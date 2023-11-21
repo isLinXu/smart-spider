@@ -1,136 +1,121 @@
-import os
+
+# coding: utf-8
 import re
-import time
-import uuid
 import requests
-import numpy as np
-import torch
-import clip
-from PIL import Image
-import imghdr
-from io import BytesIO
-from tqdm import tqdm
+import time
+import os
+import threading
+from fake_useragent import UserAgent
+from queue import Queue
+import hashlib
 
 
-class ImageDownloader:
-    def __init__(self, keywords, max_sum=1000, save_root='images'):
-        self.keywords = keywords
-        self.max_sum = max_sum
-        self.save_root = save_root
-
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
-
-    def is_image_relevant(self, image, keyword):
-        text = clip.tokenize([keyword]).to(self.device)
-        image = self.preprocess(image).unsqueeze(0).to(self.device)
-
-        with torch.no_grad():
-            image_features = self.model.encode_image(image)
-            text_features = self.model.encode_text(text)
-
-            logits_per_image, _ = self.model(image, text)
-            probs = logits_per_image.softmax(dim=-1).cpu().numpy()
-
-        return probs[0][0] > 0.5
-
-    def download_image(self, key_word, save_name):
-        download_sum = 0
-        save_path = os.path.join(self.save_root, save_name)
-        os.makedirs(save_path, exist_ok=True)
-
-        for i in tqdm(range(0, self.max_sum), desc=f"下载 {key_word} 的图片"):
-            download_sum = i
-            str_pn = str(download_sum)
-            url = f'http://image.baidu.com/search/flip?tn=baiduimage&ie=utf-8&word={key_word}&pn={str_pn}&gsm=80&ct=&ic=0&lm=-1&width=0&height=0'
-
-            try:
-                s = requests.session()
-                s.headers[
-                    'User-Agent'] = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.119 Safari/537.36'
-                result = s.get(url).content.decode('utf-8')
-                img_urls = re.findall('"objURL":"(.*?)",', result, re.S)
-
-                if not img_urls:
-                    break
-
-                # for img_url in tqdm(img_urls, desc=f"下载 {key_word} 的图片"):
-                for img_url in img_urls:
-                    for _ in range(3):  # 尝试3次
-                        try:
-                            img = requests.get(img_url, timeout=30)
-                            pil_img = Image.open(BytesIO(img.content))
-                            break
-                        except requests.exceptions.RequestException as e:
-                            print(f"请求异常，重试：{e}")
-                            time.sleep(1)
-                    else:
-                        continue
-
-                    relevance_score = self.is_image_relevant(pil_img, key_word)
-
-                    if relevance_score:
-                        file_name = os.path.join(save_path, f'{uuid.uuid1()}_{relevance_score:.2f}.jpg')
-
-                        with open(file_name, 'wb') as f:
-                            f.write(img.content)
-
-                        print(f'正在下载 {key_word} 的第 {download_sum} 张图片，相关性分数：{relevance_score:.2f}')
-                        download_sum += 1
-
-                        if download_sum >= self.max_sum:
-                            break
-
-                        time.sleep(1)  # 在请求之间添加延迟
-            except Exception as e:
-                print(e)
-                continue
-
-        print('下载完成')
-
-    def delete_error_image(self, father_path):
-        try:
-            image_dirs = os.listdir(father_path)
-            for image_dir in image_dirs:
-                image_dir = os.path.join(father_path, image_dir)
-
-                if os.path.isdir(image_dir):
-                    images = os.listdir(image_dir)
-
-                    for image in images:
-                        image = os.path.join(image_dir, image)
-
-                        try:
-                            image_type = imghdr.what(image)
-
-                            if image_type not in ('jpeg', 'png'):
-                                os.remove(image)
-                                print(f'已删除：{image}')
-                                continue
-
-                            img = np.array(Image.open(image))
-
-                            if len(img.shape) == 2:
-                                os.remove(image)
-                                print(f'已删除：{image}')
-                        except:
-                            os.remove(image)
-                            print(f'已删除：{image}')
-        except:
-            pass
+class BaiduSpiderPhotos(threading.Thread):
+    def __init__(self, queue, keywords):
+        threading.Thread.__init__(self)
+        self._queue = queue
+        self._keywords = keywords
 
     def run(self):
-        for key_word in self.keywords:
-            save_name = self.keywords[key_word]
-            self.download_image(key_word, save_name)
+        while not self._queue.empty():
+            url = self._queue.get()
+            try:
+                self.spider(url, self._keywords)
+            except Exception as e:
+                pass
 
-        self.delete_error_image(self.save_root)
+    def spider(self, url, keywords):
+        def ua():
+            UA = UserAgent()
+            return UA.random
+
+        r_photos = requests.get(url=url, headers={'User-Agent': ua()}, timeout=2)
+        r_urls = re.findall(r'"objURL":"(.*?)"', r_photos.text)
+        for r_url in r_urls:
+            try:
+                r_url_get = requests.get(url=r_url, headers={'User-Agent': ua()}, timeout=2)
+                if r_url_get.status_code == 200:
+                    print('[INFO]当前正在下载的url链接为：', r_url)
+                    m = hashlib.md5()
+                    m.update(r_url.encode())
+                    name = m.hexdigest()
+                    print('[INFO]正在保存图片')
+                    res = requests.get(url=r_url, headers={'User-Agent': ua()}, timeout=3)
+                    image_content = res.content
+                    filename = keywords + '/' + name + '.jpg'
+                    with open(filename, 'wb') as f:
+                        f.write(image_content)
+                    print('[INFO]保存成功，图片名为：{}.jpg'.format(name))
+            except Exception as e:
+                pass
+
+
+def check_pics_number(keywords):
+    def ua():
+        UA = UserAgent()
+        return UA.random
+
+    page_num = 1
+    check_page = 0
+    while True:
+        check_url = 'http://image.baidu.com/search/flip?tn=baiduimage&ie=utf-8&word=' + str(keywords) + '&pn=' + str(check_page)
+        check_content = requests.get(url=check_url, headers={'User-Agnet': ua()})
+        print('[INFO]当前第{}页存在'.format(page_num))
+        if '抱歉，没有找到与' in check_content.text:
+            return page_num
+            break
+        page_num += 1
+        check_page = ((page_num) * 20) - 20
+
+
+def deal_url(keywords, maxpage):
+    queue = Queue()
+    for j in range(0, maxpage, 20):
+        spider_url = 'http://image.baidu.com/search/flip?tn=baiduimage&ie=utf-8&word=' + str(keywords) + '&pn=' + str(j)
+        print('当前要访问的url是：', spider_url)
+        queue.put(spider_url)
+    threads = []
+    thread_count = 30
+    for i in range(thread_count):
+        threads.append(BaiduSpiderPhotos(queue, keywords))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+def create_file(keywords):
+    create_path = keywords
+    if not os.path.exists(create_path):
+        os.mkdir(create_path)
+    else:
+        print('[INFO]已存在以{}关键字命名的文件夹'.format(keywords))
+
+
+def read_file():
+    read_list = []
+    read_txt = 'spider.txt'
+    with open(read_txt, 'r') as f:
+        for i in f.readlines():
+            read_list.append(i[:-1])
+        return read_list
+
+
+def main():
+    read_list = ['crow', 'person', 'nomotor']
+    for read in read_list:
+        keywords = str(read)
+        create_file(keywords)
+        print('[INFO]正在搜索关键字：{}一共有多少张图，请稍等。。。'.format(keywords))
+        search_time_start = time.time()
+        page_num = check_pics_number(keywords)
+        print('[INFO]关键字{}大约有{}张图左右'.format(keywords, (page_num * 20)))
+        print('[INFO]搜索本关键字一共花费{:.3f} s'.format(time.time() - search_time_start))
+        print('[INFO]正在下载...')
+        download_time = time.time()
+        deal_url(keywords, page_num)
+        print('下载这些图片一共用时:{:.3f} s'.format(time.time() - download_time))
 
 
 if __name__ == '__main__':
-    # keywords = {'电动车': 'nomotor'}
-    keywords = {'行人': 'person'}
-    max_sum = 1000
-
-    image_downloader = ImageDownloader(keywords, max_sum)
-    image_downloader.run()
+    main()
