@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 from smart_spider import logo_str
 
-logger.add("output.log", format="{time} {level} {message}", level="INFO")
+logger.add("../output.log", format="{time} {level} {message}", level="INFO")
 
 
 class SmartSpider:
@@ -138,27 +138,25 @@ class SmartSpider:
 
                             if image_type not in ('jpeg', 'png'):
                                 os.remove(image)
-                                logger.info(f'已删除：{image}')
+                                print(f'已删除：{image}')
                                 continue
 
                             img = np.array(Image.open(image))
 
                             if len(img.shape) == 2:
                                 os.remove(image)
-                                logger.info(f'已删除：{image}')
+                                print(f'已删除：{image}')
                         except:
                             os.remove(image)
-                            logger.info(f'已删除：{image}')
+                            print(f'已删除：{image}')
         except:
             pass
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    # parser.add_argument("--keywords", nargs="+", default=['皮卡丘', '小火龙', '杰尼龟', '妙蛙种子'], help="关键词列表")
-    parser.add_argument("--keywords", nargs="+", default=['动漫女生'], help="关键词列表")
-    parser.add_argument("--max_pics", type=int, default=100, help="每个关键词的最大图片数量")
+    parser.add_argument("--keywords", nargs="+", default=['皮卡丘', '小火龙', '杰尼龟', '妙蛙种子'], help="关键词列表")
+    parser.add_argument("--max_pics", type=int, default=1000, help="每个关键词的最大图片数量")
     args = parser.parse_args()
     image_downloader = SmartSpider(args.keywords, args.max_pics)
     image_downloader.download_images()
-    image_downloader.delete_error_image('./')

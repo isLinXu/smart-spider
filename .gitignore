@@ -158,3 +158,20 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+/baid/
+/coco128/
+/crow/
+/images/
+/nomotor/
+/person/
+/smart_spider/
+/动漫女生/
+/妙蛙种子/
+/室内行人/
+/小火龙/
+/杰尼龟/
+/狗/
+/猫/
+/电动车/
+/皮卡丘/
+/temp/
