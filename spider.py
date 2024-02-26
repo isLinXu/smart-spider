@@ -6,7 +6,7 @@ from smart_spider.smart_spider import SmartSpider
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # parser.add_argument("--keywords", nargs="+", default=['皮卡丘', '小火龙', '杰尼龟', '妙蛙种子'], help="关键词列表")
-    parser.add_argument("--keywords", nargs="+", default=['车'], help="关键词列表")
+    parser.add_argument("--keywords", nargs="+", default=['小猫'], help="关键词列表")
     parser.add_argument("--max_pics", type=int, default=30, help="每个关键词的最大图片数量")
     parser.add_argument("--similarity_threshold", type=float, default=0.20, help="相似度阈值")
     parser.add_argument("--timeout", type=int, default=5, help="请求超时时间")

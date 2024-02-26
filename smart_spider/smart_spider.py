@@ -15,7 +15,9 @@ from .downloader import Downloader
 logger.add("../output.log", format="{time} {level} {message}", level="INFO")
 
 class SmartSpider:
-    def __init__(self, keywords, max_pics, similarity_threshold=0.20, timeout=5, max_workers=30, search_engines = []):
+    def __init__(self, keywords, max_pics, similarity_threshold=0.20, timeout=5, max_workers=30, search_engines=None):
+        if search_engines is None:
+            search_engines = []
         self.keywords = keywords
         self.max_pics = max_pics
         self.similarity_threshold = similarity_threshold

@@ -137,6 +137,8 @@ class Downloader:
                 r_urls = re.findall(r'src="(.*?)"', check_content.text)
             elif search_engine == "sogou":
                 r_urls = re.findall(r'"thumbUrl":"(.*?)"', check_content.text)
+            elif search_engine == "360":
+                r_urls = re.findall(r'"img":"(.*?)"', check_content.text)
             else:
                 raise ValueError("Unknown search engine")
 
