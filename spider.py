@@ -16,5 +16,4 @@ if __name__ == '__main__':
     image_downloader = SmartSpider(args.keywords, args.max_pics,
                                    args.similarity_threshold, args.timeout,
                                    args.max_workers, args.search_engines)
-    # image_downloader.download_images()
     image_downloader.run()

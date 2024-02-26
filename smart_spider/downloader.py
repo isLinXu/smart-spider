@@ -11,7 +11,6 @@ from tqdm import tqdm
 
 from .utils import create_file, is_image_relevant, is_image_downloaded, print_logo_str
 
-
 class Downloader:
     def __init__(self):
         self.logo = print_logo_str()

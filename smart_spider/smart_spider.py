@@ -8,24 +8,11 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
-import clip
-import numpy as np
-import requests
-import torch
-from fake_useragent import UserAgent
+
 from loguru import logger
-
-from PIL import Image
-from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
-from tqdm import tqdm
-
-from smart_spider import logo_str
 from .downloader import Downloader
-from .utils import create_file
-# from .downloader import check_pics_number
 
 logger.add("../output.log", format="{time} {level} {message}", level="INFO")
-
 
 class SmartSpider:
     def __init__(self, keywords, max_pics, similarity_threshold=0.20, timeout=5, max_workers=30, search_engines = []):
@@ -54,5 +41,4 @@ if __name__ == '__main__':
     image_downloader = SmartSpider(args.keywords, args.max_pics,
                                    args.similarity_threshold, args.timeout,
                                    args.max_workers, args.search_engines)
-    # image_downloader.download_images()
     image_downloader.run()
