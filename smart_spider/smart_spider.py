@@ -24,10 +24,13 @@ logger.add("../output.log", format="{time} {level} {message}", level="INFO")
 
 
 class SmartSpider:
-    def __init__(self, keywords, max_pics):
+    def __init__(self, keywords, max_pics, similarity_threshold=0.20, timeout=5, max_workers=30):
         self.print_logo_str()
         self.keywords = keywords
         self.max_pics = max_pics
+        self.similarity_threshold = similarity_threshold
+        self.timeout = timeout
+        self.max_workers = max_workers
         self.ua = UserAgent()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
@@ -36,7 +39,12 @@ class SmartSpider:
         print(f"{logo_str}")
 
     def is_image_relevant(self, image_content, keyword):
-        image = Image.open(BytesIO(image_content))
+        try:
+            image = Image.open(BytesIO(image_content))
+        except Exception as e:
+            logger.error(f"Error opening image: {e}")
+            return False
+
         image_transform = Compose([
             Resize(256),
             CenterCrop(224),
@@ -52,12 +60,12 @@ class SmartSpider:
             keyword_features = self.model.encode_text(keyword_tensor)
             similarity = torch.nn.functional.cosine_similarity(image_features, keyword_features)
 
-        return similarity.item()
+        return similarity.item() > self.similarity_threshold
 
     def spider(self, search_engine, url, keywords, max_pics, pbar):
         headers = {'User-Agent': self.ua.random}
         try:
-            r_photos = requests.get(url=url, headers=headers, timeout=2)
+            r_photos = requests.get(url=url, headers=headers, timeout=self.timeout)
             if search_engine == "baidu":
                 r_urls = re.findall(r'"objURL":"(.*?)"', r_photos.text)
             elif search_engine == "google":
@@ -69,19 +77,16 @@ class SmartSpider:
             else:
                 raise ValueError("Unknown search engine")
             try:
-                # r_photos = requests.get(url=url, headers=headers, timeout=2)
-                # r_urls = re.findall(r'"objURL":"(.*?)"', r_photos.text)
                 downloaded_pics = 0
                 for r_url in r_urls:
                     if downloaded_pics >= max_pics:
                         break
                     try:
-                        r_url_get = requests.get(url=r_url, headers=headers, timeout=2)
+                        r_url_get = requests.get(url=r_url, headers=headers, timeout=self.timeout)
                         if r_url_get.status_code == 200:
                             image_content = r_url_get.content
-                            image_similarity = self.is_image_relevant(image_content, keywords)
-                            if image_similarity > 0.20:
-                                logger.info(f'当前正在下载的url链接为：{r_url}, 相似度为：{image_similarity}')
+                            if self.is_image_relevant(image_content, keywords):
+                                logger.info(f'当前正在下载的url链接为：{r_url}')
                                 name = hashlib.md5(r_url.encode()).hexdigest()
                                 logger.info('正在保存图片......')
                                 filename = os.path.join(keywords, f'{name}.jpg')
@@ -91,28 +96,11 @@ class SmartSpider:
                                 downloaded_pics += 1
                                 pbar.update(1)
                     except Exception as e:
-                        pass
+                        logger.error(f"Error downloading image: {e}")
             except Exception as e:
-                pass
+                logger.error(f"Error processing image URLs: {e}")
         except Exception as e:
-            pass
-
-    # def check_pics_number(self, keywords, max_pics):
-    #     headers = {'User-Agent': self.ua.random}
-    #     page_num = 1
-    #     check_page = 0
-    #     total_pics = 0
-    #     while total_pics < max_pics:
-    #         check_url = f'http://image.baidu.com/search/flip?tn=baiduimage&ie=utf-8&word={keywords}&pn={check_page}'
-    #         check_content = requests.get(url=check_url, headers=headers)
-    #         logger.info(f'当前第{page_num}页存在')
-    #         if '抱歉，没有找到与' in check_content.text:
-    #             return page_num
-    #         r_urls = re.findall(r'"objURL":"(.*?)"', check_content.text)
-    #         total_pics += len(r_urls)
-    #         page_num += 1
-    #         check_page = ((page_num) * 20) - 20
-    #     return page_num
+            logger.error(f"Error fetching image search results: {e}")
 
     def check_pics_number(self, search_engine, keywords, max_pics):
         headers = {'User-Agent': self.ua.random}
@@ -150,7 +138,6 @@ class SmartSpider:
             check_page = ((page_num) * 20) - 20
         return page_num
 
-
     def create_file(self, keywords):
         if not os.path.exists(keywords):
             os.mkdir(keywords)
@@ -158,13 +145,10 @@ class SmartSpider:
             logger.info(f'已存在以{keywords}关键字命名的文件夹')
 
     def download_images(self):
-        search_engines = ["baidu", "google", "bing", "sogou"]
+        search_engines = ["baidu",  "bing", "sogou", "google"]
         for keywords in self.keywords:
             self.create_file(keywords)
             logger.info(f'正在搜索关键字：[{keywords}]一共有多少张图，请稍等。。。')
-            # page_num = self.check_pics_number(search_engine, keywords, self.max_pics)
-            # total_pics_to_download = min(self.max_pics, (page_num * 20))
-            # logger.info(f'关键字[{keywords}]将下载{total_pics_to_download}的图像数量')
             urls = []
             for search_engine in search_engines:
                 page_num = self.check_pics_number(search_engine, keywords, self.max_pics)
@@ -187,7 +171,7 @@ class SmartSpider:
                     raise ValueError("Unknown search engine")
 
                 with tqdm(total=total_pics_to_download, desc=f'Downloading [{keywords}]') as pbar:
-                    with ThreadPoolExecutor(max_workers=30) as executor:
+                    with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                         for url in urls:
                             search_engine = random.choice(search_engines)
                             executor.submit(self.spider, search_engine, url, keywords, self.max_pics, pbar)
@@ -204,32 +188,34 @@ class SmartSpider:
                     images = os.listdir(image_dir)
 
                     for image in images:
-                        image = os.path.join(image_dir, image)
-
+                        image_path = os.path.join(image_dir, image)
                         try:
-                            image_type = imghdr.what(image)
+                            image_type = imghdr.what(image_path)
 
                             if image_type not in ('jpeg', 'png'):
-                                os.remove(image)
-                                print(f'已删除：{image}')
+                                os.remove(image_path)
+                                logger.info(f'已删除：{image_path}')
                                 continue
 
-                            img = np.array(Image.open(image))
+                            img = np.array(Image.open(image_path))
 
                             if len(img.shape) == 2:
-                                os.remove(image)
-                                print(f'已删除：{image}')
-                        except:
-                            os.remove(image)
-                            print(f'已删除：{image}')
-        except:
-            pass
-
+                                os.remove(image_path)
+                                logger.info(f'已删除：{image_path}')
+                        except Exception as e:
+                            os.remove(image_path)
+                            logger.error(f"Error processing image: {e}")
+                            logger.info(f'已删除：{image_path}')
+        except Exception as e:
+            logger.error(f"Error processing image directories: {e}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--keywords", nargs="+", default=['皮卡丘', '小火龙', '杰尼龟', '妙蛙种子'], help="关键词列表")
     parser.add_argument("--max_pics", type=int, default=1000, help="每个关键词的最大图片数量")
+    parser.add_argument("--similarity_threshold", type=float, default=0.20, help="相似度阈值")
+    parser.add_argument("--timeout", type=int, default=5, help="请求超时时间")
+    parser.add_argument("--max_workers", type=int, default=30, help="线程池最大工作线程数")
     args = parser.parse_args()
-    image_downloader = SmartSpider(args.keywords, args.max_pics)
+    image_downloader = SmartSpider(args.keywords, args.max_pics, args.similarity_threshold, args.timeout, args.max_workers)
     image_downloader.download_images()
