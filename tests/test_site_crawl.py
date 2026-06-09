@@ -9,6 +9,7 @@ import pytest
 from smart_spider.site_parser import (
     SiteParser,
     JDlingyuParser,
+    DZDMRParser,
     SITE_PARSER_REGISTRY,
     get_site_parser,
     register_site_parser,
@@ -159,6 +160,147 @@ class TestJDlingyuParser:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# DZDMRParser
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestDZDMRParser:
+    """验证 DZDMRParser 的解析逻辑。"""
+
+    def setup_method(self):
+        self.parser = DZDMRParser()
+
+    # ── collect_pages ──────────────────────────────────────────────
+
+    def test_collect_pages_extracts_articles(self):
+        html = '''
+        <article class="excerpt">
+          <a href="https://www.dzdmr.com/324242.html">
+            <img data-src="https://www.dzdmr.com/wp-content/uploads/2026/06/20260608_001_dPLW1-220x150.jpg"
+                alt="安然《性感蒂法》原版写真 [80P-770MB]-妹子图">
+          </a>
+        </article>
+        <article class="excerpt">
+          <a href="https://www.dzdmr.com/324234.html">
+            <img data-src="https://www.dzdmr.com/wp-content/uploads/2026/06/20260607_205_mMY15-220x150.jpg"
+                alt="云溪溪 奶桃 光之语[80P+1V-1.98G]-妹子图">
+          </a>
+        </article>
+        '''
+        items = self.parser.collect_pages(html)
+        assert len(items) == 2
+        assert items[0]["id"] == "324242"
+        assert items[0]["url"] == "https://www.dzdmr.com/324242.html"
+        assert "安然" in items[0]["title"]
+        assert items[0]["cover_url"] == "https://www.dzdmr.com/wp-content/uploads/2026/06/20260608_001_dPLW1.jpg"
+
+    def test_collect_pages_deduplicates(self):
+        html = '''
+        <a href="https://www.dzdmr.com/324242.html">
+          <img data-src="https://www.dzdmr.com/wp-content/uploads/2026/06/20260608_001_dPLW1-220x150.jpg"
+              alt="Title A-妹子图">
+        </a>
+        <a href="https://www.dzdmr.com/324242.html">
+          <img data-src="https://www.dzdmr.com/wp-content/uploads/2026/06/20260608_001_dPLW1-220x150.jpg"
+              alt="Title A dup-妹子图">
+        </a>
+        '''
+        items = self.parser.collect_pages(html)
+        assert len(items) == 1
+
+    def test_collect_pages_no_match(self):
+        html = "<div>No links here</div>"
+        items = self.parser.collect_pages(html)
+        assert items == []
+
+    def test_collect_pages_strips_suffix(self):
+        """标题末尾的 '-妹子图' 应被去掉。"""
+        html = '''
+        <a href="https://www.dzdmr.com/123.html">
+          <img data-src="https://www.dzdmr.com/wp-content/uploads/2026/06/test-220x150.jpg"
+              alt="测试标题-妹子图">
+        </a>
+        '''
+        items = self.parser.collect_pages(html)
+        assert items[0]["title"] == "测试标题"
+
+    # ── extract_images ─────────────────────────────────────────────
+
+    def test_extract_images_cdn_preview(self):
+        html = '<img class="aligncenter" src="https://90i.yznwh.com/2026/06/06/20260608_001_dPLW1.jpg">'
+        urls = self.parser.extract_images(html)
+        assert len(urls) == 1
+        assert "yznwh.com" in urls[0]
+
+    def test_extract_images_thumb_to_original(self):
+        html = '<img data-src="https://www.dzdmr.com/wp-content/uploads/2026/06/test-220x150.jpg">'
+        urls = self.parser.extract_images(html)
+        assert len(urls) == 1
+        assert urls[0] == "https://www.dzdmr.com/wp-content/uploads/2026/06/test.jpg"
+        assert "-220x150" not in urls[0]
+
+    def test_extract_images_filters_thumbnail(self):
+        """WordPress dux 主题占位图应被过滤。"""
+        html = '<img src="https://www.dzdmr.com/wp-content/themes/dux/assets/img/thumbnail.png">'
+        urls = self.parser.extract_images(html)
+        assert len(urls) == 0
+
+    def test_extract_images_filters_thumb_suffix(self):
+        """原始缩略图（含 -220x150）应被过滤，只有转原图后的才保留。"""
+        html = '<img src="https://www.dzdmr.com/wp-content/uploads/2026/06/test-220x150.jpg">'
+        urls = self.parser.extract_images(html)
+        # src 中的缩略图含 -220x150 后缀，should_filter_image 会过滤
+        assert len(urls) == 0
+
+    def test_extract_images_no_duplicates(self):
+        html = '''
+        <img src="https://90i.yznwh.com/2026/06/06/photo1.jpg">
+        <img data-src="https://90i.yznwh.com/2026/06/06/photo1.jpg">
+        '''
+        urls = self.parser.extract_images(html)
+        assert len(urls) == 1
+
+    def test_extract_images_mixed_sources(self):
+        """CDN 预览图 + 缩略图转原图混合场景。"""
+        html = '''
+        <img class="aligncenter" src="https://90i.yznwh.com/2026/06/06/preview1.jpg">
+        <img data-src="https://www.dzdmr.com/wp-content/uploads/2026/06/cover1-220x150.jpg">
+        <img src="https://www.dzdmr.com/wp-content/themes/dux/assets/img/thumbnail.png">
+        '''
+        urls = self.parser.extract_images(html)
+        assert len(urls) == 2
+        assert "yznwh.com" in urls[0]
+        assert "-220x150" not in urls[1]
+
+    # ── build_listing_url ──────────────────────────────────────────
+
+    def test_build_listing_url_page1(self):
+        assert self.parser.build_listing_url(1) == "https://www.dzdmr.com/"
+
+    def test_build_listing_url_page2(self):
+        assert self.parser.build_listing_url(2) == "https://www.dzdmr.com/page/2"
+
+    # ── should_filter_image ────────────────────────────────────────
+
+    def test_should_filter_thumbnail_png(self):
+        assert self.parser.should_filter_image(
+            "https://www.dzdmr.com/wp-content/themes/dux/assets/img/thumbnail.png"
+        )
+
+    def test_should_filter_thumb_suffix(self):
+        assert self.parser.should_filter_image(
+            "https://www.dzdmr.com/wp-content/uploads/2026/06/test-220x150.jpg"
+        )
+
+    def test_should_not_filter_normal_image(self):
+        assert not self.parser.should_filter_image(
+            "https://90i.yznwh.com/2026/06/06/photo1.jpg"
+        )
+
+    def test_should_filter_internal_ip(self):
+        assert self.parser.should_filter_image("http://192.168.1.1/img.jpg")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # SiteCrawler 初始化
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -211,3 +353,7 @@ class TestExports:
     def test_jdlingyu_registered(self):
         from smart_spider import SITE_PARSER_REGISTRY
         assert "jdlingyu" in SITE_PARSER_REGISTRY
+
+    def test_dzdmr_registered(self):
+        from smart_spider import SITE_PARSER_REGISTRY
+        assert "dzdmr" in SITE_PARSER_REGISTRY

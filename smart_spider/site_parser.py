@@ -295,7 +295,158 @@ class JDlingyuParser(SiteParser):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# 内置解析器: 妹子图 (dzdmr.com)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class DZDMRParser(SiteParser):
+    """妹子图 (dzdmr.com) 解析器。
+
+    网站结构
+    --------
+    1. 列表页: https://www.dzdmr.com/ (首页), https://www.dzdmr.com/page/{n}
+       - 共 3571 页，每页约 24 篇文章
+       - 文章链接格式: https://www.dzdmr.com/{id}.html
+       - 缩略图: data-src="...-220x150.jpg" (WordPress dux 主题)
+
+    2. 详情页: https://www.dzdmr.com/{id}.html
+       - 免费预览图: CDN 域名 yznwh.com (1-3 张)
+       - 完整图集: 需登录（隐藏内容区域 "此处为隐藏的内容"）
+       - 无详情页分页
+
+    3. 图片策略
+       - CDN 预览图: https://90i.yznwh.com/... (直接可下载)
+       - 缩略图转原图: 去掉 URL 中的 "-220x150" 后缀
+         注意: 仅首页缩略图（/wp-content/uploads/ 当月）转原图有效，
+         侧边栏旧文章缩略图转原图可能 404
+
+    限制
+    ----
+    无登录状态下，每篇文章只能获取 1-3 张免费预览图 + 1 张封面原图。
+    完整图集需要登录后才能访问。
+    """
+
+    name = "dzdmr"
+    base_url = "https://www.dzdmr.com"
+    listing_url = "https://www.dzdmr.com"
+
+    # CDN 域名列表（用于识别预览图）
+    _CDN_DOMAINS = ("yznwh.com",)
+
+    def collect_pages(self, html: str) -> list[dict]:
+        """从列表页 HTML 解析文章链接。
+
+        提取策略:
+        1. 从文章卡片中提取链接 + 缩略图 + alt 标题
+        2. 缩略图 URL 去掉 -220x150 后缀即为封面原图
+        """
+        items = []
+        seen = set()
+
+        # 提取文章卡片: href + data-src(缩略图) + alt(标题)
+        for m in re.finditer(
+            r'href="https://www\.dzdmr\.com/(\d+)\.html"[^>]*>.*?'
+            r'data-src="([^"]*-220x150[^"]*?)"[^>]*?'
+            r'alt="([^"]*?)"',
+            html, re.DOTALL,
+        ):
+            aid = m.group(1)
+            if aid in seen:
+                continue
+            seen.add(aid)
+
+            thumb_url = m.group(2)
+            # 补全协议
+            if thumb_url.startswith("//"):
+                thumb_url = "https:" + thumb_url
+            elif thumb_url.startswith("/"):
+                thumb_url = self.base_url + thumb_url
+
+            title = m.group(3).strip()
+            # 去掉标题末尾的 "-妹子图"
+            title = re.sub(r"\s*[-–—]\s*妹子图\s*$", "", title)
+
+            url = f"https://www.dzdmr.com/{aid}.html"
+            # 缩略图转原图: 去掉 -220x150 后缀
+            cover_url = thumb_url.replace("-220x150", "")
+
+            items.append({
+                "url": url,
+                "title": title,
+                "id": aid,
+                "cover_url": cover_url,
+            })
+
+        return items
+
+    def extract_images(self, html: str) -> list[str]:
+        """从详情页 HTML 解析图片真实 URL。
+
+        提取策略（三层）:
+        1. CDN 预览图 (yznwh.com) — 免费可见的正文图片
+        2. 本站缩略图转原图 — 去掉 -220x150 后缀
+        3. 其他图片 URL — 兜底
+
+        每层都会调用 should_filter_image() 进行过滤。
+        """
+        urls = []
+
+        # 方式1: CDN 预览图（正文区域，免费可见）
+        for m in re.finditer(
+            r'(?:src|data-src)="(https?://[^"]*?(?:' + "|".join(self._CDN_DOMAINS) + r')[^"]*?)"',
+            html,
+        ):
+            url = m.group(1)
+            if not self.should_filter_image(url) and url not in urls:
+                urls.append(url)
+
+        # 方式2: 本站缩略图转原图（去掉 -220x150 后缀）
+        for m in re.finditer(
+            r'data-src="(https?://www\.dzdmr\.com/wp-content/uploads/[^"]*-220x150[^"]*?)"',
+            html,
+        ):
+            url = m.group(1).replace("-220x150", "")
+            if not self.should_filter_image(url) and url not in urls:
+                urls.append(url)
+
+        # 方式3: 其他图片 URL（兜底）
+        for m in re.finditer(
+            r'(?:data-src|src)="(https?://[^"]*\.(?:jpg|jpeg|png|webp|gif|JPG|PNG)[^"]*?)"',
+            html, re.IGNORECASE,
+        ):
+            url = m.group(1)
+            if not self.should_filter_image(url) and url not in urls:
+                urls.append(url)
+
+        return urls
+
+    def build_listing_url(self, page: int) -> str:
+        """构造列表页 URL。
+
+        dzdmr 分页规则:
+        - page=1 → https://www.dzdmr.com/
+        - page>1 → https://www.dzdmr.com/page/{page}
+        """
+        if page == 1:
+            return self.listing_url + "/"
+        return f"{self.listing_url}/page/{page}"
+
+    def should_filter_image(self, url: str) -> bool:
+        """过滤占位图、缩略图和内网地址。"""
+        # WordPress dux 主题占位图
+        if "thumbnail.png" in url:
+            return True
+        # 缩略图（已通过转原图处理，原始缩略图不需要）
+        if "-220x150" in url:
+            return True
+        # 内网地址
+        if url.startswith(("http://192.", "http://10.", "http://172.")):
+            return True
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # 自动注册内置解析器
 # ════════════════════════════════════════════════════════════════════════════════
 
 register_site_parser(JDlingyuParser())
+register_site_parser(DZDMRParser())
