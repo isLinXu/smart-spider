@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: "Test (Python ${{ matrix.python-version }})"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install core dependencies
+        run: |
+          pip install --upgrade pip
+          # 安装测试所需最小依赖（跳过 torch/clip 重型依赖）
+          pip install requests urllib3 fake-useragent loguru tqdm Pillow numpy
+          pip install pytest pytest-cov pytest-mock
+
+      - name: Install optional lightweight dependencies
+        run: |
+          pip install trafilatura || true
+          pip install pybloom-live || true
+          pip install curl_cffi || true
+
+      - name: Run tests (mock clip/torch)
+        run: |
+          # 使用 mock 跳过 clip/torch 导入（CI 环境不安装重型 GPU 依赖）
+          pytest tests/ -v --tb=short \
+            --ignore=tests/test_http_client.py \
+            -k "not TestSmartHttpClient" \
+            --cov=smart_spider \
+            --cov-report=xml \
+            --cov-report=term-missing
+        env:
+          PYTHONPATH: .
+
+      - name: Run HTTP client tests
+        run: |
+          pytest tests/test_http_client.py -v --tb=short
+        env:
+          PYTHONPATH: .
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: matrix.python-version == '3.11'
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  lint:
+    name: "Lint"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install ruff
+      - name: Ruff check
+        run: ruff check smart_spider/ tests/ spider.py --select=E,W,F --ignore=E501
