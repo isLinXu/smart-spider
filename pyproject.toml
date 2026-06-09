@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "smart-spider"
+version = "2.2.0"
+description = "多模态智能爬虫：基于 CLIP 语义过滤，支持图片/视频/文本采集，内置完整反爬体系"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+
+dependencies = [
+    # 网络请求（核心）
+    "requests>=2.28.0",
+    "urllib3>=1.26.0",
+    "fake-useragent>=1.4.0",
+    # 日志 & 进度条
+    "loguru>=0.6.0",
+    "tqdm>=4.64.0",
+    # 图像处理
+    "Pillow>=9.0.0",
+    "numpy>=1.21.0",
+    # 深度学习核心（CLIP 依赖）
+    "torch>=1.13.0",
+    "torchvision>=0.14.0",
+]
+
+[project.optional-dependencies]
+# 动态渲染（反爬 SPA 页面）
+browser = [
+    "playwright>=1.40.0",
+    "playwright-stealth>=1.0.6",
+]
+# 视频下载
+video = [
+    "yt-dlp>=2023.11.16",
+]
+# 文本提取
+text = [
+    "trafilatura>=1.6.0",
+]
+# TLS 指纹伪造（绕过 Cloudflare 等）
+tls = [
+    "curl_cffi>=0.6.0",
+]
+# URL 去重（BloomFilter，内存效率高）
+dedup = [
+    "pybloom-live>=3.0.0",
+]
+# 开发工具
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-mock>=3.11.0",
+]
+# 全功能安装
+all = [
+    "smart-spider[browser,video,text,tls,dedup]",
+]
+
+[project.scripts]
+smart-spider = "spider:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["smart_spider*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+[tool.coverage.run]
+source = ["smart_spider"]
+omit = ["tests/*", "examples/*", "spider.py"]
+
+[tool.coverage.report]
+show_missing = true
