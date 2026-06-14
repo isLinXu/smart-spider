@@ -164,7 +164,8 @@ cython_debug/
 /images/
 /nomotor/
 /person/
-/smart_spider/
+# smart_spider source code is tracked; only ignore __pycache__ and output dirs
+# /smart_spider/  (removed — was blocking source code tracking)
 /动漫女生/
 /妙蛙种子/
 /室内行人/

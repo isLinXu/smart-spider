@@ -59,7 +59,6 @@ from io import BytesIO
 from typing import Any, Callable, Optional
 
 import numpy as np
-import torch
 from loguru import logger
 from PIL import Image
 from tqdm import tqdm
@@ -73,6 +72,15 @@ from .engines import (
 )
 from .http_client import SmartHttpClient, ProxyPool
 from .utils import create_file, is_image_downloaded, print_logo_str
+
+# torch / clip 延迟导入：仅在图片模态（CLIP 推理）需要时加载
+# 这样 SiteCrawler / UrlDeduplicator 等组件可在无 torch 环境下独立使用
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+    torch = None  # type: ignore
 
 try:
     import clip
