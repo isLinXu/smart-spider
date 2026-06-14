@@ -445,8 +445,399 @@ class DZDMRParser(SiteParser):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# 内置解析器: 每日妹子图 (meizi5.com)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class Meizi5Parser(SiteParser):
+    """每日妹子图 (meizi5.com) 解析器。
+
+    网站结构
+    --------
+    1. 列表页: https://meizi5.com/ (首页), https://meizi5.com/page/{n}
+       - 每页约 12-15 篇文章
+       - 文章链接格式: https://meizi5.com/{id}.html
+       - 封面图: src="https://meizi5.com/wp-content/uploads/.../VOL_XXX_face.jpg"
+
+    2. 详情页: https://meizi5.com/{id}.html
+       - 图片使用直接 src: https://meizi5.com/wp-content/uploads/.../VOL_XXX_N.jpg
+       - 无详情页分页
+       - 无懒加载
+
+    3. 图片策略
+       - 所有图片都在本站 wp-content/uploads 目录下
+       - 封面图带 _face 后缀，详情图带 _1, _2, _3 等序号后缀
+    """
+
+    name = "meizi5"
+    base_url = "https://meizi5.com"
+    listing_url = "https://meizi5.com"
+
+    def collect_pages(self, html: str) -> list[dict]:
+        """从列表页 HTML 解析文章链接。"""
+        items = []
+        seen = set()
+
+        # 提取文章卡片: href + 标题
+        for m in re.finditer(
+            r'href="https://meizi5\.com/(\d+)\.html"[^>]*>([^<]*)</a>',
+            html, re.DOTALL,
+        ):
+            aid = m.group(1)
+            if aid in seen:
+                continue
+            seen.add(aid)
+
+            title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            # 去掉标题末尾的无关后缀
+            title = re.sub(r"\s*阅读全文\s*$", "", title)
+
+            url = f"https://meizi5.com/{aid}.html"
+            items.append({"url": url, "title": title, "id": aid})
+
+        return items
+
+    def extract_images(self, html: str) -> list[str]:
+        """从详情页 HTML 解析图片真实 URL。
+
+        提取策略:
+        1. 本站 wp-content/uploads 目录下的图片（主要内容）
+        2. 过滤封面图（_face 后缀）和装饰性图片
+        """
+        urls = []
+
+        # 方式1: 本站图片（正文区域）
+        for m in re.finditer(
+            r'src="(https://meizi5\.com/wp-content/uploads/[^"]+\.(?:jpg|jpeg|png|webp|gif))"',
+            html, re.IGNORECASE,
+        ):
+            url = m.group(1)
+            if not self.should_filter_image(url) and url not in urls:
+                urls.append(url)
+
+        # 方式2: 相对路径图片（兜底）
+        for m in re.finditer(
+            r'src="(/wp-content/uploads/[^"]+\.(?:jpg|jpeg|png|webp|gif))"',
+            html, re.IGNORECASE,
+        ):
+            url = self.base_url + m.group(1)
+            if not self.should_filter_image(url) and url not in urls:
+                urls.append(url)
+
+        return urls
+
+    def build_listing_url(self, page: int) -> str:
+        """构造列表页 URL。
+
+        meizi5 分页规则:
+        - page=1 → https://meizi5.com/
+        - page>1 → https://meizi5.com/page/{page}
+        """
+        if page == 1:
+            return self.listing_url + "/"
+        return f"{self.listing_url}/page/{page}"
+
+    def should_filter_image(self, url: str) -> bool:
+        """过滤封面图、头像和装饰性图片。"""
+        # 封面图（缩略图）
+        if "_face" in url:
+            return True
+        # 头像
+        if "avatar" in url.lower():
+            return True
+        # Logo
+        if "logo" in url.lower():
+            return True
+        # 内网地址
+        if url.startswith(("http://192.", "http://10.", "http://172.")):
+            return True
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 内置解析器: 日式JK (jk.rs)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class JKrsParser(SiteParser):
+    """日式JK (jk.rs) 解析器。
+
+    网站结构
+    --------
+    1. 列表页: https://www.jk.rs/ (首页), https://www.jk.rs/page/{n}
+       - 每页约 10-12 篇文章
+       - 文章链接格式: https://www.jk.rs/{year}/{month}/{day}/{id}.html
+       - 也有旧格式: https://www.jk.rs/{id}.html
+       - 封面图使用 data-src 懒加载到 pic1.imgdb.cn CDN
+
+    2. 详情页: 上述文章链接
+       - 图片使用 data-src 懒加载
+       - 图片来源: pic1.imgdb.cn, pic.imgdb.cn, 本站 wp-content/uploads
+       - 无详情页分页
+
+    3. 图片策略
+       - 主要 CDN: pic1.imgdb.cn, pic.imgdb.cn
+       - 本站也有少量 wp-content/uploads 图片
+       - 需过滤 giphy.gif, default-avatar, logo 等装饰图
+    """
+
+    name = "jkrs"
+    base_url = "https://www.jk.rs"
+    listing_url = "https://www.jk.rs"
+
+    def collect_pages(self, html: str) -> list[dict]:
+        """从列表页 HTML 解析文章链接。"""
+        items = []
+        seen = set()
+
+        # 方式1: 日期格式文章链接 /YYYY/MM/DD/ID.html
+        for m in re.finditer(
+            r'href="(https://www\.jk\.rs/\d{4}/\d{2}/\d{2}/(\d+)\.html)"[^>]*>([^<]*)</a>',
+            html, re.DOTALL,
+        ):
+            url = m.group(1)
+            aid = m.group(2)
+            if aid in seen:
+                continue
+            seen.add(aid)
+            title = re.sub(r"<[^>]+>", "", m.group(3)).strip()
+            items.append({"url": url, "title": title, "id": aid})
+
+        # 方式2: 旧格式 /ID.html
+        for m in re.finditer(
+            r'href="(https://www\.jk\.rs/(\d+)\.html)"[^>]*>([^<]*)</a>',
+            html, re.DOTALL,
+        ):
+            url = m.group(1)
+            aid = m.group(2)
+            if aid in seen:
+                continue
+            seen.add(aid)
+            title = re.sub(r"<[^>]+>", "", m.group(3)).strip()
+            items.append({"url": url, "title": title, "id": aid})
+
+        return items
+
+    def extract_images(self, html: str) -> list[str]:
+        """从详情页 HTML 解析图片真实 URL。
+
+        提取策略（三层）:
+        1. data-src 属性（懒加载，主要来源）
+        2. src 属性中已是真实 URL
+        3. 兜底：所有图片 URL
+        """
+        urls = []
+
+        # 方式1: data-src 懒加载（主要来源）
+        for m in re.finditer(
+            r'data-src="(https?://[^"]+\.(?:jpg|jpeg|png|webp|gif))"',
+            html, re.IGNORECASE,
+        ):
+            url = m.group(1)
+            if not self.should_filter_image(url) and url not in urls:
+                urls.append(url)
+
+        # 方式2: src 属性中已是真实 URL
+        for m in re.finditer(
+            r'src="(https?://[^"]+\.(?:jpg|jpeg|png|webp|gif))"',
+            html, re.IGNORECASE,
+        ):
+            url = m.group(1)
+            if url not in urls and not self.should_filter_image(url):
+                urls.append(url)
+
+        # 方式3: 相对路径图片（兜底）
+        for m in re.finditer(
+            r'(?:data-src|src)="(/wp-content/uploads/[^"]+\.(?:jpg|jpeg|png|webp|gif))"',
+            html, re.IGNORECASE,
+        ):
+            url = self.base_url + m.group(1)
+            if url not in urls and not self.should_filter_image(url):
+                urls.append(url)
+
+        return urls
+
+    def should_filter_image(self, url: str) -> bool:
+        """过滤装饰性图片。"""
+        if "giphy" in url.lower():
+            return True
+        if "avatar" in url.lower():
+            return True
+        if "logo" in url.lower():
+            return True
+        if "default" in url.lower():
+            return True
+        if url.startswith(("http://192.", "http://10.", "http://172.")):
+            return True
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 内置解析器: 学姐吧 (xuejieba2026.com)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class XuejiebaParser(SiteParser):
+    """学姐吧 (xuejieba2026.com) 解析器。
+
+    网站结构
+    --------
+    1. 列表页: https://xuejieba2026.com/ (首页), https://xuejieba2026.com/page/{n}
+       - 每页约 12-15 篇文章
+       - 文章链接格式: https://xuejieba2026.com/{id}.html
+       - 封面图使用 data-src 懒加载到 thumb 目录（缩略图）
+
+    2. 详情页: https://xuejieba2026.com/{id}.html
+       - 图片使用 data-src 懒加载
+       - 图片来源: 本站 wp-content/uploads/YYYY/MM/ 目录
+       - 无详情页分页
+
+    3. 图片策略
+       - 详情页正文图片在 wp-content/uploads/YYYY/MM/ 下
+       - 列表页缩略图在 wp-content/uploads/thumb/ 下（带 _face 或 fill_ 前缀）
+       - 需过滤 logo, avatar, default-img, 内网地址
+    """
+
+    name = "xuejieba"
+    base_url = "https://xuejieba2026.com"
+    listing_url = "https://xuejieba2026.com"
+
+    def collect_pages(self, html: str) -> list[dict]:
+        """从列表页 HTML 解析文章链接。"""
+        items = []
+        seen = set()
+
+        for m in re.finditer(
+            r'href="https://xuejieba2026\.com/(\d+)\.html"[^>]*>([^<]*)</a>',
+            html, re.DOTALL,
+        ):
+            aid = m.group(1)
+            if aid in seen:
+                continue
+            seen.add(aid)
+
+            title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            # 去掉标题末尾的无关后缀
+            title = re.sub(r"\s*阅读全文\s*$", "", title)
+
+            url = f"https://xuejieba2026.com/{aid}.html"
+            items.append({"url": url, "title": title, "id": aid})
+
+        return items
+
+    def extract_images(self, html: str) -> list[str]:
+        """从详情页 HTML 解析图片真实 URL。
+
+        提取策略:
+        1. data-src 属性（懒加载，主要来源）
+        2. src 属性中已是真实 URL
+        3. 过滤缩略图、头像、logo、占位图、内网地址
+        """
+        urls = []
+
+        # 方式1: data-src 懒加载（主要来源）
+        for m in re.finditer(
+            r'data-src="(https?://[^"]+\.(?:jpg|jpeg|png|webp|gif))"',
+            html, re.IGNORECASE,
+        ):
+            url = m.group(1)
+            if not self.should_filter_image(url) and url not in urls:
+                urls.append(url)
+
+        # 方式2: src 属性中已是真实 URL
+        for m in re.finditer(
+            r'src="(https?://[^"]+\.(?:jpg|jpeg|png|webp|gif))"',
+            html, re.IGNORECASE,
+        ):
+            url = m.group(1)
+            if url not in urls and not self.should_filter_image(url):
+                urls.append(url)
+
+        return urls
+
+    def should_filter_image(self, url: str) -> bool:
+        """过滤缩略图、头像、logo、占位图和内网地址。"""
+        # 缩略图目录
+        if "/thumb/" in url:
+            return True
+        # 头像
+        if "avatar" in url.lower():
+            return True
+        # Logo
+        if "logo" in url.lower():
+            return True
+        # 占位图
+        if "default-img" in url.lower():
+            return True
+        if "default-avatar" in url.lower():
+            return True
+        # 内网地址
+        if url.startswith(("http://192.", "http://10.", "http://172.")):
+            return True
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 内置解析器: 亚洲美女图片中心 (theasianbeauty.com)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class AsianBeautyParser(SiteParser):
+    """亚洲美女图片中心 (theasianbeauty.com) 解析器。
+
+    网站结构
+    --------
+    1. 首页直接展示图片网格，无文章列表结构
+    2. 图片 URL: https://cdn.theasianbeauty.com/media/medium_xxx_xxx.jpg
+    3. 无分页（或滚动加载）
+
+    策略: 将首页本身作为唯一"文章"，直接提取所有图片
+    """
+
+    name = "asianbeauty"
+    base_url = "https://www.theasianbeauty.com"
+    listing_url = "https://www.theasianbeauty.com"
+
+    def collect_pages(self, html: str) -> list[dict]:
+        """将首页本身作为唯一文章返回。"""
+        return [{"url": self.listing_url, "title": "首页", "id": "index"}]
+
+    def extract_images(self, html: str) -> list[str]:
+        """从首页 HTML 直接提取所有图片 URL。"""
+        urls = []
+
+        # cdn.theasianbeauty.com 图片
+        for m in re.finditer(
+            r'src="(https://cdn\.theasianbeauty\.com/media/[^"]+\.(?:jpg|jpeg|png|webp|gif))"',
+            html, re.IGNORECASE,
+        ):
+            url = m.group(1)
+            if url not in urls:
+                urls.append(url)
+
+        # 兜底：所有图片 URL
+        for m in re.finditer(
+            r'src="(https?://[^"]+\.(?:jpg|jpeg|png|webp|gif))"',
+            html, re.IGNORECASE,
+        ):
+            url = m.group(1)
+            if url not in urls and not self.should_filter_image(url):
+                urls.append(url)
+
+        return urls
+
+    def should_filter_image(self, url: str) -> bool:
+        """过滤 logo 和装饰性图片。"""
+        if "logo" in url.lower():
+            return True
+        if "icon" in url.lower():
+            return True
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # 自动注册内置解析器
 # ════════════════════════════════════════════════════════════════════════════════
 
 register_site_parser(JDlingyuParser())
 register_site_parser(DZDMRParser())
+register_site_parser(Meizi5Parser())
+register_site_parser(JKrsParser())
+register_site_parser(XuejiebaParser())
+register_site_parser(AsianBeautyParser())
