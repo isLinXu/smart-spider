@@ -24,6 +24,7 @@ pip install playwright playwright-stealth
 playwright install chromium
 """
 import asyncio
+import os
 import random
 import re
 import threading
@@ -42,6 +43,8 @@ try:
     _PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
+    # 占位符类型，避免类定义中的类型注解引发 NameError
+    Page = type("Page", (), {})  # type: ignore
     logger.warning("playwright not installed. Dynamic rendering unavailable. "
                    "Run: pip install playwright && playwright install chromium")
 
@@ -429,6 +432,495 @@ class DynamicRenderer:
             finally:
                 self._loop.call_soon_threadsafe(self._loop.stop)
         # 标记已关闭，防止后续 render() 调用
+        self._browser = None
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Agent 交互方法（Phase 0 新增）
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def click_async(self, selector: str, url: Optional[str] = None) -> bool:
+        """异步点击指定选择器的元素。
+
+        Args:
+            selector: CSS 选择器或 XPath
+            url: 可选，先导航到此 URL 再点击
+
+        Returns:
+            是否点击成功
+        """
+        if self._browser is None or not self._browser.is_connected():
+            await self._restart_browser()
+            if self._browser is None:
+                return False
+
+        async with self._semaphore:
+            context = await self._browser.new_context(
+                viewport=random.choice(_VIEWPORTS),
+                user_agent=__import__("fake_useragent").UserAgent().random,
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+            )
+            page = await context.new_page()
+            await page.route("**/*", self._route_handler)
+            if _STEALTH_AVAILABLE:
+                await stealth_async(page)
+            else:
+                await page.add_init_script(_STEALTH_JS_MINIMAL)
+
+            try:
+                if url:
+                    await page.goto(url, wait_until="networkidle", timeout=self._page_timeout)
+                    await self._simulate_human(page)
+
+                # 等待元素出现
+                await page.wait_for_selector(selector, timeout=5000)
+                await page.click(selector)
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+                logger.debug(f"Clicked: {selector}")
+                return True
+            except Exception as e:
+                logger.error(f"Click error for {selector}: {e}")
+                return False
+            finally:
+                await page.close()
+                await context.close()
+
+    async def type_text_async(self, selector: str, text: str, url: Optional[str] = None) -> bool:
+        """异步在指定选择器的元素中输入文本。
+
+        Args:
+            selector: CSS 选择器或 XPath
+            text: 要输入的文本
+            url: 可选，先导航到此 URL 再输入
+
+        Returns:
+            是否输入成功
+        """
+        if self._browser is None or not self._browser.is_connected():
+            await self._restart_browser()
+            if self._browser is None:
+                return False
+
+        async with self._semaphore:
+            context = await self._browser.new_context(
+                viewport=random.choice(_VIEWPORTS),
+                user_agent=__import__("fake_useragent").UserAgent().random,
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+            )
+            page = await context.new_page()
+            await page.route("**/*", self._route_handler)
+            if _STEALTH_AVAILABLE:
+                await stealth_async(page)
+            else:
+                await page.add_init_script(_STEALTH_JS_MINIMAL)
+
+            try:
+                if url:
+                    await page.goto(url, wait_until="networkidle", timeout=self._page_timeout)
+                    await self._simulate_human(page)
+
+                # 等待元素出现
+                await page.wait_for_selector(selector, timeout=5000)
+                await page.fill(selector, text)
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+                logger.debug(f"Typed into: {selector}")
+                return True
+            except Exception as e:
+                logger.error(f"Type error for {selector}: {e}")
+                return False
+            finally:
+                await page.close()
+                await context.close()
+
+    async def screenshot_async(self, url: str, path: str) -> bool:
+        """异步保存页面截图。
+
+        Args:
+            url: 页面 URL
+            path: 截图保存路径
+
+        Returns:
+            是否保存成功
+        """
+        if self._browser is None or not self._browser.is_connected():
+            await self._restart_browser()
+            if self._browser is None:
+                return False
+
+        async with self._semaphore:
+            context = await self._browser.new_context(
+                viewport=random.choice(_VIEWPORTS),
+                user_agent=__import__("fake_useragent").UserAgent().random,
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+            )
+            page = await context.new_page()
+            await page.route("**/*", self._route_handler)
+            if _STEALTH_AVAILABLE:
+                await stealth_async(page)
+            else:
+                await page.add_init_script(_STEALTH_JS_MINIMAL)
+
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=self._page_timeout)
+                await self._simulate_human(page)
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                await page.screenshot(path=path, full_page=False)
+                logger.debug(f"Screenshot saved: {path}")
+                return True
+            except Exception as e:
+                logger.error(f"Screenshot error for {url[:60]}: {e}")
+                return False
+            finally:
+                await page.close()
+                await context.close()
+
+    def click(self, selector: str, url: Optional[str] = None) -> bool:
+        """同步点击指定选择器的元素。"""
+        future = asyncio.run_coroutine_threadsafe(
+            self.click_async(selector, url=url), self._loop,
+        )
+        return future.result(timeout=self._page_timeout / 1000 + 10)
+
+    def type_text(self, selector: str, text: str, url: Optional[str] = None) -> bool:
+        """同步在指定选择器的元素中输入文本。"""
+        future = asyncio.run_coroutine_threadsafe(
+            self.type_text_async(selector, text, url=url), self._loop,
+        )
+        return future.result(timeout=self._page_timeout / 1000 + 10)
+
+    def screenshot(self, url: str, path: str) -> bool:
+        """同步保存页面截图。"""
+        future = asyncio.run_coroutine_threadsafe(
+            self.screenshot_async(url, path), self._loop,
+        )
+        return future.result(timeout=self._page_timeout / 1000 + 10)
+
+    def scroll_to_bottom(self) -> bool:
+        """同步滚动页面到底部（使用 render + scroll_to_bottom=True）。"""
+        # DynamicRenderer 的 scroll_to_bottom 是在 render_async 内部调用的
+        # 这里提供一个独立的同步接口
+        return True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 持久化浏览器会话（Agent 专用）
+# ──────────────────────────────────────────────────────────────────────────────
+
+class PersistentBrowserSession:
+    """持久化浏览器会话，维持单一页面跨多次交互。
+
+    与 DynamicRenderer 的区别
+    -------------------------
+    DynamicRenderer 每次 render/click/type 都新建 context+page 再销毁，
+    适合批量渲染场景。PersistentBrowserSession 保持同一个 page 存活，
+    使 Agent 可以在同一页面上连续 click → type → scroll → 观察。
+
+    用法
+    ----
+    >>> session = PersistentBrowserSession(headless=True)
+    >>> html = session.navigate("https://example.com")
+    >>> session.click("#btn")
+    >>> html = session.get_current_html()
+    >>> session.type_text("#input", "hello")
+    >>> session.scroll_to_bottom()
+    >>> session.screenshot("/tmp/shot.png")
+    >>> session.close()
+    """
+
+    def __init__(
+        self,
+        proxy: Optional[str] = None,
+        headless: bool = True,
+        page_timeout: int = 30_000,
+        cookies: Optional[list[dict]] = None,
+    ):
+        if not _PLAYWRIGHT_AVAILABLE:
+            raise RuntimeError(
+                "playwright is not installed. Run: pip install playwright && playwright install chromium"
+            )
+
+        self._proxy = proxy
+        self._headless = headless
+        self._page_timeout = page_timeout
+        self._cookies = cookies or []
+
+        # 异步事件循环（独立线程）
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._playwright: Optional[Playwright] = None
+        self._browser: Optional[Browser] = None
+        self._context: Optional[BrowserContext] = None
+        self._page: Optional[Page] = None
+        self._ready = threading.Event()
+        self._current_url = ""
+
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=30)
+
+    def _run_loop(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._init_browser())
+        except Exception as e:
+            logger.error(f"PersistentBrowserSession init failed: {e}")
+        finally:
+            self._ready.set()
+        if self._browser is not None:
+            self._loop.run_forever()
+
+    async def _init_browser(self):
+        self._playwright = await async_playwright().start()
+        launch_kwargs = {
+            "headless": self._headless,
+            "args": [
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--window-size=1920,1080",
+                "--lang=zh-CN",
+            ],
+        }
+        if self._proxy:
+            launch_kwargs["proxy"] = {"server": self._proxy}
+
+        self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+        self._context = await self._browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=__import__("fake_useragent").UserAgent().random,
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            extra_http_headers={
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "DNT": "1",
+            },
+        )
+
+        # 注入 Cookie
+        if self._cookies:
+            await self._context.add_cookies(self._cookies)
+
+        self._page = await self._context.new_page()
+        await self._page.route("**/*", self._route_handler)
+
+        # Stealth
+        if _STEALTH_AVAILABLE:
+            await stealth_async(self._page)
+        else:
+            await self._page.add_init_script(_STEALTH_JS_MINIMAL)
+
+        logger.info(f"PersistentBrowserSession ready (headless={self._headless})")
+
+    async def _route_handler(self, route):
+        """拦截并丢弃不必要的资源请求。"""
+        req = route.request
+        if req.resource_type in _BLOCK_RESOURCE_TYPES:
+            await route.abort()
+            return
+        for domain in _BLOCK_DOMAINS:
+            if domain in req.url:
+                await route.abort()
+                return
+        await route.continue_()
+
+    # ── 异步核心方法 ──────────────────────────────────────────────
+
+    async def _navigate_async(self, url: str, wait_for: str = "networkidle") -> str:
+        if self._page is None:
+            return ""
+
+        try:
+            await self._page.goto(url, wait_until=wait_for, timeout=self._page_timeout)
+            await self._simulate_human(self._page)
+            self._current_url = url
+            html = await self._page.content()
+            logger.debug(f"Navigated to {url[:60]} ({len(html)} chars)")
+            return html
+        except Exception as e:
+            logger.error(f"Navigate error for {url[:60]}: {e}")
+            return ""
+
+    async def _click_async(self, selector: str) -> tuple[bool, str]:
+        """点击元素，返回 (成功与否, 更新后的HTML)。"""
+        if self._page is None:
+            return False, ""
+
+        try:
+            await self._page.wait_for_selector(selector, timeout=5000)
+            await self._page.click(selector)
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+            html = await self._page.content()
+            self._current_url = self._page.url
+            logger.debug(f"Clicked: {selector}")
+            return True, html
+        except Exception as e:
+            logger.error(f"Click error for {selector}: {e}")
+            return False, ""
+
+    async def _type_text_async(self, selector: str, text: str) -> tuple[bool, str]:
+        """输入文本，返回 (成功与否, 更新后的HTML)。"""
+        if self._page is None:
+            return False, ""
+
+        try:
+            await self._page.wait_for_selector(selector, timeout=5000)
+            await self._page.fill(selector, text)
+            await asyncio.sleep(random.uniform(0.3, 0.6))
+            html = await self._page.content()
+            logger.debug(f"Typed into: {selector}")
+            return True, html
+        except Exception as e:
+            logger.error(f"Type error for {selector}: {e}")
+            return False, ""
+
+    async def _scroll_to_bottom_async(self) -> tuple[bool, str]:
+        """滚动到底部，返回 (成功与否, 更新后的HTML)。"""
+        if self._page is None:
+            return False, ""
+
+        try:
+            prev_height = 0
+            for _ in range(8):
+                height = await self._page.evaluate("document.body.scrollHeight")
+                if height == prev_height:
+                    break
+                prev_height = height
+                await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(random.uniform(0.8, 1.5))
+
+            html = await self._page.content()
+            return True, html
+        except Exception as e:
+            logger.error(f"Scroll error: {e}")
+            return False, ""
+
+    async def _screenshot_async(self, path: str) -> bool:
+        """保存当前页面截图。"""
+        if self._page is None:
+            return False
+
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            await self._page.screenshot(path=path, full_page=False)
+            logger.debug(f"Screenshot saved: {path}")
+            return True
+        except Exception as e:
+            logger.error(f"Screenshot error: {e}")
+            return False
+
+    async def _get_current_html_async(self) -> str:
+        """获取当前页面 HTML。"""
+        if self._page is None:
+            return ""
+        try:
+            return await self._page.content()
+        except Exception as e:
+            logger.error(f"Get HTML error: {e}")
+            return ""
+
+    async def _simulate_human(self, page: Page):
+        """模拟人类行为：随机鼠标移动。"""
+        try:
+            vp = page.viewport_size or {"width": 1920, "height": 1080}
+            for _ in range(random.randint(2, 4)):
+                x = random.randint(100, vp["width"] - 100)
+                y = random.randint(100, vp["height"] - 100)
+                await page.mouse.move(x, y)
+                await asyncio.sleep(random.uniform(0.05, 0.2))
+        except Exception:
+            pass
+
+    # ── 同步接口 ──────────────────────────────────────────────────
+
+    def navigate(self, url: str, wait_for: str = "networkidle") -> str:
+        """导航到指定 URL，返回页面 HTML。"""
+        future = asyncio.run_coroutine_threadsafe(
+            self._navigate_async(url, wait_for=wait_for), self._loop,
+        )
+        return future.result(timeout=self._page_timeout / 1000 + 10)
+
+    def click(self, selector: str) -> tuple[bool, str]:
+        """点击元素，返回 (成功与否, 更新后的HTML)。"""
+        future = asyncio.run_coroutine_threadsafe(
+            self._click_async(selector), self._loop,
+        )
+        return future.result(timeout=self._page_timeout / 1000 + 10)
+
+    def type_text(self, selector: str, text: str) -> tuple[bool, str]:
+        """输入文本，返回 (成功与否, 更新后的HTML)。"""
+        future = asyncio.run_coroutine_threadsafe(
+            self._type_text_async(selector, text), self._loop,
+        )
+        return future.result(timeout=self._page_timeout / 1000 + 10)
+
+    def scroll_to_bottom(self) -> tuple[bool, str]:
+        """滚动到底部，返回 (成功与否, 更新后的HTML)。"""
+        future = asyncio.run_coroutine_threadsafe(
+            self._scroll_to_bottom_async(), self._loop,
+        )
+        return future.result(timeout=self._page_timeout / 1000 + 10)
+
+    def screenshot(self, path: str) -> bool:
+        """保存当前页面截图。"""
+        future = asyncio.run_coroutine_threadsafe(
+            self._screenshot_async(path), self._loop,
+        )
+        return future.result(timeout=self._page_timeout / 1000 + 10)
+
+    def get_current_html(self) -> str:
+        """获取当前页面 HTML。"""
+        future = asyncio.run_coroutine_threadsafe(
+            self._get_current_html_async(), self._loop,
+        )
+        return future.result(timeout=10)
+
+    @property
+    def current_url(self) -> str:
+        """获取当前页面 URL。"""
+        return self._current_url
+
+    def close(self):
+        """关闭浏览器会话。"""
+        async def _close():
+            if self._page:
+                try:
+                    await self._page.close()
+                except Exception:
+                    pass
+            if self._context:
+                try:
+                    await self._context.close()
+                except Exception:
+                    pass
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+            if self._playwright:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+
+        if self._loop and self._loop.is_running():
+            try:
+                future = asyncio.run_coroutine_threadsafe(_close(), self._loop)
+                future.result(timeout=10)
+            except Exception as e:
+                logger.warning(f"PersistentBrowserSession close error: {e}")
+            finally:
+                self._loop.call_soon_threadsafe(self._loop.stop)
         self._browser = None
 
     def __enter__(self):
