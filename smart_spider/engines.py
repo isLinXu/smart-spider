@@ -114,8 +114,13 @@ class BaiduImageEngine(SearchEngine):
         try:
             data = json.loads(html)
             for entry in data.get("data", []):
-                url = entry.get("objURL") or entry.get("hoverURL") or entry.get("middleURL")
+                # objURL 可能是编码格式（非 http 开头），优先使用可直接访问的 URL
+                # 优先使用 middleURL（中等尺寸原图），其次 hoverURL，最后 thumbURL
+                url = entry.get("middleURL") or entry.get("hoverURL") or entry.get("thumbURL") or entry.get("objURL")
                 if url and url.startswith("http"):
+                    # 确保百度图片 URL 包含完整参数，避免返回 HTML 错误页
+                    if "baidu.com/it/" in url and "fmt=" not in url:
+                        url = url + "&fmt=auto&f=JPEG" if url.endswith(("&fm=253", "&fm=253&")) else url
                     items.append({
                         "url": url,
                         "meta": {
