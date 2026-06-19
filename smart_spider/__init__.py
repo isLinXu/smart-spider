@@ -58,6 +58,12 @@ from .agent import BrowserUseAgent
 from .browser_controller import BrowserController
 from .browser import DynamicRenderer, PersistentBrowserSession
 
+# 数据集爬取
+from .dataset_crawler import DatasetCrawler, DatasetDirManager, ProgressManager, MetadataWriter
+
+# spider_tools 桥接
+from .spider_tools_bridge import SpiderToolsBridge, SpiderToolsURL, integrate_with_dataset_crawler, parse_page_spec, list_available_sites
+
 __all__ = [
     "SmartSpider",
     "UrlDeduplicator",
@@ -112,4 +118,15 @@ __all__ = [
     "BrowserController",
     "DynamicRenderer",
     "PersistentBrowserSession",
+    # 数据集爬取
+    "DatasetCrawler",
+    "DatasetDirManager",
+    "ProgressManager",
+    "MetadataWriter",
+    # spider_tools 桥接
+    "SpiderToolsBridge",
+    "SpiderToolsURL",
+    "integrate_with_dataset_crawler",
+    "parse_page_spec",
+    "list_available_sites",
 ]
