@@ -72,8 +72,8 @@ _ENGINE_REFERERS = {
 
 # curl_cffi Chrome 版本轮换（模拟不同 Chrome 版本的 TLS 指纹）
 _CHROME_IMPERSONATES = [
-    "chrome110", "chrome107", "chrome104",
-    "chrome101", "chrome99",  "chrome95",
+    "chrome124", "chrome120", "chrome110",
+    "chrome107", "chrome104", "chrome101",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -535,7 +535,7 @@ class SmartHttpClient:
     def get_text(self, url: str, engine: Optional[str] = None) -> str:
         """便捷方法：获取文本内容，自动检测编码。"""
         resp = self.get(url, engine=engine)
-        resp.encoding = resp.apparent_encoding or "utf-8"
+        resp.encoding = getattr(resp, 'apparent_encoding', None) or resp.charset_encoding or "utf-8"
         return resp.text
 
     def get_stream(self, url: str, engine: Optional[str] = None, peek_bytes: int = 8192):
