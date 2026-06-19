@@ -166,6 +166,13 @@ cython_debug/
 /person/
 # smart_spider source code is tracked; only ignore __pycache__ and output dirs
 # /smart_spider/  (removed — was blocking source code tracking)
+
+# 爬取输出目录与临时文件
+output_*/
+.session_tmps/
+crawl_dzdmr.py
+crawl_shutterstock.py
+verify_*.py
 /动漫女生/
 /妙蛙种子/
 /室内行人/
