@@ -45,6 +45,7 @@ def baidu_json_response():
         "data": [
             {
                 "objURL": "https://img.example.com/1.jpg",
+                "middleURL": "https://img.example.com/middle1.jpg",
                 "hoverURL": "https://img.example.com/hover1.jpg",
                 "thumbURL": "https://thumb.example.com/t1.jpg",
                 "fromPageTitleEncode": "Example Title 1",
@@ -210,7 +211,7 @@ class TestBaiduImageEngine:
     def test_extract_items_json(self, baidu_json_response):
         items = self.engine.extract_items(baidu_json_response)
         assert len(items) == 2
-        assert items[0]["url"] == "https://img.example.com/1.jpg"
+        assert items[0]["url"] == "https://img.example.com/middle1.jpg"
         assert items[0]["meta"]["title"] == "Example Title 1"
         assert items[0]["meta"]["width"] == 800
 
@@ -253,6 +254,14 @@ class TestBingImageEngine:
         items = self.engine.extract_items(html)
         assert len(items) == 1
         assert items[0]["url"] == "https://img.bing.com/iurl1.jpg"
+
+    def test_extract_items_mediaurl_from_current_html(self):
+        html = (
+            '<a href="/images/search?mediaurl=https%3a%2f%2fimg.example.com%2fcat.jpg'
+            '&amp;exph=640&amp;expw=480">cat</a>'
+        )
+        items = self.engine.extract_items(html)
+        assert items == [{"url": "https://img.example.com/cat.jpg", "meta": {}}]
 
     def test_extract_items_empty(self):
         items = self.engine.extract_items("")
