@@ -130,6 +130,24 @@ def main():
         help="启用断点续传（从上次中断处继续）",
     )
 
+    # 标签与任务状态
+    parser.add_argument(
+        "--label-mode", choices=("fixed", "discovery", "hybrid"), default="hybrid",
+        help="标签模式：fixed/discovery/hybrid（默认 hybrid）",
+    )
+    parser.add_argument(
+        "--labels", type=str, default=None,
+        help="正式标签，逗号分隔；未指定时默认使用搜索关键词",
+    )
+    parser.add_argument(
+        "--state-db", type=str, default=None,
+        help="SQLite 状态库路径；默认写入输出目录",
+    )
+    parser.add_argument(
+        "--no-state-db", action="store_true",
+        help="关闭 SQLite 状态库（仅保留旧的文件进度模式）",
+    )
+
     # spider_tools 桥接
     parser.add_argument(
         "--st-sites", type=str, default=None,
@@ -156,6 +174,7 @@ def main():
 
     # 解析参数
     keywords = [kw.strip() for kw in args.keywords.split(",") if kw.strip()]
+    labels = [label.strip() for label in args.labels.split(",") if label.strip()] if args.labels else None
     engines = [e.strip() for e in args.engines.split(",") if e.strip()] if args.engines else None
     sites = [s.strip() for s in args.sites.split(",") if s.strip()] if args.sites else None
     proxies = [args.proxy] if args.proxy else None
@@ -195,6 +214,9 @@ def main():
         st_pages=st_pages,
         st_limit_per_site=args.st_limit,
         resume=args.resume,
+        label_mode=args.label_mode,
+        labels=labels,
+        state_db="" if args.no_state_db else args.state_db,
     )
 
     crawler.crawl()

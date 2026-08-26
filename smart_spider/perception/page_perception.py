@@ -282,7 +282,14 @@ class PagePerception:
             content = None
             if http_client is not None:
                 # 使用 SmartHttpClient 下载（带代理、反爬）
-                content = http_client.get(src)
+                get_bytes = getattr(http_client, "get_bytes", None)
+                if callable(get_bytes):
+                    content = get_bytes(src)
+                else:
+                    content = http_client.get(src)
+                # 兼容自定义 HTTP 客户端返回 Response 的旧实现。
+                if hasattr(content, "content"):
+                    content = content.content
 
             if content is None:
                 # 降级：使用 urllib 下载
@@ -296,7 +303,10 @@ class PagePerception:
             if not content:
                 return None
 
-            buf = io.BytesIO(content)
+            if not isinstance(content, (bytes, bytearray, memoryview)):
+                return None
+
+            buf = io.BytesIO(bytes(content))
             img = Image.open(buf).convert("RGB")
             return img
         except Exception as e:
