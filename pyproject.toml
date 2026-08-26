@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "smart-spider"
@@ -61,6 +61,10 @@ all = [
 
 [project.scripts]
 smart-spider = "spider:main"
+smart-spider-multimodal = "smart_spider.multimodal_cli:main"
+
+[tool.setuptools]
+py-modules = ["spider", "crawl_dataset", "crawl_multimodal"]
 
 [tool.setuptools.packages.find]
 where = ["."]
