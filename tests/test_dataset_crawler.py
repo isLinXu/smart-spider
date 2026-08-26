@@ -1,5 +1,6 @@
 # coding=utf-8
 """DatasetCrawler 单元测试。"""
+import io
 import json
 import os
 import shutil
@@ -7,6 +8,7 @@ import tempfile
 import threading
 
 import pytest
+from PIL import Image
 
 from smart_spider.dataset_crawler import (
     DatasetCrawler,
@@ -14,6 +16,7 @@ from smart_spider.dataset_crawler import (
     MetadataWriter,
     ProgressManager,
 )
+from smart_spider.smart_spider import UrlDeduplicator
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -106,6 +109,55 @@ class TestDatasetDirManager:
         name2 = os.path.basename(path2)
         # 不同 URL 应产生不同 hash
         assert name1 != name2
+
+    def test_atomic_save_respects_max_count_under_concurrency(self):
+        """并发保存不能超过全局目标，也不能产生重复路径。"""
+        dm = DatasetDirManager(self.tmp, batch_size=10)
+        paths = []
+        lock = threading.Lock()
+
+        def save(idx):
+            result = dm.save_content(
+                f"http://example.com/atomic-{idx}.jpg",
+                ".jpg",
+                b"image-bytes",
+                max_count=25,
+            )
+            if result is not None:
+                with lock:
+                    paths.append(result)
+
+        threads = [threading.Thread(target=save, args=(i,)) for i in range(100)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(paths) == 25
+        assert dm.saved_count == 25
+        assert len({path for _, path in paths}) == 25
+        assert dm.count_existing_images() == 25
+
+
+def test_url_dedup_claim_is_retryable_until_committed():
+    dedup = UrlDeduplicator(content_dedup=True)
+    url = "https://example.com/transient.jpg"
+    content = b"transient-content"
+    try:
+        assert dedup.claim(url) is True
+        assert dedup.claim(url) is False
+        assert dedup.claim_content(content) is True
+        dedup.release_content(content)
+        dedup.release(url)
+
+        assert dedup.claim(url) is True
+        assert dedup.claim_content(content) is True
+        dedup.commit_content(content)
+        dedup.commit(url)
+        assert dedup.claim(url) is False
+        assert dedup.claim_content(content) is False
+    finally:
+        dedup.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -288,4 +340,71 @@ class TestDatasetCrawlerInit:
             assert crawler._dir_manager.batch_size == 100
             assert crawler._dir_manager.output_dir == tmp
         finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_download_and_save_valid_image(self):
+        """真实图片字节应通过验证链并写入 metadata。"""
+        tmp = tempfile.mkdtemp()
+        crawler = None
+        try:
+            image = Image.new("RGB", (256, 256))
+            image.putdata([
+                (x % 256, y % 256, (x + y) % 256)
+                for y in range(256)
+                for x in range(256)
+            ])
+            image_bytes = io.BytesIO()
+            image.save(image_bytes, format="JPEG", quality=95)
+            payload = image_bytes.getvalue()
+
+            class FakeResponse:
+                def __init__(self, remainder):
+                    self.remainder = remainder
+
+                def iter_content(self, chunk_size=65536):
+                    yield self.remainder
+
+                def close(self):
+                    pass
+
+            crawler = DatasetCrawler(
+                keywords=["blue square"],
+                total_count=1,
+                output_dir=tmp,
+                use_clip=False,
+                min_file_size=100,
+                min_variance=1.0,
+            )
+            crawler._http.get_stream = lambda url, peek_bytes=8192: (
+                payload[:peek_bytes],
+                FakeResponse(payload[peek_bytes:]),
+            )
+
+            assert crawler._download_and_save(
+                "https://img.example.com/blue.jpg",
+                "blue square",
+                "test",
+            ) is True
+            assert crawler._dir_manager.saved_count == 1
+            image_files = [
+                os.path.join(root, name)
+                for root, _, names in os.walk(tmp)
+                for name in names
+                if name.endswith(".jpg")
+            ]
+            assert len(image_files) == 1
+            with open(os.path.join(tmp, "metadata.jsonl"), encoding="utf-8") as f:
+                record = json.loads(f.readline())
+            assert record["index"] == 0
+            assert record["file_path"] == image_files[0]
+            assert [item["name"] for item in record["labels"]] == ["blue square"]
+            assert crawler._state_store.count_candidates(crawler.job_id, "accepted") == 1
+            with open(os.path.join(tmp, "manifest.jsonl"), encoding="utf-8") as f:
+                manifest = json.loads(f.readline())
+            assert manifest["task_type"] == "image_classification"
+            assert manifest["modalities"][0]["modality"] == "image"
+            assert manifest["modalities"][0]["uri"] == os.path.relpath(record["file_path"], tmp)
+        finally:
+            if crawler is not None:
+                crawler.close()
             shutil.rmtree(tmp, ignore_errors=True)

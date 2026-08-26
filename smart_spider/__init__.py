@@ -59,7 +59,43 @@ from .browser_controller import BrowserController
 from .browser import DynamicRenderer, PersistentBrowserSession
 
 # 数据集爬取
-from .dataset_crawler import DatasetCrawler, DatasetDirManager, ProgressManager, MetadataWriter
+from .dataset_crawler import DatasetCrawler, DatasetDirManager, ProgressManager, MetadataWriter, ManifestWriter
+from .dataset_contracts import (
+    CandidateResource,
+    LabelDecision,
+    LabelMode,
+    LabelPolicy,
+    LabelResolution,
+    Modality,
+    ModalityAsset,
+    ModalityRelation,
+    QualityMetrics,
+    SampleRecord,
+)
+from .dataset_state import DatasetStateStore
+from .multimodal_pipeline import (
+    AdaptiveSourceRouter,
+    BatchAnnotationBackend,
+    AnnotationResult,
+    AnnotationRouter,
+    BrowserPageSource,
+    DiscoveryResult,
+    DiscoveryTask,
+    PageSampleExtractor,
+    RouteAction,
+    RouteDecision,
+    SourceResponse,
+    StaticPageSource,
+)
+from .multimodal_job import (
+    AssetStore,
+    MultimodalDatasetOrchestrator,
+    MultimodalJobConfig,
+    MultimodalJobReport,
+    MultimodalManifestWriter,
+)
+from .multimodal_sources import SearchDiscoverySource, SiteDiscoverySource
+from .multimodal_scale import QualityReport, ShardedManifestWriter
 
 # spider_tools 桥接
 from .spider_tools_bridge import SpiderToolsBridge, SpiderToolsURL, integrate_with_dataset_crawler, parse_page_spec, list_available_sites
@@ -123,6 +159,39 @@ __all__ = [
     "DatasetDirManager",
     "ProgressManager",
     "MetadataWriter",
+    "ManifestWriter",
+    "CandidateResource",
+    "LabelDecision",
+    "LabelMode",
+    "LabelPolicy",
+    "LabelResolution",
+    "Modality",
+    "ModalityAsset",
+    "ModalityRelation",
+    "QualityMetrics",
+    "SampleRecord",
+    "DatasetStateStore",
+    "PageSampleExtractor",
+    "AdaptiveSourceRouter",
+    "AnnotationRouter",
+    "BatchAnnotationBackend",
+    "AnnotationResult",
+    "StaticPageSource",
+    "BrowserPageSource",
+    "DiscoveryTask",
+    "DiscoveryResult",
+    "SourceResponse",
+    "RouteAction",
+    "RouteDecision",
+    "AssetStore",
+    "MultimodalDatasetOrchestrator",
+    "MultimodalJobConfig",
+    "MultimodalJobReport",
+    "MultimodalManifestWriter",
+    "ShardedManifestWriter",
+    "QualityReport",
+    "SearchDiscoverySource",
+    "SiteDiscoverySource",
     # spider_tools 桥接
     "SpiderToolsBridge",
     "SpiderToolsURL",

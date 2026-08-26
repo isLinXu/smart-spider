@@ -294,6 +294,10 @@ class UrlDeduplicator:
         self._persist_path = persist_path
         self._persist_file = None  # 写追加文件句柄
         self._content_dedup = content_dedup
+        self._claimed_urls: set[str] = set()
+        self._retryable_urls: set[str] = set()
+        self._claimed_contents: set[str] = set()
+        self._retryable_contents: set[str] = set()
 
         try:
             from pybloom_live import ScalableBloomFilter
@@ -381,6 +385,89 @@ class UrlDeduplicator:
                     return True
                 self._content_set.add(h)
             return False
+
+    def claim(self, url: str) -> bool:
+        """领取 URL，但只有 ``commit`` 后才会进入永久去重集合。"""
+        h = hashlib.md5(url.encode()).hexdigest()
+        with self._lock:
+            if h in self._claimed_urls:
+                return False
+            if h in self._retryable_urls:
+                self._retryable_urls.remove(h)
+                self._claimed_urls.add(h)
+                return True
+            if self._bloom is not None:
+                if h in self._bloom:
+                    return False
+            elif h in self._set:
+                return False
+            self._claimed_urls.add(h)
+            return True
+
+    def commit(self, url: str):
+        """成功处理 URL 后提交永久去重状态。"""
+        h = hashlib.md5(url.encode()).hexdigest()
+        with self._lock:
+            self._claimed_urls.discard(h)
+            if self._bloom is not None:
+                self._bloom.add(h)
+            else:
+                self._set.add(h)
+            if self._persist_file is not None:
+                try:
+                    self._persist_file.write(h + "\n")
+                except Exception:
+                    pass
+
+    def release(self, url: str):
+        """临时失败时释放 URL，允许后续重试。"""
+        h = hashlib.md5(url.encode()).hexdigest()
+        with self._lock:
+            if h in self._claimed_urls:
+                self._claimed_urls.remove(h)
+                self._retryable_urls.add(h)
+
+    def claim_content(self, content: bytes) -> bool:
+        """领取内容哈希，避免并发重复保存且允许失败后重试。"""
+        if not self._content_dedup:
+            return True
+        h = hashlib.md5(content).hexdigest()
+        with self._lock:
+            if h in self._claimed_contents:
+                return False
+            if h in self._retryable_contents:
+                self._retryable_contents.remove(h)
+                self._claimed_contents.add(h)
+                return True
+            if self._content_bloom is not None:
+                if h in self._content_bloom:
+                    return False
+            elif self._content_set is not None and h in self._content_set:
+                return False
+            self._claimed_contents.add(h)
+            return True
+
+    def commit_content(self, content: bytes):
+        """成功写盘后提交内容哈希。"""
+        if not self._content_dedup:
+            return
+        h = hashlib.md5(content).hexdigest()
+        with self._lock:
+            self._claimed_contents.discard(h)
+            if self._content_bloom is not None:
+                self._content_bloom.add(h)
+            elif self._content_set is not None:
+                self._content_set.add(h)
+
+    def release_content(self, content: bytes):
+        """写盘失败时释放内容哈希。"""
+        if not self._content_dedup:
+            return
+        h = hashlib.md5(content).hexdigest()
+        with self._lock:
+            if h in self._claimed_contents:
+                self._claimed_contents.remove(h)
+                self._retryable_contents.add(h)
 
     def close(self):
         """关闭持久化文件句柄。"""

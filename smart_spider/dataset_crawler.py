@@ -1,5 +1,5 @@
 # coding=utf-8
-"""数据集爬取流水线：基于 SmartSpider 的图片大规模采集，按每 100 张分桶存储。
+"""数据集采集执行器：当前以图片下载为兼容入口，输出通用多模态 manifest。
 
 架构总览
 --------
@@ -51,7 +51,8 @@ output_dir/
 │   ├── ...
 ├── batch_0200/
 │   └── ...
-├── metadata.jsonl        # 全量元数据（每行一条）
+├── metadata.jsonl        # 旧图片采集元数据（每行一条）
+├── manifest.jsonl        # 通用多模态样本事实来源
 ├── _dataset_report.json  # 采集报告
 └── .dataset_progress.json # 断点续传状态
 
@@ -72,6 +73,7 @@ import json
 import os
 import queue
 import signal
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -81,6 +83,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 from loguru import logger
+from PIL import Image
 from tqdm import tqdm
 
 from .http_client import SmartHttpClient, ProxyPool
@@ -96,6 +99,16 @@ from .smart_spider import (
 from .engines import ENGINE_REGISTRY, MediaType, RenderMode, get_engine
 from .site_crawler import SiteCrawler
 from .site_parser import SiteParser, get_site_parser
+from .dataset_contracts import (
+    CandidateResource,
+    LabelDecision,
+    LabelPolicy,
+    Modality,
+    ModalityAsset,
+    QualityMetrics,
+    SampleRecord,
+)
+from .dataset_state import DatasetStateStore
 
 # torch / clip 延迟导入
 try:
@@ -160,6 +173,60 @@ class DatasetDirManager:
         url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
         filename = f"{idx:04d}_{url_hash}{ext}"
         return os.path.join(batch_dir, filename)
+
+    def save_content(
+        self,
+        url: str,
+        ext: str,
+        content: bytes,
+        max_count: Optional[int] = None,
+    ) -> Optional[tuple[int, str]]:
+        """原子保存内容并返回 ``(index, path)``。
+
+        与历史上的 ``get_save_path`` 不同，这个方法把目标数量检查、编号
+        分配和文件提交放在同一把锁中。只有 ``os.replace`` 成功后计数器才
+        增加，因此并发 worker 不会因为失败写入消耗编号，也不会超过全局
+        目标数量。
+        """
+        if not isinstance(content, (bytes, bytearray, memoryview)):
+            raise TypeError("content must be bytes-like")
+
+        with self._lock:
+            if max_count is not None and self._saved_count >= max_count:
+                return None
+
+            idx = self._saved_count
+            batch_dir = os.path.join(
+                self.output_dir,
+                f"batch_{(idx // self.batch_size) * self.batch_size:04d}",
+            )
+            os.makedirs(batch_dir, exist_ok=True)
+            url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+            final_path = os.path.join(batch_dir, f"{idx:04d}_{url_hash}{ext}")
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    dir=batch_dir,
+                    prefix=f".{idx:04d}_",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temp_file:
+                    temp_path = temp_file.name
+                    temp_file.write(bytes(content))
+                    temp_file.flush()
+                    os.fsync(temp_file.fileno())
+                os.replace(temp_path, final_path)
+            except Exception:
+                if temp_path:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+                raise
+
+            self._saved_count += 1
+            return idx, final_path
 
     def increment(self) -> int:
         """递增计数器并返回当前值（线程安全）。"""
@@ -301,12 +368,42 @@ class MetadataWriter:
         self.close()
 
 
+class ManifestWriter:
+    """通用多模态 manifest 写入器。
+
+    ``metadata.jsonl`` 是旧图像采集格式；这里的 ``manifest.jsonl`` 是新
+    的任务事实来源，样本可以同时包含文本、图片和其他模态资产。
+    """
+
+    def __init__(self, output_dir: str):
+        self._path = os.path.join(output_dir, "manifest.jsonl")
+        self._lock = threading.Lock()
+        self._file = open(self._path, "a", encoding="utf-8", buffering=1)
+
+    def write(self, sample: SampleRecord):
+        with self._lock:
+            try:
+                self._file.write(json.dumps(sample.to_dict(), ensure_ascii=False) + "\n")
+            except Exception as e:
+                logger.warning(f"ManifestWriter: write error: {e}")
+
+    def close(self):
+        with self._lock:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+
+    def __del__(self):
+        self.close()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 数据集爬取器
 # ──────────────────────────────────────────────────────────────────────────────
 
 class DatasetCrawler:
-    """大规模图片数据集爬取器。
+    """大规模数据集采集器的图片资源兼容执行器。
 
     核心特性
     --------
@@ -315,7 +412,8 @@ class DatasetCrawler:
     3. 多源爬取：搜索引擎（SmartSpider）+ 站点深度（SiteCrawler）+ URL 列表
     4. CLIP 可选过滤：可关闭 CLIP 做全量采集，也可启用做精准过滤
     5. 断点续传：进度文件 + URL 去重持久化
-    6. 统一元数据：所有图片的元数据写入 metadata.jsonl
+    6. 兼容元数据：图片字段写入 metadata.jsonl
+    7. 通用 manifest：图片样本以多模态 SampleRecord 写入 manifest.jsonl
     7. 优雅关停：SIGINT/SIGTERM 信号处理
 
     用法
@@ -366,6 +464,12 @@ class DatasetCrawler:
         st_limit_per_site: int = 0,
         # 断点续传
         resume: bool = False,
+        # 数据集任务内核
+        label_mode: str = "hybrid",
+        labels: Optional[list[str]] = None,
+        label_policy: Optional[LabelPolicy] = None,
+        state_db: Optional[str] = None,
+        job_id: Optional[str] = None,
         # 回调
         callbacks: Optional[list[Callable]] = None,
         # 磁盘保护
@@ -385,6 +489,15 @@ class DatasetCrawler:
         self.min_file_size = min_file_size
         self._callbacks = callbacks or []
         self._disk_guard_mb = disk_guard_mb
+        self.job_id = job_id or hashlib.sha256(
+            os.path.abspath(output_dir).encode("utf-8")
+        ).hexdigest()[:16]
+        self.label_policy = label_policy or LabelPolicy(
+            mode=label_mode,
+            # 没有显式 labels 时，把当前搜索词作为默认正式标签；
+            # 自动发现的额外标签仍按 hybrid 策略进入候选区。
+            fixed_labels=labels if labels is not None else keywords,
+        )
 
         # 优雅关停
         self._shutdown_requested = threading.Event()
@@ -406,9 +519,24 @@ class DatasetCrawler:
 
         # 元数据写入器
         self._metadata_writer = MetadataWriter(output_dir)
+        self._manifest_writer = ManifestWriter(output_dir)
 
         # 进度管理器
         self._progress = ProgressManager(output_dir)
+
+        # SQLite 状态库：传入空字符串可显式关闭，默认写入输出目录。
+        self._state_store = None
+        if state_db != "":
+            db_path = state_db or os.path.join(output_dir, ".dataset_state.sqlite3")
+            self._state_store = DatasetStateStore(db_path)
+            self._state_store.create_job(
+                self.job_id,
+                {
+                    "keywords": keywords,
+                    "total_count": total_count,
+                    "label_policy": self.label_policy.to_dict(),
+                },
+            )
 
         # URL 去重
         _dedup_path = None
@@ -528,18 +656,52 @@ class DatasetCrawler:
         Returns:
             True 表示成功保存，False 表示跳过或失败
         """
-        if self._dedup.is_seen(url):
-            return False
-
         if self._dir_manager.saved_count >= self.total_count:
             return False
 
+        if not self._dedup.claim(url):
+            return False
+        url_claimed = True
+        content_claimed = False
+
+        candidate_id = None
+        if self._state_store is not None:
+            try:
+                candidate_id = self._state_store.add_candidate(
+                    self.job_id,
+                    CandidateResource(
+                        url=url,
+                        source=source,
+                        query=keyword,
+                        source_meta={"keyword": keyword},
+                    ),
+                )
+            except Exception as state_err:
+                logger.warning(f"State store candidate error: {state_err}")
+
+        def reject(reason: str) -> bool:
+            if candidate_id and self._state_store is not None:
+                try:
+                    self._state_store.reject_candidate(candidate_id, reason)
+                except Exception as state_err:
+                    logger.warning(f"State store reject error: {state_err}")
+            return False
+
+        def fail(error: str) -> bool:
+            if candidate_id and self._state_store is not None:
+                try:
+                    self._state_store.fail_candidate(candidate_id, error)
+                except Exception as state_err:
+                    logger.warning(f"State store failure error: {state_err}")
+            return False
+
         resp = None
+        full_content = None
         try:
             peek, resp = self._http.get_stream(url, peek_bytes=8192)
             ext = _detect_ext(peek)
             if ext not in (".jpg", ".png", ".webp", ".gif", ".avif", ".avis"):
-                return False
+                return reject("unsupported_image_format")
 
             # 读取完整内容
             try:
@@ -547,11 +709,11 @@ class DatasetCrawler:
                 full_content = peek + rest
             except Exception as read_err:
                 logger.warning(f"Image body read failed: {url[:55]}: {read_err}")
-                return False
+                return fail(f"read_error: {read_err}")
 
             if len(full_content) < self.min_file_size:
                 self.stats.inc_filtered("image")
-                return False
+                return reject("file_too_small")
 
             # 解码图片
             try:
@@ -563,22 +725,23 @@ class DatasetCrawler:
             except Exception:
                 logger.debug(f"Image verification failed: {url[:55]}")
                 self.stats.inc_failed("image")
-                return False
+                return reject("invalid_image")
 
             # 尺寸过滤
             if img.width < self.min_width or img.height < self.min_height:
                 self.stats.inc_filtered("image")
-                return False
+                return reject("image_too_small")
 
             # 低方差过滤
             arr = np.array(img.resize((32, 32)))
             if np.std(arr) < self.min_variance:
                 self.stats.inc_filtered("image")
-                return False
+                return reject("low_variance")
 
             # 内容去重
-            if self._dedup.is_content_seen(full_content):
-                return False
+            if not self._dedup.claim_content(full_content):
+                return reject("duplicate_content")
+            content_claimed = True
 
             # CLIP 过滤（可选）
             sim = 0.0
@@ -600,17 +763,78 @@ class DatasetCrawler:
                                 media_type="image", url=url,
                                 detail={"sim": round(sim, 4), "reason": "clip_low_sim"},
                             ))
-                            return False
+                            return reject("clip_low_sim")
                     except Exception as e:
                         logger.debug(f"CLIP inference error: {e}")
 
-            # 保存图片
-            save_path = self._dir_manager.get_save_path(url, ext)
-            with open(save_path, "wb") as f:
-                f.write(full_content)
+            # 原子保存图片；再次在锁内检查全局目标，避免并发超量。
+            saved = self._dir_manager.save_content(
+                url,
+                ext,
+                full_content,
+                max_count=self.total_count,
+            )
+            if saved is None:
+                return reject("target_reached")
+            idx, save_path = saved
+            self._dedup.commit_content(full_content)
+            content_claimed = False
+            self._dedup.commit(url)
+            url_claimed = False
+
+            label_resolution = self.label_policy.resolve([
+                LabelDecision(keyword, 1.0, "query")
+            ])
+            content_hash = hashlib.sha256(full_content).hexdigest()
+            quality = QualityMetrics(
+                modality=Modality.IMAGE.value,
+                width=img.width,
+                height=img.height,
+                file_size=len(full_content),
+                format=img.format or ext.lstrip("."),
+                variance=float(np.var(arr)),
+                validated=True,
+            )
+
+            sample = SampleRecord(
+                sample_id=f"sha256:{content_hash}",
+                file=os.path.relpath(save_path, self.output_dir),
+                labels=label_resolution.labels,
+                quality=quality,
+                provenance={
+                    "source": source,
+                    "query": keyword,
+                    "url": url,
+                },
+                pipeline={
+                    "job_id": self.job_id,
+                    "label_policy": self.label_policy.to_dict(),
+                    "status": "accepted",
+                },
+                modalities=[ModalityAsset(
+                    modality=Modality.IMAGE,
+                    role="image",
+                    uri=os.path.relpath(save_path, self.output_dir),
+                    mime_type=f"image/{ext.lstrip('.')}",
+                )],
+                task_type="image_classification",
+            )
+
+            if candidate_id and self._state_store is not None:
+                try:
+                    self._state_store.add_sample(
+                        self.job_id,
+                        sample,
+                        candidate_id=candidate_id,
+                        content_hash=content_hash,
+                    )
+                except Exception as state_err:
+                    # 文件已经原子提交，状态库异常不能让样本被误报为下载失败。
+                    logger.warning(f"State store sample error: {state_err}")
+
+            self._manifest_writer.write(sample)
 
             # 写入元数据
-            idx = self._dir_manager.saved_count - 1  # get_save_path 已递增
             batch_name = f"batch_{(idx // self.batch_size) * self.batch_size:04d}"
             self._metadata_writer.write({
                 "index": idx,
@@ -623,6 +847,9 @@ class DatasetCrawler:
                 "width": img.width,
                 "height": img.height,
                 "ext": ext,
+                "labels": [item.to_dict() for item in label_resolution.labels],
+                "label_candidates": [item.to_dict() for item in label_resolution.candidates],
+                "quality": quality.to_dict(),
             })
 
             self.stats.inc_saved("image")
@@ -640,13 +867,17 @@ class DatasetCrawler:
         except Exception as e:
             logger.warning(f"Download error {url[:55]}: {e}")
             self.stats.inc_failed("image")
-            return False
+            return fail(str(e))
         finally:
             if resp is not None:
                 try:
                     resp.close()
                 except Exception:
                     pass
+            if content_claimed and full_content is not None:
+                self._dedup.release_content(full_content)
+            if url_claimed:
+                self._dedup.release(url)
 
     # ──────────────────────────────────────────────────────────────
     # 搜索引擎爬取
@@ -810,6 +1041,15 @@ class DatasetCrawler:
     # 主入口
     # ──────────────────────────────────────────────────────────────
 
+    def close(self):
+        """关闭元数据、去重和 SQLite 状态资源。"""
+        self._metadata_writer.close()
+        self._manifest_writer.close()
+        self._dedup.close()
+        if self._state_store is not None:
+            self._state_store.close()
+            self._state_store = None
+
     def crawl(self):
         """执行数据集爬取任务。"""
         try:
@@ -871,8 +1111,7 @@ class DatasetCrawler:
 
         finally:
             # 清理资源
-            self._metadata_writer.close()
-            self._dedup.close()
+            self.close()
             signal.signal(signal.SIGINT, self._original_sigint)
             signal.signal(signal.SIGTERM, self._original_sigterm)
 

@@ -161,6 +161,15 @@ class BingImageEngine(SearchEngine):
                 }
             })
         if not items:
+            # Bing 当前图片页常把原图放在详情链接的 mediaurl 查询参数中，
+            # 而不是旧版的 murl JSON 字段；兼容 HTML entity + URL 编码。
+            for encoded_url in re.findall(
+                r"mediaurl=([^&\"'<>\s]+)", html, flags=re.IGNORECASE
+            ):
+                url = unquote(encoded_url)
+                if url.startswith("http"):
+                    items.append({"url": url, "meta": {}})
+        if not items:
             for url in re.findall(r'"iurl":"(https?://[^"]+)"', html):
                 items.append({"url": url, "meta": {}})
         return items
