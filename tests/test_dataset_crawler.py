@@ -16,6 +16,7 @@ from smart_spider.dataset_crawler import (
     MetadataWriter,
     ProgressManager,
 )
+from smart_spider.dataset_contracts import LabelPolicy
 from smart_spider.smart_spider import UrlDeduplicator
 
 
@@ -340,6 +341,28 @@ class TestDatasetCrawlerInit:
             assert crawler._dir_manager.batch_size == 100
             assert crawler._dir_manager.output_dir == tmp
         finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_query_label_decisions_support_multiple_labels_and_aliases(self):
+        """组合查询词应解析为多个固定标签，并支持可选别名。"""
+        tmp = tempfile.mkdtemp()
+        crawler = None
+        try:
+            crawler = DatasetCrawler(
+                keywords=["forklift worker"],
+                total_count=1,
+                output_dir=tmp,
+                use_clip=False,
+                label_policy=LabelPolicy(
+                    fixed_labels=["叉车", "工区", "工人"],
+                    aliases={"forklift": "叉车", "worker": "工人"},
+                ),
+            )
+            decisions = crawler._query_label_decisions("forklift worker")
+            assert [item.name for item in decisions] == ["叉车", "工人"]
+        finally:
+            if crawler is not None:
+                crawler.close()
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_download_and_save_valid_image(self):

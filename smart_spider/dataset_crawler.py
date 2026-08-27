@@ -72,6 +72,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import signal
 import tempfile
 import threading
@@ -648,6 +649,48 @@ class DatasetCrawler:
     # 图片下载 + 过滤 + 保存
     # ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _query_contains_term(query: str, term: str) -> bool:
+        """判断搜索词是否包含一个标签词或别名。"""
+        if not term:
+            return False
+        if any(ord(char) > 127 for char in term):
+            return term in query
+        return re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])",
+            query,
+        ) is not None
+
+    def _query_label_decisions(self, keyword: str) -> list[LabelDecision]:
+        """从组合搜索词解析多个正式标签，未命中时保持旧兼容行为。"""
+        query = self.label_policy._key(keyword)
+        fixed_by_key = {
+            self.label_policy._key(label): label
+            for label in self.label_policy.fixed_labels
+        }
+        decisions: list[LabelDecision] = []
+        seen: set[str] = set()
+
+        def add(label: str, evidence: dict[str, Any]):
+            key = self.label_policy._key(label)
+            if key and key in fixed_by_key and key not in seen:
+                seen.add(key)
+                decisions.append(LabelDecision(
+                    fixed_by_key[key], 1.0, "query", evidence,
+                ))
+
+        for key, label in fixed_by_key.items():
+            if self._query_contains_term(query, key):
+                add(label, {"query": keyword, "match": key})
+
+        for alias, label in self.label_policy.aliases.items():
+            if self._query_contains_term(query, alias):
+                add(label, {"query": keyword, "alias": alias})
+
+        if not decisions:
+            decisions.append(LabelDecision(keyword, 1.0, "query"))
+        return decisions
+
     def _download_and_save(self, url: str, keyword: str, source: str) -> bool:
         """下载单张图片，经过过滤后保存到分桶目录。
 
@@ -782,9 +825,9 @@ class DatasetCrawler:
             self._dedup.commit(url)
             url_claimed = False
 
-            label_resolution = self.label_policy.resolve([
-                LabelDecision(keyword, 1.0, "query")
-            ])
+            label_resolution = self.label_policy.resolve(
+                self._query_label_decisions(keyword)
+            )
             content_hash = hashlib.sha256(full_content).hexdigest()
             quality = QualityMetrics(
                 modality=Modality.IMAGE.value,
