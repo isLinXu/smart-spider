@@ -272,6 +272,24 @@ class TestDatasetCrawlerInit:
             assert crawler.model is None
             assert crawler.total_count == 100
             assert crawler.batch_size == 100
+            assert crawler.image_output_format == "jpg"
+            assert crawler.jpeg_quality == 95
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_image_output_format_can_preserve_source(self):
+        """默认转 JPG，但允许任务显式保留源格式。"""
+        tmp = tempfile.mkdtemp()
+        try:
+            crawler = DatasetCrawler(
+                keywords=["test"],
+                total_count=1,
+                output_dir=tmp,
+                use_clip=False,
+                image_output_format="original",
+            )
+            assert crawler.image_output_format is None
+            crawler.close()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -419,7 +437,7 @@ class TestDatasetCrawlerInit:
                 for x in range(256)
             ])
             image_bytes = io.BytesIO()
-            image.save(image_bytes, format="JPEG", quality=95)
+            image.save(image_bytes, format="PNG")
             payload = image_bytes.getvalue()
 
             class FakeResponse:
@@ -458,10 +476,16 @@ class TestDatasetCrawlerInit:
                 if name.endswith(".jpg")
             ]
             assert len(image_files) == 1
+            with Image.open(image_files[0]) as saved_image:
+                assert saved_image.format == "JPEG"
             with open(os.path.join(tmp, "metadata.jsonl"), encoding="utf-8") as f:
                 record = json.loads(f.readline())
             assert record["index"] == 0
             assert record["file_path"] == image_files[0]
+            assert record["ext"] == ".jpg"
+            assert record["source_ext"] == ".png"
+            assert record["quality"]["format"] == "jpeg"
+            assert record["format_conversion"]["enabled"] is True
             assert [item["name"] for item in record["labels"]] == ["blue square"]
             assert crawler._state_store.count_candidates(crawler.job_id, "accepted") == 1
             with open(os.path.join(tmp, "manifest.jsonl"), encoding="utf-8") as f:
