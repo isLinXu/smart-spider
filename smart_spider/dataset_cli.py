@@ -77,6 +77,14 @@ def main():
         "--image-similarity-threshold", type=float, default=0.75,
         help="查询图片相似度阈值（默认 0.75）",
     )
+    parser.add_argument(
+        "--image-output-format", choices=("jpg", "original"), default="jpg",
+        help="图片落盘格式：jpg（默认）或 original（保留源格式）",
+    )
+    parser.add_argument(
+        "--jpeg-quality", type=int, default=95,
+        help="JPEG 输出质量 1-100（默认 95）",
+    )
 
     # 搜索引擎
     parser.add_argument(
@@ -211,6 +219,8 @@ def main():
         clip_model=args.clip_model,
         query_image=args.query_image,
         image_similarity_threshold=args.image_similarity_threshold,
+        image_output_format=args.image_output_format,
+        jpeg_quality=args.jpeg_quality,
         proxies=proxies,
         rate=args.rate,
         max_workers=args.max_workers,

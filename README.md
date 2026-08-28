@@ -89,6 +89,16 @@ smart-spider-image-search --query-image ./query.jpg \
 
 在 `dataset_cli` 中传入 `--query-image` 后，关键词或站点仍负责发现互联网候选，下载并完成基础图片校验后，再用查询图片做视觉相似度二次筛选；通过 `--image-similarity-threshold` 调整严格程度。最终 `metadata.jsonl` 的 `image_sim`、`manifest.jsonl` 的 `pipeline.image_query` 会记录筛选证据。
 
+图片数据集默认在下载、校验和过滤后统一转换为 JPG（JPEG quality 默认 95），并同步更新图片路径、MIME、质量字段和样本 ID。需要保留源格式时使用：
+
+```bash
+python -m smart_spider.dataset_cli \
+    --keywords "cat" --total 1000 --output ./dataset_cats \
+    --image-output-format original
+```
+
+可通过 `--jpeg-quality 1-100` 调整 JPG 质量。
+
 ## 参数说明
 
 ### 基础参数
