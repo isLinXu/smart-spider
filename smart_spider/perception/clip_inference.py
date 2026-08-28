@@ -54,6 +54,17 @@ class CLIPInference:
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         return image_features
 
+    def encode_images(self, images: list["PIL.Image.Image"]) -> "torch.Tensor":
+        """批量编码图片为归一化特征向量。"""
+        import torch as _torch
+        if not images:
+            raise ValueError("images must not be empty")
+        tensors = _torch.stack([self.preprocess(image) for image in images]).to(self.device)
+        with _torch.no_grad():
+            image_features = self.model.encode_image(tensors)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        return image_features
+
     def compute_similarity(self, image_features: "torch.Tensor", text_features: "torch.Tensor") -> float:
         """计算余弦相似度。"""
         import torch as _torch

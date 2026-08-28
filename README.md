@@ -56,7 +56,48 @@ python spider.py --keywords 猫咪 \
     --media_types video \
     --search_engines bilibili \
     --cookies_file ./cookies.txt
+
+# 建立本地图片索引并以图搜图
+python -m smart_spider.image_search_cli \
+    --build-from ./output --index ./output/image_index.npz
+python -m smart_spider.image_search_cli \
+    --query-image ./query.jpg \
+    --index ./output/image_index.npz \
+    --top-k 20 --threshold 0.75
+
+# 在现有数据集爬取链路中使用查询图片筛选候选
+python -m smart_spider.dataset_cli \
+    --keywords "cat" \
+    --query-image ./query.jpg \
+    --image-similarity-threshold 0.75 \
+    --total 1000 --output ./dataset_cats
 ```
+
+### 本地以图搜图
+
+以图搜图第一版复用项目已有的 CLIP 图像编码器，在已采集目录或任意本地图片目录中建立向量索引。索引文件只包含归一化向量、图片路径和基础图片元数据，不会修改原始图片；查询结果按余弦相似度降序输出为 JSON。
+
+也可以使用安装后的命令：
+
+```bash
+smart-spider-image-search --build-from ./output --index ./output/image_index.npz
+smart-spider-image-search --query-image ./query.jpg \
+    --index ./output/image_index.npz --top-k 20
+```
+
+`--device cuda` 可启用 GPU，`--batch-size` 控制建立索引时的批大小，`--threshold` 用于过滤低相似度结果。当前实现面向本地数据集检索，索引/查询 API 已与编码器解耦，后续可以增加百度、Bing 或其他外部反向图片搜索 provider。
+
+在 `dataset_cli` 中传入 `--query-image` 后，关键词或站点仍负责发现互联网候选，下载并完成基础图片校验后，再用查询图片做视觉相似度二次筛选；通过 `--image-similarity-threshold` 调整严格程度。最终 `metadata.jsonl` 的 `image_sim`、`manifest.jsonl` 的 `pipeline.image_query` 会记录筛选证据。
+
+图片数据集默认在下载、校验和过滤后统一转换为 JPG（JPEG quality 默认 95），并同步更新图片路径、MIME、质量字段和样本 ID。需要保留源格式时使用：
+
+```bash
+python -m smart_spider.dataset_cli \
+    --keywords "cat" --total 1000 --output ./dataset_cats \
+    --image-output-format original
+```
+
+可通过 `--jpeg-quality 1-100` 调整 JPG 质量。
 
 ## 参数说明
 

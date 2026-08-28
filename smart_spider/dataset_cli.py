@@ -21,6 +21,10 @@ python -m smart_spider.dataset_cli --keywords "illustration" --total 1000 --site
 # 断点续传
 python -m smart_spider.dataset_cli --keywords "cat" --total 5000 --resume --output ./dataset_cats
 
+# 以图搜图：关键词发现候选，查询图片做视觉二次筛选
+python -m smart_spider.dataset_cli --keywords "cat" --query-image ./query.jpg \
+    --image-similarity-threshold 0.75 --total 1000 --output ./dataset_cats
+
 # 自定义分桶大小
 python -m smart_spider.dataset_cli --keywords "flower" --total 2000 --batch-size 200 --output ./dataset_flowers
 
@@ -64,6 +68,22 @@ def main():
     parser.add_argument(
         "--clip-model", type=str, default="ViT-B/32",
         help="CLIP 模型名称（默认 ViT-B/32）",
+    )
+    parser.add_argument(
+        "--query-image", type=str, default=None,
+        help="查询图片路径；候选下载后按视觉相似度二次筛选",
+    )
+    parser.add_argument(
+        "--image-similarity-threshold", type=float, default=0.75,
+        help="查询图片相似度阈值（默认 0.75）",
+    )
+    parser.add_argument(
+        "--image-output-format", choices=("jpg", "original"), default="jpg",
+        help="图片落盘格式：jpg（默认）或 original（保留源格式）",
+    )
+    parser.add_argument(
+        "--jpeg-quality", type=int, default=95,
+        help="JPEG 输出质量 1-100（默认 95）",
     )
 
     # 搜索引擎
@@ -197,6 +217,10 @@ def main():
         use_clip=not args.no_clip,
         similarity_threshold=args.similarity_threshold,
         clip_model=args.clip_model,
+        query_image=args.query_image,
+        image_similarity_threshold=args.image_similarity_threshold,
+        image_output_format=args.image_output_format,
+        jpeg_quality=args.jpeg_quality,
         proxies=proxies,
         rate=args.rate,
         max_workers=args.max_workers,

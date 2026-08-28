@@ -62,6 +62,7 @@ all = [
 [project.scripts]
 smart-spider = "spider:main"
 smart-spider-multimodal = "smart_spider.multimodal_cli:main"
+smart-spider-image-search = "smart_spider.image_search_cli:main"
 
 [tool.setuptools]
 py-modules = ["spider", "crawl_dataset", "crawl_multimodal"]

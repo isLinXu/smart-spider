@@ -72,6 +72,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import signal
 import tempfile
 import threading
@@ -132,6 +133,8 @@ except ImportError:
 _BATCH_SIZE = 100          # 每个子目录存放的图片数量
 _DEFAULT_DISK_GUARD_MB = 100
 _QUEUE_PUT_TIMEOUT = 5.0
+_DEFAULT_IMAGE_OUTPUT_FORMAT = "jpg"
+_DEFAULT_JPEG_QUALITY = 95
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -474,6 +477,12 @@ class DatasetCrawler:
         callbacks: Optional[list[Callable]] = None,
         # 磁盘保护
         disk_guard_mb: int = _DEFAULT_DISK_GUARD_MB,
+        # 以图搜图过滤（追加到末尾，保持旧位置参数兼容）
+        query_image: Optional[str] = None,
+        image_similarity_threshold: float = 0.75,
+        # 图片落盘格式（追加到末尾，保持旧位置参数兼容）
+        image_output_format: Optional[str] = _DEFAULT_IMAGE_OUTPUT_FORMAT,
+        jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
     ):
         self.keywords = keywords
         self.total_count = total_count
@@ -482,6 +491,29 @@ class DatasetCrawler:
         self.use_clip = use_clip
         self.similarity_threshold = similarity_threshold
         self.clip_model_name = clip_model
+        self.query_image = query_image
+        self.image_similarity_threshold = image_similarity_threshold
+        if not -1.0 <= image_similarity_threshold <= 1.0:
+            raise ValueError("image_similarity_threshold must be between -1 and 1")
+        if image_output_format is None:
+            self.image_output_format = None
+        else:
+            normalized_output_format = image_output_format.strip().lower().lstrip(".")
+            if normalized_output_format in {"original", "source"}:
+                self.image_output_format = None
+            elif normalized_output_format in {"jpg", "jpeg"}:
+                self.image_output_format = "jpg"
+            else:
+                raise ValueError(
+                    "image_output_format must be 'jpg' (default), 'original', or None"
+                )
+        if not 1 <= jpeg_quality <= 100:
+            raise ValueError("jpeg_quality must be between 1 and 100")
+        self.jpeg_quality = jpeg_quality
+        if query_image and (not use_clip or not _CLIP_AVAILABLE):
+            raise RuntimeError(
+                "query_image requires CLIP; remove --no-clip and install openai-clip"
+            )
         self.max_workers = max_workers
         self.min_width = min_width
         self.min_height = min_height
@@ -581,6 +613,8 @@ class DatasetCrawler:
         self.device = "cpu"
         self._clip_text_cache: dict[str, Optional[Any]] = {}
         self._clip_text_cache_lock = threading.Lock()
+        self._clip_infer_lock = threading.Lock()
+        self._image_query_feature = None
 
         if use_clip:
             if not _CLIP_AVAILABLE:
@@ -592,6 +626,13 @@ class DatasetCrawler:
                 self.model, self.preprocess = clip.load(self.clip_model_name, device=self.device)
                 self.model.eval()
                 logger.info(f"CLIP model '{self.clip_model_name}' loaded on {self.device}")
+
+        if self.query_image:
+            if not self.use_clip or self.model is None or self.preprocess is None:
+                raise RuntimeError(
+                    "query_image requires CLIP; remove --no-clip and install openai-clip"
+                )
+            self._image_query_feature = self._encode_image_file(self.query_image)
 
         # 断点续传：恢复已保存数量
         if resume:
@@ -644,9 +685,117 @@ class DatasetCrawler:
             self._clip_text_cache[keyword] = result
         return result
 
+    def _encode_image(self, image: Image.Image):
+        """编码单张图片并返回归一化 CLIP 向量。"""
+        if self.model is None or self.preprocess is None:
+            return None
+        img_tensor = self.preprocess(image).unsqueeze(0).to(self.device)
+        # CLIP 模型在多个下载线程之间共享；串行化 forward，兼容 CPU/GPU
+        # 及自定义模型后端的线程安全边界。
+        with self._clip_infer_lock:
+            with torch.no_grad():
+                img_feat = self.model.encode_image(img_tensor)
+                img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+        return img_feat
+
+    def _encode_image_file(self, path: str):
+        """读取查询图片并生成归一化 CLIP 向量。"""
+        try:
+            with Image.open(path) as image:
+                return self._encode_image(image.convert("RGB"))
+        except Exception as exc:
+            raise ValueError(f"cannot encode query image '{path}': {exc}") from exc
+
+    def _image_query_similarity(self, image: Image.Image) -> Optional[float]:
+        """计算候选图片与查询图片的余弦相似度。"""
+        if self._image_query_feature is None:
+            return None
+        image_feature = self._encode_image(image)
+        if image_feature is None:
+            return None
+        return float(torch.nn.functional.cosine_similarity(
+            image_feature,
+            self._image_query_feature,
+        ).item())
+
     # ──────────────────────────────────────────────────────────────
     # 图片下载 + 过滤 + 保存
     # ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _query_contains_term(query: str, term: str) -> bool:
+        """判断搜索词是否包含一个标签词或别名。"""
+        if not term:
+            return False
+        if any(ord(char) > 127 for char in term):
+            return term in query
+        return re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])",
+            query,
+        ) is not None
+
+    def _query_label_decisions(self, keyword: str) -> list[LabelDecision]:
+        """从组合搜索词解析多个正式标签，未命中时保持旧兼容行为。"""
+        query = self.label_policy._key(keyword)
+        fixed_by_key = {
+            self.label_policy._key(label): label
+            for label in self.label_policy.fixed_labels
+        }
+        decisions: list[LabelDecision] = []
+        seen: set[str] = set()
+
+        def add(label: str, evidence: dict[str, Any]):
+            key = self.label_policy._key(label)
+            if key and key in fixed_by_key and key not in seen:
+                seen.add(key)
+                decisions.append(LabelDecision(
+                    fixed_by_key[key], 1.0, "query", evidence,
+                ))
+
+        for key, label in fixed_by_key.items():
+            if self._query_contains_term(query, key):
+                add(label, {"query": keyword, "match": key})
+
+        for alias, label in self.label_policy.aliases.items():
+            if self._query_contains_term(query, alias):
+                add(label, {"query": keyword, "alias": alias})
+
+        if not decisions:
+            decisions.append(LabelDecision(keyword, 1.0, "query"))
+        return decisions
+
+    def _prepare_output_image(
+        self,
+        image: Image.Image,
+        source_content: bytes,
+        source_ext: str,
+    ) -> tuple[bytes, str, str, dict[str, Any]]:
+        """在图片通过过滤后，按配置生成最终落盘内容。
+
+        内容去重仍使用下载到的原始字节；这里只负责生成数据集最终保存的
+        字节，因此 WebP/GIF 等源格式默认会以 JPEG 文件落盘。
+        """
+        source_format = (image.format or source_ext.lstrip(".") or "unknown").lower()
+        if self.image_output_format is None:
+            return source_content, source_ext, source_format, {
+                "enabled": False,
+                "from_format": source_format,
+                "to_format": source_format,
+            }
+
+        output = BytesIO()
+        image.save(
+            output,
+            format="JPEG",
+            quality=self.jpeg_quality,
+            optimize=True,
+        )
+        return output.getvalue(), ".jpg", "jpeg", {
+            "enabled": True,
+            "from_format": source_format,
+            "to_format": "jpeg",
+            "quality": self.jpeg_quality,
+        }
 
     def _download_and_save(self, url: str, keyword: str, source: str) -> bool:
         """下载单张图片，经过过滤后保存到分桶目录。
@@ -745,14 +894,12 @@ class DatasetCrawler:
 
             # CLIP 过滤（可选）
             sim = 0.0
+            image_sim = None
             if self.use_clip and self.model is not None:
                 text_feat = self._get_text_feature(keyword)
                 if text_feat is not None:
                     try:
-                        img_tensor = self.preprocess(img).unsqueeze(0).to(self.device)
-                        with torch.no_grad():
-                            img_feat = self.model.encode_image(img_tensor)
-                            img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+                        img_feat = self._encode_image(img)
                         sim = torch.nn.functional.cosine_similarity(
                             img_feat, text_feat
                         ).item()
@@ -767,11 +914,37 @@ class DatasetCrawler:
                     except Exception as e:
                         logger.debug(f"CLIP inference error: {e}")
 
+            # 以图搜图过滤：关键词/站点负责发现候选，查询图片负责视觉二次筛选。
+            if self._image_query_feature is not None:
+                try:
+                    image_sim = self._image_query_similarity(img)
+                    if image_sim is None:
+                        return reject("image_query_inference_error")
+                    if image_sim < self.image_similarity_threshold:
+                        self.stats.inc_filtered("image")
+                        self._emit_callback(CrawlEvent(
+                            event_type="item_filtered", keyword=keyword,
+                            media_type="image", url=url,
+                            detail={
+                                "image_sim": round(image_sim, 4),
+                                "image_similarity_threshold": self.image_similarity_threshold,
+                                "reason": "image_query_low_sim",
+                            },
+                        ))
+                        return reject("image_query_low_sim")
+                except Exception as e:
+                    logger.debug(f"Image query inference error: {e}")
+                    return reject("image_query_inference_error")
+
+            output_content, output_ext, output_format, format_conversion = (
+                self._prepare_output_image(img, full_content, ext)
+            )
+
             # 原子保存图片；再次在锁内检查全局目标，避免并发超量。
             saved = self._dir_manager.save_content(
                 url,
-                ext,
-                full_content,
+                output_ext,
+                output_content,
                 max_count=self.total_count,
             )
             if saved is None:
@@ -782,16 +955,16 @@ class DatasetCrawler:
             self._dedup.commit(url)
             url_claimed = False
 
-            label_resolution = self.label_policy.resolve([
-                LabelDecision(keyword, 1.0, "query")
-            ])
-            content_hash = hashlib.sha256(full_content).hexdigest()
+            label_resolution = self.label_policy.resolve(
+                self._query_label_decisions(keyword)
+            )
+            content_hash = hashlib.sha256(output_content).hexdigest()
             quality = QualityMetrics(
                 modality=Modality.IMAGE.value,
                 width=img.width,
                 height=img.height,
-                file_size=len(full_content),
-                format=img.format or ext.lstrip("."),
+                file_size=len(output_content),
+                format=output_format,
                 variance=float(np.var(arr)),
                 validated=True,
             )
@@ -809,13 +982,23 @@ class DatasetCrawler:
                 pipeline={
                     "job_id": self.job_id,
                     "label_policy": self.label_policy.to_dict(),
+                    "format_conversion": format_conversion,
+                    "image_query": {
+                        "path": self.query_image,
+                        "similarity": round(image_sim, 4) if image_sim is not None else None,
+                        "threshold": self.image_similarity_threshold,
+                    } if self.query_image else None,
                     "status": "accepted",
                 },
                 modalities=[ModalityAsset(
                     modality=Modality.IMAGE,
                     role="image",
                     uri=os.path.relpath(save_path, self.output_dir),
-                    mime_type=f"image/{ext.lstrip('.')}",
+                    mime_type=(
+                        "image/jpeg"
+                        if output_ext == ".jpg"
+                        else f"image/{output_ext.lstrip('.') }"
+                    ),
                 )],
                 task_type="image_classification",
             )
@@ -844,9 +1027,12 @@ class DatasetCrawler:
                 "keyword": keyword,
                 "source": source,
                 "sim": round(sim, 4),
+                "image_sim": round(image_sim, 4) if image_sim is not None else None,
                 "width": img.width,
                 "height": img.height,
-                "ext": ext,
+                "ext": output_ext,
+                "source_ext": ext,
+                "format_conversion": format_conversion,
                 "labels": [item.to_dict() for item in label_resolution.labels],
                 "label_candidates": [item.to_dict() for item in label_resolution.candidates],
                 "quality": quality.to_dict(),
@@ -856,7 +1042,12 @@ class DatasetCrawler:
             self._emit_callback(CrawlEvent(
                 event_type="item_saved", keyword=keyword,
                 media_type="image", url=url,
-                detail={"sim": round(sim, 4), "file": save_path, "index": idx},
+                detail={
+                    "sim": round(sim, 4),
+                    "image_sim": round(image_sim, 4) if image_sim is not None else None,
+                    "file": save_path,
+                    "index": idx,
+                },
             ))
 
             if idx % 100 == 0 and idx > 0:
@@ -1124,6 +1315,8 @@ class DatasetCrawler:
         report["search_engines"] = self.search_engines
         report["site_parsers"] = self._site_parsers
         report["use_clip"] = self.use_clip
+        report["image_output_format"] = self.image_output_format or "original"
+        report["jpeg_quality"] = self.jpeg_quality
         report["batch_size"] = self.batch_size
         report["batches"] = self._dir_manager.list_batches()
         report["shutdown"] = self._shutdown_requested.is_set()

@@ -16,6 +16,7 @@ from smart_spider.dataset_crawler import (
     MetadataWriter,
     ProgressManager,
 )
+from smart_spider.dataset_contracts import LabelPolicy
 from smart_spider.smart_spider import UrlDeduplicator
 
 
@@ -271,6 +272,24 @@ class TestDatasetCrawlerInit:
             assert crawler.model is None
             assert crawler.total_count == 100
             assert crawler.batch_size == 100
+            assert crawler.image_output_format == "jpg"
+            assert crawler.jpeg_quality == 95
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_image_output_format_can_preserve_source(self):
+        """默认转 JPG，但允许任务显式保留源格式。"""
+        tmp = tempfile.mkdtemp()
+        try:
+            crawler = DatasetCrawler(
+                keywords=["test"],
+                total_count=1,
+                output_dir=tmp,
+                use_clip=False,
+                image_output_format="original",
+            )
+            assert crawler.image_output_format is None
+            crawler.close()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -287,6 +306,48 @@ class TestDatasetCrawlerInit:
             )
             assert crawler.search_engines == ["baidu"]
         finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_query_image_requires_clip(self):
+        """以图搜图不能在明确关闭 CLIP 时静默失效。"""
+        tmp = tempfile.mkdtemp()
+        query = os.path.join(tmp, "query.jpg")
+        Image.new("RGB", (32, 32), (255, 0, 0)).save(query)
+        with pytest.raises(RuntimeError, match="query_image requires CLIP"):
+            DatasetCrawler(
+                keywords=["test"],
+                total_count=1,
+                output_dir=os.path.join(tmp, "dataset"),
+                use_clip=False,
+                query_image=query,
+            )
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_image_query_similarity_uses_visual_embedding(self):
+        """查询图片过滤器应使用归一化图像向量计算余弦相似度。"""
+        torch = pytest.importorskip("torch")
+        tmp = tempfile.mkdtemp()
+        crawler = None
+        try:
+            crawler = DatasetCrawler(
+                keywords=["test"],
+                total_count=1,
+                output_dir=tmp,
+                use_clip=False,
+            )
+
+            class FakeModel:
+                def encode_image(self, tensor):
+                    return tensor
+
+            crawler.model = FakeModel()
+            crawler.preprocess = lambda image: torch.tensor([1.0, 0.0, 0.0])
+            crawler._image_query_feature = torch.tensor([[1.0, 0.0, 0.0]])
+            similarity = crawler._image_query_similarity(Image.new("RGB", (8, 8)))
+            assert similarity == pytest.approx(1.0)
+        finally:
+            if crawler is not None:
+                crawler.close()
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_init_with_sites(self):
@@ -342,6 +403,28 @@ class TestDatasetCrawlerInit:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_query_label_decisions_support_multiple_labels_and_aliases(self):
+        """组合查询词应解析为多个固定标签，并支持可选别名。"""
+        tmp = tempfile.mkdtemp()
+        crawler = None
+        try:
+            crawler = DatasetCrawler(
+                keywords=["forklift worker"],
+                total_count=1,
+                output_dir=tmp,
+                use_clip=False,
+                label_policy=LabelPolicy(
+                    fixed_labels=["叉车", "工区", "工人"],
+                    aliases={"forklift": "叉车", "worker": "工人"},
+                ),
+            )
+            decisions = crawler._query_label_decisions("forklift worker")
+            assert [item.name for item in decisions] == ["叉车", "工人"]
+        finally:
+            if crawler is not None:
+                crawler.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_download_and_save_valid_image(self):
         """真实图片字节应通过验证链并写入 metadata。"""
         tmp = tempfile.mkdtemp()
@@ -354,7 +437,7 @@ class TestDatasetCrawlerInit:
                 for x in range(256)
             ])
             image_bytes = io.BytesIO()
-            image.save(image_bytes, format="JPEG", quality=95)
+            image.save(image_bytes, format="PNG")
             payload = image_bytes.getvalue()
 
             class FakeResponse:
@@ -393,10 +476,16 @@ class TestDatasetCrawlerInit:
                 if name.endswith(".jpg")
             ]
             assert len(image_files) == 1
+            with Image.open(image_files[0]) as saved_image:
+                assert saved_image.format == "JPEG"
             with open(os.path.join(tmp, "metadata.jsonl"), encoding="utf-8") as f:
                 record = json.loads(f.readline())
             assert record["index"] == 0
             assert record["file_path"] == image_files[0]
+            assert record["ext"] == ".jpg"
+            assert record["source_ext"] == ".png"
+            assert record["quality"]["format"] == "jpeg"
+            assert record["format_conversion"]["enabled"] is True
             assert [item["name"] for item in record["labels"]] == ["blue square"]
             assert crawler._state_store.count_candidates(crawler.job_id, "accepted") == 1
             with open(os.path.join(tmp, "manifest.jsonl"), encoding="utf-8") as f:
