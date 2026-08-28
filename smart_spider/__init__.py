@@ -96,6 +96,13 @@ from .multimodal_job import (
 )
 from .multimodal_sources import SearchDiscoverySource, SiteDiscoverySource
 from .multimodal_scale import QualityReport, ShardedManifestWriter
+from .image_retrieval import (
+    IMAGE_SUFFIXES,
+    ImageSearchResult,
+    ImageSimilarityIndex,
+    IndexBuildReport,
+    iter_image_files,
+)
 
 # spider_tools 桥接
 from .spider_tools_bridge import SpiderToolsBridge, SpiderToolsURL, integrate_with_dataset_crawler, parse_page_spec, list_available_sites
@@ -192,6 +199,11 @@ __all__ = [
     "QualityReport",
     "SearchDiscoverySource",
     "SiteDiscoverySource",
+    "IMAGE_SUFFIXES",
+    "ImageSearchResult",
+    "ImageSimilarityIndex",
+    "IndexBuildReport",
+    "iter_image_files",
     # spider_tools 桥接
     "SpiderToolsBridge",
     "SpiderToolsURL",
