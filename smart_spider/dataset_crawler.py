@@ -133,6 +133,8 @@ except ImportError:
 _BATCH_SIZE = 100          # 每个子目录存放的图片数量
 _DEFAULT_DISK_GUARD_MB = 100
 _QUEUE_PUT_TIMEOUT = 5.0
+_DEFAULT_IMAGE_OUTPUT_FORMAT = "jpg"
+_DEFAULT_JPEG_QUALITY = 95
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -478,6 +480,9 @@ class DatasetCrawler:
         # 以图搜图过滤（追加到末尾，保持旧位置参数兼容）
         query_image: Optional[str] = None,
         image_similarity_threshold: float = 0.75,
+        # 图片落盘格式（追加到末尾，保持旧位置参数兼容）
+        image_output_format: Optional[str] = _DEFAULT_IMAGE_OUTPUT_FORMAT,
+        jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
     ):
         self.keywords = keywords
         self.total_count = total_count
@@ -490,6 +495,21 @@ class DatasetCrawler:
         self.image_similarity_threshold = image_similarity_threshold
         if not -1.0 <= image_similarity_threshold <= 1.0:
             raise ValueError("image_similarity_threshold must be between -1 and 1")
+        if image_output_format is None:
+            self.image_output_format = None
+        else:
+            normalized_output_format = image_output_format.strip().lower().lstrip(".")
+            if normalized_output_format in {"original", "source"}:
+                self.image_output_format = None
+            elif normalized_output_format in {"jpg", "jpeg"}:
+                self.image_output_format = "jpg"
+            else:
+                raise ValueError(
+                    "image_output_format must be 'jpg' (default), 'original', or None"
+                )
+        if not 1 <= jpeg_quality <= 100:
+            raise ValueError("jpeg_quality must be between 1 and 100")
+        self.jpeg_quality = jpeg_quality
         if query_image and (not use_clip or not _CLIP_AVAILABLE):
             raise RuntimeError(
                 "query_image requires CLIP; remove --no-clip and install openai-clip"
@@ -744,6 +764,39 @@ class DatasetCrawler:
             decisions.append(LabelDecision(keyword, 1.0, "query"))
         return decisions
 
+    def _prepare_output_image(
+        self,
+        image: Image.Image,
+        source_content: bytes,
+        source_ext: str,
+    ) -> tuple[bytes, str, str, dict[str, Any]]:
+        """在图片通过过滤后，按配置生成最终落盘内容。
+
+        内容去重仍使用下载到的原始字节；这里只负责生成数据集最终保存的
+        字节，因此 WebP/GIF 等源格式默认会以 JPEG 文件落盘。
+        """
+        source_format = (image.format or source_ext.lstrip(".") or "unknown").lower()
+        if self.image_output_format is None:
+            return source_content, source_ext, source_format, {
+                "enabled": False,
+                "from_format": source_format,
+                "to_format": source_format,
+            }
+
+        output = BytesIO()
+        image.save(
+            output,
+            format="JPEG",
+            quality=self.jpeg_quality,
+            optimize=True,
+        )
+        return output.getvalue(), ".jpg", "jpeg", {
+            "enabled": True,
+            "from_format": source_format,
+            "to_format": "jpeg",
+            "quality": self.jpeg_quality,
+        }
+
     def _download_and_save(self, url: str, keyword: str, source: str) -> bool:
         """下载单张图片，经过过滤后保存到分桶目录。
 
@@ -883,11 +936,15 @@ class DatasetCrawler:
                     logger.debug(f"Image query inference error: {e}")
                     return reject("image_query_inference_error")
 
+            output_content, output_ext, output_format, format_conversion = (
+                self._prepare_output_image(img, full_content, ext)
+            )
+
             # 原子保存图片；再次在锁内检查全局目标，避免并发超量。
             saved = self._dir_manager.save_content(
                 url,
-                ext,
-                full_content,
+                output_ext,
+                output_content,
                 max_count=self.total_count,
             )
             if saved is None:
@@ -901,13 +958,13 @@ class DatasetCrawler:
             label_resolution = self.label_policy.resolve(
                 self._query_label_decisions(keyword)
             )
-            content_hash = hashlib.sha256(full_content).hexdigest()
+            content_hash = hashlib.sha256(output_content).hexdigest()
             quality = QualityMetrics(
                 modality=Modality.IMAGE.value,
                 width=img.width,
                 height=img.height,
-                file_size=len(full_content),
-                format=img.format or ext.lstrip("."),
+                file_size=len(output_content),
+                format=output_format,
                 variance=float(np.var(arr)),
                 validated=True,
             )
@@ -925,6 +982,7 @@ class DatasetCrawler:
                 pipeline={
                     "job_id": self.job_id,
                     "label_policy": self.label_policy.to_dict(),
+                    "format_conversion": format_conversion,
                     "image_query": {
                         "path": self.query_image,
                         "similarity": round(image_sim, 4) if image_sim is not None else None,
@@ -936,7 +994,11 @@ class DatasetCrawler:
                     modality=Modality.IMAGE,
                     role="image",
                     uri=os.path.relpath(save_path, self.output_dir),
-                    mime_type=f"image/{ext.lstrip('.')}",
+                    mime_type=(
+                        "image/jpeg"
+                        if output_ext == ".jpg"
+                        else f"image/{output_ext.lstrip('.') }"
+                    ),
                 )],
                 task_type="image_classification",
             )
@@ -968,7 +1030,9 @@ class DatasetCrawler:
                 "image_sim": round(image_sim, 4) if image_sim is not None else None,
                 "width": img.width,
                 "height": img.height,
-                "ext": ext,
+                "ext": output_ext,
+                "source_ext": ext,
+                "format_conversion": format_conversion,
                 "labels": [item.to_dict() for item in label_resolution.labels],
                 "label_candidates": [item.to_dict() for item in label_resolution.candidates],
                 "quality": quality.to_dict(),
@@ -1251,6 +1315,8 @@ class DatasetCrawler:
         report["search_engines"] = self.search_engines
         report["site_parsers"] = self._site_parsers
         report["use_clip"] = self.use_clip
+        report["image_output_format"] = self.image_output_format or "original"
+        report["jpeg_quality"] = self.jpeg_quality
         report["batch_size"] = self.batch_size
         report["batches"] = self._dir_manager.list_batches()
         report["shutdown"] = self._shutdown_requested.is_set()
