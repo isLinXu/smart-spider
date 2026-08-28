@@ -290,6 +290,48 @@ class TestDatasetCrawlerInit:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_query_image_requires_clip(self):
+        """以图搜图不能在明确关闭 CLIP 时静默失效。"""
+        tmp = tempfile.mkdtemp()
+        query = os.path.join(tmp, "query.jpg")
+        Image.new("RGB", (32, 32), (255, 0, 0)).save(query)
+        with pytest.raises(RuntimeError, match="query_image requires CLIP"):
+            DatasetCrawler(
+                keywords=["test"],
+                total_count=1,
+                output_dir=os.path.join(tmp, "dataset"),
+                use_clip=False,
+                query_image=query,
+            )
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_image_query_similarity_uses_visual_embedding(self):
+        """查询图片过滤器应使用归一化图像向量计算余弦相似度。"""
+        torch = pytest.importorskip("torch")
+        tmp = tempfile.mkdtemp()
+        crawler = None
+        try:
+            crawler = DatasetCrawler(
+                keywords=["test"],
+                total_count=1,
+                output_dir=tmp,
+                use_clip=False,
+            )
+
+            class FakeModel:
+                def encode_image(self, tensor):
+                    return tensor
+
+            crawler.model = FakeModel()
+            crawler.preprocess = lambda image: torch.tensor([1.0, 0.0, 0.0])
+            crawler._image_query_feature = torch.tensor([[1.0, 0.0, 0.0]])
+            similarity = crawler._image_query_similarity(Image.new("RGB", (8, 8)))
+            assert similarity == pytest.approx(1.0)
+        finally:
+            if crawler is not None:
+                crawler.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_init_with_sites(self):
         """指定站点解析器初始化。"""
         tmp = tempfile.mkdtemp()

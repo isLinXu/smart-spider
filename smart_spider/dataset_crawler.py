@@ -475,6 +475,9 @@ class DatasetCrawler:
         callbacks: Optional[list[Callable]] = None,
         # 磁盘保护
         disk_guard_mb: int = _DEFAULT_DISK_GUARD_MB,
+        # 以图搜图过滤（追加到末尾，保持旧位置参数兼容）
+        query_image: Optional[str] = None,
+        image_similarity_threshold: float = 0.75,
     ):
         self.keywords = keywords
         self.total_count = total_count
@@ -483,6 +486,14 @@ class DatasetCrawler:
         self.use_clip = use_clip
         self.similarity_threshold = similarity_threshold
         self.clip_model_name = clip_model
+        self.query_image = query_image
+        self.image_similarity_threshold = image_similarity_threshold
+        if not -1.0 <= image_similarity_threshold <= 1.0:
+            raise ValueError("image_similarity_threshold must be between -1 and 1")
+        if query_image and (not use_clip or not _CLIP_AVAILABLE):
+            raise RuntimeError(
+                "query_image requires CLIP; remove --no-clip and install openai-clip"
+            )
         self.max_workers = max_workers
         self.min_width = min_width
         self.min_height = min_height
@@ -582,6 +593,8 @@ class DatasetCrawler:
         self.device = "cpu"
         self._clip_text_cache: dict[str, Optional[Any]] = {}
         self._clip_text_cache_lock = threading.Lock()
+        self._clip_infer_lock = threading.Lock()
+        self._image_query_feature = None
 
         if use_clip:
             if not _CLIP_AVAILABLE:
@@ -593,6 +606,13 @@ class DatasetCrawler:
                 self.model, self.preprocess = clip.load(self.clip_model_name, device=self.device)
                 self.model.eval()
                 logger.info(f"CLIP model '{self.clip_model_name}' loaded on {self.device}")
+
+        if self.query_image:
+            if not self.use_clip or self.model is None or self.preprocess is None:
+                raise RuntimeError(
+                    "query_image requires CLIP; remove --no-clip and install openai-clip"
+                )
+            self._image_query_feature = self._encode_image_file(self.query_image)
 
         # 断点续传：恢复已保存数量
         if resume:
@@ -644,6 +664,39 @@ class DatasetCrawler:
         with self._clip_text_cache_lock:
             self._clip_text_cache[keyword] = result
         return result
+
+    def _encode_image(self, image: Image.Image):
+        """编码单张图片并返回归一化 CLIP 向量。"""
+        if self.model is None or self.preprocess is None:
+            return None
+        img_tensor = self.preprocess(image).unsqueeze(0).to(self.device)
+        # CLIP 模型在多个下载线程之间共享；串行化 forward，兼容 CPU/GPU
+        # 及自定义模型后端的线程安全边界。
+        with self._clip_infer_lock:
+            with torch.no_grad():
+                img_feat = self.model.encode_image(img_tensor)
+                img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+        return img_feat
+
+    def _encode_image_file(self, path: str):
+        """读取查询图片并生成归一化 CLIP 向量。"""
+        try:
+            with Image.open(path) as image:
+                return self._encode_image(image.convert("RGB"))
+        except Exception as exc:
+            raise ValueError(f"cannot encode query image '{path}': {exc}") from exc
+
+    def _image_query_similarity(self, image: Image.Image) -> Optional[float]:
+        """计算候选图片与查询图片的余弦相似度。"""
+        if self._image_query_feature is None:
+            return None
+        image_feature = self._encode_image(image)
+        if image_feature is None:
+            return None
+        return float(torch.nn.functional.cosine_similarity(
+            image_feature,
+            self._image_query_feature,
+        ).item())
 
     # ──────────────────────────────────────────────────────────────
     # 图片下载 + 过滤 + 保存
@@ -788,14 +841,12 @@ class DatasetCrawler:
 
             # CLIP 过滤（可选）
             sim = 0.0
+            image_sim = None
             if self.use_clip and self.model is not None:
                 text_feat = self._get_text_feature(keyword)
                 if text_feat is not None:
                     try:
-                        img_tensor = self.preprocess(img).unsqueeze(0).to(self.device)
-                        with torch.no_grad():
-                            img_feat = self.model.encode_image(img_tensor)
-                            img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+                        img_feat = self._encode_image(img)
                         sim = torch.nn.functional.cosine_similarity(
                             img_feat, text_feat
                         ).item()
@@ -809,6 +860,28 @@ class DatasetCrawler:
                             return reject("clip_low_sim")
                     except Exception as e:
                         logger.debug(f"CLIP inference error: {e}")
+
+            # 以图搜图过滤：关键词/站点负责发现候选，查询图片负责视觉二次筛选。
+            if self._image_query_feature is not None:
+                try:
+                    image_sim = self._image_query_similarity(img)
+                    if image_sim is None:
+                        return reject("image_query_inference_error")
+                    if image_sim < self.image_similarity_threshold:
+                        self.stats.inc_filtered("image")
+                        self._emit_callback(CrawlEvent(
+                            event_type="item_filtered", keyword=keyword,
+                            media_type="image", url=url,
+                            detail={
+                                "image_sim": round(image_sim, 4),
+                                "image_similarity_threshold": self.image_similarity_threshold,
+                                "reason": "image_query_low_sim",
+                            },
+                        ))
+                        return reject("image_query_low_sim")
+                except Exception as e:
+                    logger.debug(f"Image query inference error: {e}")
+                    return reject("image_query_inference_error")
 
             # 原子保存图片；再次在锁内检查全局目标，避免并发超量。
             saved = self._dir_manager.save_content(
@@ -852,6 +925,11 @@ class DatasetCrawler:
                 pipeline={
                     "job_id": self.job_id,
                     "label_policy": self.label_policy.to_dict(),
+                    "image_query": {
+                        "path": self.query_image,
+                        "similarity": round(image_sim, 4) if image_sim is not None else None,
+                        "threshold": self.image_similarity_threshold,
+                    } if self.query_image else None,
                     "status": "accepted",
                 },
                 modalities=[ModalityAsset(
@@ -887,6 +965,7 @@ class DatasetCrawler:
                 "keyword": keyword,
                 "source": source,
                 "sim": round(sim, 4),
+                "image_sim": round(image_sim, 4) if image_sim is not None else None,
                 "width": img.width,
                 "height": img.height,
                 "ext": ext,
@@ -899,7 +978,12 @@ class DatasetCrawler:
             self._emit_callback(CrawlEvent(
                 event_type="item_saved", keyword=keyword,
                 media_type="image", url=url,
-                detail={"sim": round(sim, 4), "file": save_path, "index": idx},
+                detail={
+                    "sim": round(sim, 4),
+                    "image_sim": round(image_sim, 4) if image_sim is not None else None,
+                    "file": save_path,
+                    "index": idx,
+                },
             ))
 
             if idx % 100 == 0 and idx > 0:
