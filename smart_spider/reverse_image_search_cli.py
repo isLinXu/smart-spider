@@ -43,6 +43,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--timeout", type=float, default=45.0, help="单个 Provider 超时秒数")
     parser.add_argument("--settle", type=float, default=4.0, help="上传后等待结果加载秒数")
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=2,
+        help="每个 Provider 的最大尝试次数；会轮换备用入口（默认 2）",
+    )
     parser.add_argument("--fail-fast", action="store_true", help="某个 Provider 失败后停止后续 Provider")
     parser.add_argument("--output", help="将 JSON 结果写入文件；默认输出到终端")
     return parser
@@ -57,6 +63,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--timeout must be positive")
     if args.settle < 0:
         parser.error("--settle must be non-negative")
+    if args.attempts <= 0:
+        parser.error("--attempts must be positive")
     try:
         providers = resolve_providers(args.providers)
     except ValueError as exc:
@@ -71,6 +79,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         debug_dir=args.debug_dir,
         timeout_ms=int(args.timeout * 1000),
         settle_ms=int(args.settle * 1000),
+        max_attempts=args.attempts,
     )
     try:
         response = searcher.search(args.image, top_k=args.top_k, fail_fast=args.fail_fast)

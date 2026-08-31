@@ -18,7 +18,7 @@ import os
 import re
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -94,6 +94,7 @@ class ProviderSearchResponse:
     result_page_url: str = ""
     results: tuple[RemoteImageSearchResult, ...] = ()
     elapsed_ms: int = 0
+    attempts: int = 1
     error: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -102,6 +103,7 @@ class ProviderSearchResponse:
             "query_image": self.query_image,
             "result_page_url": self.result_page_url,
             "elapsed_ms": self.elapsed_ms,
+            "attempts": self.attempts,
             "results": [
                 result.to_dict(rank=index)
                 for index, result in enumerate(self.results, start=1)
@@ -316,6 +318,7 @@ def _generic_external_results(
             source_url=source_url,
             image_url=image_url if image_url.startswith(("http://", "https://")) else "",
             thumbnail_url=image_url if image_url.startswith(("http://", "https://")) else "",
+            metadata={"source_domain": urlparse(source_url).netloc},
         ))
         if len(results) >= top_k:
             break
@@ -364,7 +367,10 @@ def _parse_bing_results(html: str, *, page_url: str, top_k: int) -> list[RemoteI
             image_url=image_url,
             thumbnail_url=thumbnail_url,
             snippet=_clean_text(str(payload.get("desc") or ""))[:1000],
-            metadata={"format": payload.get("fmt", "")},
+            metadata={
+                "format": payload.get("fmt", ""),
+                "source_domain": urlparse(source_url).netloc,
+            },
         ))
         if len(results) >= top_k:
             return results
@@ -404,9 +410,11 @@ class _BaseBrowserProvider:
 
     name = ""
     start_url = ""
+    start_urls: tuple[str, ...] = ()
     input_selectors = ("input[type='file']",)
     trigger_selectors: tuple[str, ...] = ()
     blocked_hosts: set[str] = set()
+    result_selectors: tuple[str, ...] = ()
 
     def upload(self, page: Any, image_path: str, timeout_ms: int) -> None:
         for selector in self.input_selectors:
@@ -429,11 +437,33 @@ class _BaseBrowserProvider:
             f"{self.name}: no image upload input found; the provider page may have changed"
         )
 
-    def wait_for_results(self, page: Any, timeout_ms: int, settle_ms: int) -> None:
+    def wait_for_results(
+        self,
+        page: Any,
+        timeout_ms: int,
+        settle_ms: int,
+        *,
+        initial_url: str = "",
+    ) -> None:
+        deadline = time.monotonic() + timeout_ms / 1000
+        appeared = False
+        while time.monotonic() < deadline:
+            if initial_url and page.url != initial_url:
+                appeared = True
+                break
+            if any(page.locator(selector).count() > 0 for selector in self.result_selectors):
+                appeared = True
+                break
+            page.wait_for_timeout(250)
         try:
-            page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            page.wait_for_load_state("domcontentloaded", timeout=remaining_ms)
         except PlaywrightTimeoutError:
             pass
+        if not appeared:
+            raise ReverseImageSearchError(
+                f"{self.name}: results did not appear within {timeout_ms} ms"
+            )
         page.wait_for_timeout(settle_ms)
 
     def parse_results(self, html: str, *, page_url: str, top_k: int) -> list[RemoteImageSearchResult]:
@@ -443,6 +473,7 @@ class _BaseBrowserProvider:
 class BaiduReverseImageProvider(_BaseBrowserProvider):
     name = "baidu"
     start_url = "https://graph.baidu.com/pcpage/index?tpl_from=pc"
+    start_urls = (start_url,)
     input_selectors = (
         "input[type='file']",
         "input[name='image']",
@@ -450,6 +481,11 @@ class BaiduReverseImageProvider(_BaseBrowserProvider):
     )
     trigger_selectors = ("text=上传图片", "text=识图", "[aria-label*='上传']")
     blocked_hosts = {"baidu.com", "baidubce.com"}
+    result_selectors = (
+        ".general-imgcol-item",
+        "a[href*='douyin.com']",
+        "a[href*='baijiahao.baidu.com']",
+    )
 
     def parse_results(self, html: str, *, page_url: str, top_k: int) -> list[RemoteImageSearchResult]:
         return _parse_baidu_results(html, page_url=page_url, top_k=top_k)
@@ -460,6 +496,10 @@ class BingVisualSearchProvider(_BaseBrowserProvider):
     # 直接进入 Bing 的“上传图片”视图；支持 Visual Search 的区域会保留
     # 此入口，其他区域可能重定向到普通图片搜索页并返回可诊断错误。
     start_url = "https://www.bing.com/images/search?view=detailv2&iss=sbiupload"
+    start_urls = (
+        start_url,
+        "https://www.bing.com/images/searchbyimage?cbir=sbi",
+    )
     input_selectors = (
         "input[type='file']",
         "#sb_fileinput",
@@ -467,6 +507,7 @@ class BingVisualSearchProvider(_BaseBrowserProvider):
     )
     trigger_selectors = ("#sb_sbi", "text=Visual Search", "[aria-label*='image']")
     blocked_hosts = {"bing.com", "microsoft.com"}
+    result_selectors = ("a.iusc", "#b_results")
 
     def parse_results(self, html: str, *, page_url: str, top_k: int) -> list[RemoteImageSearchResult]:
         return _parse_bing_results(html, page_url=page_url, top_k=top_k)
@@ -475,9 +516,13 @@ class BingVisualSearchProvider(_BaseBrowserProvider):
 class GoogleLensProvider(_BaseBrowserProvider):
     name = "google_lens"
     start_url = "https://lens.google.com/"
+    start_urls = (start_url, "https://lens.google.com/uploadbyurl")
     input_selectors = ("input[type='file']",)
     trigger_selectors = ("text=Upload", "text=上传", "[aria-label*='Upload']")
     blocked_hosts = {"google.com", "googleusercontent.com", "gstatic.com"}
+    # Lens 结果页的 URL 通常会变化；通用外链选择器会在首页导航中提前命中，
+    # 因此这里仅依赖 URL 变化，避免过早解析空结果。
+    result_selectors = ()
 
     def parse_results(self, html: str, *, page_url: str, top_k: int) -> list[RemoteImageSearchResult]:
         return _parse_google_results(html, page_url=page_url, top_k=top_k)
@@ -518,12 +563,15 @@ class ReverseImageSearcher:
         debug_dir: Optional[str] = None,
         timeout_ms: int = 45_000,
         settle_ms: int = 4_000,
+        max_attempts: int = 2,
     ) -> None:
         self.provider_names = resolve_providers(providers)
         if timeout_ms <= 0:
             raise ValueError("timeout_ms must be positive")
         if settle_ms < 0:
             raise ValueError("settle_ms must be non-negative")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
         self.headless = headless
         self.proxy = proxy
         self.user_data_dir = user_data_dir
@@ -531,22 +579,24 @@ class ReverseImageSearcher:
         self.debug_dir = debug_dir
         self.timeout_ms = timeout_ms
         self.settle_ms = settle_ms
+        self.max_attempts = max_attempts
 
     def _provider(self, name: str) -> _BaseBrowserProvider:
         return PROVIDER_REGISTRY[name]()
 
-    def _save_debug(self, page: Any, provider_name: str) -> None:
+    def _save_debug(self, page: Any, provider_name: str, attempt: int = 1) -> None:
         if not self.debug_dir:
             return
         debug_root = Path(self.debug_dir).expanduser().resolve()
         debug_root.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", provider_name)
+        suffix = f"-attempt-{attempt}"
         try:
-            (debug_root / f"{safe_name}.html").write_text(
+            (debug_root / f"{safe_name}{suffix}.html").write_text(
                 page.content(), encoding="utf-8"
             )
             page.screenshot(
-                path=str(debug_root / f"{safe_name}.png"),
+                path=str(debug_root / f"{safe_name}{suffix}.png"),
                 full_page=True,
             )
         except Exception:
@@ -559,6 +609,8 @@ class ReverseImageSearcher:
         provider: _BaseBrowserProvider,
         image_path: str,
         top_k: int,
+        start_url: str,
+        attempt: int = 1,
     ) -> ProviderSearchResponse:
         started = time.monotonic()
         page = context.new_page()
@@ -566,9 +618,15 @@ class ReverseImageSearcher:
         try:
             if Stealth is not None:
                 Stealth().apply_stealth_sync(page)
-            page.goto(provider.start_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            page.goto(start_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            initial_url = page.url
             provider.upload(page, image_path, self.timeout_ms)
-            provider.wait_for_results(page, self.timeout_ms, self.settle_ms)
+            provider.wait_for_results(
+                page,
+                self.timeout_ms,
+                self.settle_ms,
+                initial_url=initial_url,
+            )
             page_text = page.locator("body").inner_text(timeout=self.timeout_ms)
             blocked_reason = _blocked_page_reason(page_text)
             if blocked_reason:
@@ -586,7 +644,7 @@ class ReverseImageSearcher:
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
         except (ReverseImageSearchError, PlaywrightTimeoutError) as exc:
-            self._save_debug(page, provider.name)
+            self._save_debug(page, provider.name, attempt)
             return ProviderSearchResponse(
                 provider=provider.name,
                 query_image=image_path,
@@ -595,7 +653,7 @@ class ReverseImageSearcher:
                 error=str(exc),
             )
         except Exception as exc:  # provider failures must not hide other providers
-            self._save_debug(page, provider.name)
+            self._save_debug(page, provider.name, attempt)
             return ProviderSearchResponse(
                 provider=provider.name,
                 query_image=image_path,
@@ -605,6 +663,50 @@ class ReverseImageSearcher:
             )
         finally:
             page.close()
+
+    def _search_provider(
+        self,
+        context: Any,
+        provider: _BaseBrowserProvider,
+        image_path: str,
+        top_k: int,
+    ) -> ProviderSearchResponse:
+        """按 Provider 的备用入口重试，并返回聚合后的诊断信息。"""
+        start_urls = tuple(getattr(provider, "start_urls", ()) or ())
+        if not start_urls:
+            start_urls = (provider.start_url,)
+        started = time.monotonic()
+        last_response: Optional[ProviderSearchResponse] = None
+        for attempt in range(1, self.max_attempts + 1):
+            start_url = start_urls[(attempt - 1) % len(start_urls)]
+            response = self._search_one(
+                context,
+                provider,
+                image_path,
+                top_k,
+                start_url=start_url,
+                attempt=attempt,
+            )
+            response = replace(
+                response,
+                attempts=attempt,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+            last_response = response
+            if response.results:
+                return response
+
+        if last_response is None:  # max_attempts is validated in __init__
+            raise AssertionError("provider search completed without an attempt")
+        if not last_response.error:
+            return replace(
+                last_response,
+                error=(
+                    f"{provider.name}: no parsed results found after "
+                    f"{self.max_attempts} attempt(s)"
+                ),
+            )
+        return last_response
 
     def search(self, image_path: str, *, top_k: int = 20, fail_fast: bool = False) -> ReverseImageSearchResponse:
         """上传本地图片并返回各 Provider 的结果。"""
@@ -641,7 +743,7 @@ class ReverseImageSearcher:
                     context = browser.new_context(locale="zh-CN")
                 for provider_name in self.provider_names:
                     provider = self._provider(provider_name)
-                    response = self._search_one(context, provider, str(path), top_k)
+                    response = self._search_provider(context, provider, str(path), top_k)
                     providers.append(response)
                     if fail_fast and response.error:
                         break

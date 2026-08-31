@@ -11,10 +11,10 @@
 1. CLI 校验本地图片路径和 Provider 列表。
 2. `ReverseImageSearcher` 启动 Chromium/本机 Chrome，可选持久化用户目录、代理和非 headless 模式。
 3. 每个 Provider 打开自己的图片搜索页面，通过页面上的文件输入或上传按钮提交图片。
-4. 等待结果页加载，检查验证码/人工验证页面，然后由 Provider 解析页面 DOM。
+4. 等待 URL 或 Provider 专属结果节点出现，再等待短暂稳定时间；检查验证码/人工验证页面，然后由 Provider 解析页面 DOM。
 5. 使用统一的 `RemoteImageSearchResult` 和 `ProviderSearchResponse` 返回 JSON。
 
-Provider 失败默认不会影响其他 Provider；`--fail-fast` 可切换为遇错停止。网页结构变化时可以通过 `--debug-dir` 保存 HTML 和截图定位问题。
+Provider 失败默认不会影响其他 Provider；每个 Provider 默认最多尝试 2 次并轮换备用入口，`--attempts 1` 可关闭重试；`--fail-fast` 可切换为遇错停止。网页结构变化时可以通过 `--debug-dir` 保存每次尝试的 HTML 和截图定位问题。
 
 ## Provider 契约
 
@@ -64,4 +64,5 @@ smart-spider-reverse-image-search \
 - 使用固定 HTML fixture 验证 Bing `iusc`、Google 外部链接和百度外部链接解析。
 - 使用 CLI parser 测试验证 Provider、浏览器、代理、持久化目录和输出参数。
 - 使用本机 Chrome 做页面启动冒烟。
+- 验证动态结果等待、备用入口轮换、尝试次数和来源域名元数据。
 - 在网络可用且服务未要求验证时，执行单 Provider 真实上传；网络阻断、验证码或页面变更必须作为可诊断的 Provider 错误返回。

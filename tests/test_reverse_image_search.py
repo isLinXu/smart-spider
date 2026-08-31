@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import html
+from pathlib import Path
 
 import pytest
 
 from smart_spider.reverse_image_search import (
+    BaiduReverseImageProvider,
     BingVisualSearchProvider,
     GoogleLensProvider,
     ProviderSearchResponse,
@@ -55,6 +57,7 @@ def test_parse_bing_iousc_results():
     assert results[0].source_url == "https://example.com/cat"
     assert results[0].image_url == "https://cdn.example.com/cat.jpg"
     assert results[0].thumbnail_url.endswith("cat-thumb.jpg")
+    assert results[0].metadata["source_domain"] == "example.com"
 
 
 def test_parse_google_lens_external_links_and_filters_provider_links():
@@ -89,6 +92,7 @@ def test_parse_baidu_external_links():
     assert len(results) == 1
     assert results[0].source_url == "https://example.com/product"
     assert results[0].image_url == "https://cdn.example.com/p.png"
+    assert results[0].metadata["source_domain"] == "example.com"
 
 
 def test_parse_baidu_keeps_content_subdomains_as_sources():
@@ -119,6 +123,7 @@ def test_response_and_result_json_contract():
     )
     assert response.to_dict()["results"][0]["rank"] == 1
     assert response.to_dict()["results"][0]["source_url"] == "https://example.com"
+    assert response.to_dict()["attempts"] == 1
 
 
 def test_searcher_validates_image_and_top_k(tmp_path):
@@ -127,6 +132,74 @@ def test_searcher_validates_image_and_top_k(tmp_path):
         searcher.search(str(tmp_path / "missing.jpg"))
     with pytest.raises(ValueError, match="top_k"):
         searcher.search(__file__, top_k=0)
+    with pytest.raises(ValueError, match="max_attempts"):
+        ReverseImageSearcher(providers=["bing"], max_attempts=0)
+
+
+def test_provider_retry_uses_fallback_entry_and_records_attempts(monkeypatch):
+    searcher = ReverseImageSearcher(providers=["bing"], max_attempts=2)
+    provider = BingVisualSearchProvider()
+    calls: list[str] = []
+
+    def fake_search_one(context, current_provider, image_path, top_k, *, start_url, attempt):
+        assert current_provider is provider
+        assert image_path == str(Path("/tmp/query.jpg"))
+        assert top_k == 3
+        calls.append(start_url)
+        return ProviderSearchResponse(
+            provider=current_provider.name,
+            query_image=image_path,
+            result_page_url=start_url,
+            error="no upload input",
+        )
+
+    monkeypatch.setattr(searcher, "_search_one", fake_search_one)
+    response = searcher._search_provider(object(), provider, "/tmp/query.jpg", 3)
+
+    assert calls == list(provider.start_urls)
+    assert response.attempts == 2
+    assert response.error == "no upload input"
+
+
+def test_provider_waits_until_dynamic_result_selector_appears():
+    class FakeLocator:
+        def __init__(self, page):
+            self.page = page
+
+        def count(self):
+            return 1 if self.page.polls >= 2 else 0
+
+    class FakePage:
+        url = "https://graph.baidu.com/initial"
+
+        def __init__(self):
+            self.polls = 0
+            self.settled_for = 0
+            self.load_state_timeout = None
+
+        def locator(self, selector):
+            return FakeLocator(self)
+
+        def wait_for_timeout(self, delay_ms):
+            if delay_ms == 250:
+                self.polls += 1
+            else:
+                self.settled_for = delay_ms
+
+        def wait_for_load_state(self, state, timeout):
+            self.load_state_timeout = timeout
+
+    page = FakePage()
+    BaiduReverseImageProvider().wait_for_results(
+        page,
+        timeout_ms=1_000,
+        settle_ms=75,
+        initial_url=page.url,
+    )
+
+    assert page.polls == 2
+    assert page.settled_for == 75
+    assert page.load_state_timeout is not None
 
 
 def test_cli_parser_accepts_remote_search_options():
@@ -136,11 +209,13 @@ def test_cli_parser_accepts_remote_search_options():
         "--no-headless",
         "--user-data-dir", "/tmp/smart-spider-browser",
         "--top-k", "7",
+        "--attempts", "3",
     ])
     assert args.image == "query.jpg"
     assert args.providers == ["baidu", "google"]
     assert args.no_headless is True
     assert args.top_k == 7
+    assert args.attempts == 3
 
 
 def test_provider_contract_exposes_upload_and_parser():

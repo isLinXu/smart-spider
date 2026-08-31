@@ -110,7 +110,9 @@ smart-spider-reverse-image-search \
     --no-headless --user-data-dir ./runtime/reverse-image-browser
 ```
 
-该命令会把图片发送给所选第三方服务；项目不自动绕过验证码或登录。Provider 页面变化、网络阻断或验证页面会记录在对应 Provider 的 `error` 字段中。调试时可增加 `--debug-dir ./runtime/reverse-image-debug` 保存页面 HTML 和截图。
+每个 Provider 默认最多尝试 2 次，并在支持时轮换备用上传入口；可通过 `--attempts 1` 关闭重试。程序会等待 URL 或 Provider 结果节点出现后再解析，避免动态页面尚未完成时误报空结果。JSON 中的 `attempts`、`elapsed_ms` 和每条结果的 `metadata.source_domain` 可用于诊断和后续去重。
+
+该命令会把图片发送给所选第三方服务；项目不自动绕过验证码或登录。Provider 页面变化、网络阻断或验证页面会记录在对应 Provider 的 `error` 字段中。调试时可增加 `--debug-dir ./runtime/reverse-image-debug` 保存每次尝试的页面 HTML 和截图。
 
 图片数据集默认在下载、校验和过滤后统一转换为 JPG（JPEG quality 默认 95），并同步更新图片路径、MIME、质量字段和样本 ID。需要保留源格式时使用：
 
