@@ -9,6 +9,7 @@
 | 🖼️ **图片采集** | 百度/Bing/搜狗/360 + CLIP 语义过滤，自动识别文件格式 |
 | 🎬 **视频采集** | B 站、Bing 视频 + yt-dlp 下载（支持 1000+ 平台） |
 | 📄 **文本采集** | 百度/Bing 网页搜索 + trafilatura 正文提取，输出 JSON |
+| 🔎 **远程以图搜图** | 本地图片上传到百度识图、Bing Visual Search、Google Lens，并返回网页结果 |
 | 🌐 **动态渲染** | Playwright 无头浏览器（处理 JS 加密、SPA、无限滚动） |
 | 🔀 **代理池** | HTTP / SOCKS5 代理轮询，失败自动摘除，独立 Session |
 | 🛡️ **反爬体系** | UA 指纹随机化、完整 Header、Referer 伪造、请求抖动 |
@@ -28,7 +29,8 @@ pip install -r requirements.txt
 # CLIP（必须从 GitHub 安装）
 pip install git+https://github.com/openai/CLIP.git
 
-# Playwright 浏览器内核（需要动态渲染时）
+# Playwright 浏览器依赖（动态渲染或远程以图搜图时）
+pip install -e ".[browser]"
 playwright install chromium
 ```
 
@@ -88,6 +90,27 @@ smart-spider-image-search --query-image ./query.jpg \
 `--device cuda` 可启用 GPU，`--batch-size` 控制建立索引时的批大小，`--threshold` 用于过滤低相似度结果。当前实现面向本地数据集检索，索引/查询 API 已与编码器解耦，后续可以增加百度、Bing 或其他外部反向图片搜索 provider。
 
 在 `dataset_cli` 中传入 `--query-image` 后，关键词或站点仍负责发现互联网候选，下载并完成基础图片校验后，再用查询图片做视觉相似度二次筛选；通过 `--image-similarity-threshold` 调整严格程度。最终 `metadata.jsonl` 的 `image_sim`、`manifest.jsonl` 的 `pipeline.image_query` 会记录筛选证据。
+
+### 远程网页以图搜图
+
+如果需要把本地图片直接上传到网络反向图片搜索页面并返回网页结果，使用独立命令：
+
+```bash
+smart-spider-reverse-image-search \
+    --image ./query.jpg \
+    --providers baidu google_lens bing \
+    --top-k 20
+```
+
+结果包含 `source_url`、`image_url`、`thumbnail_url`、标题和摘要。默认使用无头 Chrome；需要登录或人工完成验证时，可以显示浏览器并保存用户目录：
+
+```bash
+smart-spider-reverse-image-search \
+    --image ./query.jpg --providers google_lens \
+    --no-headless --user-data-dir ./runtime/reverse-image-browser
+```
+
+该命令会把图片发送给所选第三方服务；项目不自动绕过验证码或登录。Provider 页面变化、网络阻断或验证页面会记录在对应 Provider 的 `error` 字段中。调试时可增加 `--debug-dir ./runtime/reverse-image-debug` 保存页面 HTML 和截图。
 
 图片数据集默认在下载、校验和过滤后统一转换为 JPG（JPEG quality 默认 95），并同步更新图片路径、MIME、质量字段和样本 ID。需要保留源格式时使用：
 
