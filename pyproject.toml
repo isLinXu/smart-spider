@@ -48,6 +48,12 @@ tls = [
 dedup = [
     "pybloom-live>=3.0.0",
 ]
+# 离线广告/语义过滤；OCR 还需要系统安装 tesseract 可执行文件
+filter = [
+    "opencv-python-headless>=4.8.0",
+    "pytesseract>=0.3.10",
+    "transformers>=4.40.0",
+]
 # 开发工具
 dev = [
     "pytest>=7.4.0",
@@ -56,7 +62,7 @@ dev = [
 ]
 # 全功能安装
 all = [
-    "smart-spider[browser,video,text,tls,dedup]",
+    "smart-spider[browser,video,text,tls,dedup,filter]",
 ]
 
 [project.scripts]
@@ -64,6 +70,7 @@ smart-spider = "spider:main"
 smart-spider-multimodal = "smart_spider.multimodal_cli:main"
 smart-spider-image-search = "smart_spider.image_search_cli:main"
 smart-spider-reverse-image-search = "smart_spider.reverse_image_search_cli:main"
+smart-spider-filter = "smart_spider.dataset_filter_cli:main"
 
 [tool.setuptools]
 py-modules = ["spider", "crawl_dataset", "crawl_multimodal"]

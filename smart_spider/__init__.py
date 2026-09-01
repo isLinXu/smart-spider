@@ -103,6 +103,17 @@ from .image_retrieval import (
     IndexBuildReport,
     iter_image_files,
 )
+from .dataset_filter import (
+    CLIPPromptScorer,
+    DatasetImageFilter,
+    DecisionPolicy,
+    FilterDecision,
+    FilterThresholds,
+    PromptSet,
+    SemanticScores,
+    VisualSignalAnalyzer,
+    VisualSignals,
+)
 from .reverse_image_search import (
     BaiduReverseImageProvider,
     BingVisualSearchProvider,
@@ -216,6 +227,15 @@ __all__ = [
     "ImageSimilarityIndex",
     "IndexBuildReport",
     "iter_image_files",
+    "CLIPPromptScorer",
+    "DatasetImageFilter",
+    "DecisionPolicy",
+    "FilterDecision",
+    "FilterThresholds",
+    "PromptSet",
+    "SemanticScores",
+    "VisualSignalAnalyzer",
+    "VisualSignals",
     "BaiduReverseImageProvider",
     "BingVisualSearchProvider",
     "BrowserDependencyError",
