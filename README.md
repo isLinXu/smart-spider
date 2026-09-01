@@ -215,6 +215,114 @@ output/
         └── ...
 ```
 
+## 数据集广告与语义过滤
+
+对已采集的数据集执行离线过滤。默认只分析并生成报告，不移动图片：
+
+```bash
+python -m smart_spider.dataset_filter_cli \
+  --dataset ./dataset_truck_loading_area_door_operation_5000_20260831 \
+  --query "货车装卸区 开关门" \
+  --limit 500
+```
+
+确认抽样报告后，对完整数据集应用过滤：
+
+```bash
+python -m smart_spider.dataset_filter_cli \
+  --dataset ./dataset_truck_loading_area_door_operation_5000_20260831 \
+  --query "货车装卸区 开关门" \
+  --apply
+```
+
+过滤器组合 CLIP 正负提示词、二维码、文字区域占比、网址/电话/促销词等信号。
+拒绝项移动到 `_quarantine/{run_id}/files/`，原始 `metadata.jsonl` 和
+`manifest.jsonl` 会备份。可使用报告中的 `run_id` 恢复：
+
+阈值提供四个预设档位：`conservative` 偏向保留、`balanced` 为默认、`strict`
+提高通用负向阈值，`precision` 还会要求装卸动作、敞开货厢门或货车对接月台等
+核心场景证据。每条决定都会记录命中的提示词、信号和 `confidence`，便于复核。
+OpenAI CLIP 对中文短句的直接匹配不稳定，因此内置中文场景使用已校准的英文提示词；
+英文 `--query` 会作为额外正向提示词参与评分。
+
+重复调参时可用 `--cache-dir ./.filter_cache` 缓存图像特征。缓存按模型隔离，
+后续仅重新计算文本相似度和视觉信号。正式过滤可以叠加在已有隔离结果上，
+恢复时必须从最新一轮开始，逐层执行 `--restore`。
+
+应用过滤后，可不加载 CLIP 模型直接验证索引、隔离链和图片可读性；加入
+`--verify-hashes` 还会比对活动图片与 `metadata.jsonl` 中的 SHA-256：
+
+```bash
+python -m smart_spider.dataset_filter_cli \
+  --dataset ./dataset_truck_loading_area_door_operation_5000_20260831 \
+  --run-id truck_loading_filter_v1_20260901 \
+  --verify --verify-hashes
+```
+
+OCR 默认关闭；安装 Tesseract 后可用 `--ocr` 仅识别疑似广告，或用
+`--ocr-all` 识别全部图片。中文 OCR 需另外安装 `chi_sim` 语言数据。
+
+模型筛选后可用逐行相对路径文件记录人工复核的明确误图，并以独立、可恢复的
+隔离运行应用；精确重复可按文件 SHA-256 另行清理。这两个操作都不会初始化 CLIP：
+
+```bash
+python -m smart_spider.dataset_filter_cli \
+  --dataset ./dataset \
+  --reject-list ./review_reject_paths.txt \
+  --apply --run-id visual_review_v1
+
+python -m smart_spider.dataset_filter_cli \
+  --dataset ./dataset \
+  --dedupe-exact \
+  --apply --run-id exact_dedupe_v1
+```
+
+对 CLIP 隔离的语义误图可用 BLIP 做非破坏性二次复核。默认阈值经过固定标注集
+校准，优先保证救回候选的精度；`--review-labels` 可同时输出 precision、recall
+和 F1，`--blip-cache-dir` 可避免重复推理：
+
+```bash
+python -m smart_spider.dataset_filter_cli \
+  --dataset ./dataset \
+  --review-quarantine semantic_filter_v2 \
+  --review-limit 300 \
+  --review-labels ./borderline_review_labels.csv \
+  --blip-cache-dir ./.filter_cache/blip \
+  --run-id blip_review_v1
+```
+
+人工确认救回候选后，可将当前活动图片和批准列表导出为独立数据集，不修改源数据集：
+
+```bash
+python -m smart_spider.dataset_filter_cli \
+  --dataset ./dataset \
+  --review-quarantine semantic_filter_v2 \
+  --export-review-list ./approved_recovery_paths.txt \
+  --export-output ./dataset_optimized
+```
+
+感知近重复检查结合 dHash、宽高比和平均颜色，默认仅生成报告；确认后加入
+`--apply` 才会隔离命中项：
+
+```bash
+python -m smart_spider.dataset_filter_cli \
+  --dataset ./dataset_optimized \
+  --dedupe-near \
+  --run-id near_dedupe_check_v1
+```
+
+```bash
+python -m smart_spider.dataset_filter_cli \
+  --dataset ./dataset_truck_loading_area_door_operation_5000_20260831 \
+  --restore 20260901_120000
+```
+
+常用控制：`--profile`、`--min-relevance`、`--mismatch-margin`、
+`--advertisement-score`、`--advertisement-margin`、`--text-area-ratio`、
+`--minimum-scene-evidence`、`--scene-evidence-margin`。
+完整判定写入 `_filter_runs/{run_id}/decisions.jsonl`（试跑）或
+`_quarantine/{run_id}/decisions.jsonl`（正式应用）。
+
 ## 添加自定义引擎
 
 ```python
