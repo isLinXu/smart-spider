@@ -1023,6 +1023,7 @@ class DatasetCrawler:
                 "index": idx,
                 "url": url,
                 "file_path": save_path,
+                "sha256": content_hash,
                 "batch": batch_name,
                 "keyword": keyword,
                 "source": source,

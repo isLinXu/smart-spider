@@ -103,6 +103,29 @@ from .image_retrieval import (
     IndexBuildReport,
     iter_image_files,
 )
+from .dataset_filter import (
+    CLIPPromptScorer,
+    DatasetImageFilter,
+    DecisionPolicy,
+    FilterDecision,
+    FilterThresholds,
+    PromptSet,
+    SemanticScores,
+    VisualSignalAnalyzer,
+    VisualSignals,
+)
+from .reverse_image_search import (
+    BaiduReverseImageProvider,
+    BingVisualSearchProvider,
+    BrowserDependencyError,
+    GoogleLensProvider,
+    ProviderSearchResponse,
+    ProviderBlockedError,
+    RemoteImageSearchResult,
+    ReverseImageSearchError,
+    ReverseImageSearchResponse,
+    ReverseImageSearcher,
+)
 
 # spider_tools 桥接
 from .spider_tools_bridge import SpiderToolsBridge, SpiderToolsURL, integrate_with_dataset_crawler, parse_page_spec, list_available_sites
@@ -204,6 +227,25 @@ __all__ = [
     "ImageSimilarityIndex",
     "IndexBuildReport",
     "iter_image_files",
+    "CLIPPromptScorer",
+    "DatasetImageFilter",
+    "DecisionPolicy",
+    "FilterDecision",
+    "FilterThresholds",
+    "PromptSet",
+    "SemanticScores",
+    "VisualSignalAnalyzer",
+    "VisualSignals",
+    "BaiduReverseImageProvider",
+    "BingVisualSearchProvider",
+    "BrowserDependencyError",
+    "GoogleLensProvider",
+    "ProviderSearchResponse",
+    "ProviderBlockedError",
+    "RemoteImageSearchResult",
+    "ReverseImageSearchError",
+    "ReverseImageSearchResponse",
+    "ReverseImageSearcher",
     # spider_tools 桥接
     "SpiderToolsBridge",
     "SpiderToolsURL",
