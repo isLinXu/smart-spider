@@ -129,6 +129,10 @@ def main():
         "--timeout", type=int, default=10,
         help="HTTP 超时秒数（默认 10）",
     )
+    parser.add_argument(
+        "--max-retries", type=int, default=3,
+        help="单个请求最大重试次数（默认 3；批量采集可设为 0-1 以快速跳过失效来源）",
+    )
 
     # 图片过滤
     parser.add_argument(
@@ -225,6 +229,7 @@ def main():
         rate=args.rate,
         max_workers=args.max_workers,
         timeout=args.timeout,
+        max_retries=args.max_retries,
         min_width=args.min_width,
         min_height=args.min_height,
         min_file_size=args.min_file_size,

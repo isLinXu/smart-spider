@@ -288,6 +288,21 @@ class SmartHttpClient:
         self._max_retries = max_retries
         self._timeout = timeout
         self._proxy_strategy = proxy_strategy
+        # Host-level circuit breaker.  Image search results frequently contain
+        # permanently dead CDNs; after a few failures, skip that host for the
+        # remainder of this client session instead of queueing thousands of
+        # doomed requests behind the normal retry/timeout path.
+        self._host_failures: dict[str, int] = {}
+        self._host_blocked_until: dict[str, float] = {}
+        self._host_lock = threading.Lock()
+        self._host_failure_threshold = 3
+        self._host_block_seconds = 300.0
+        self._host_circuit_exempt = {
+            (urlparse(url).hostname or "").lower()
+            for url in _ENGINE_REFERERS.values()
+        }
+        # Baidu's image JSON endpoint differs from its configured referer host.
+        self._host_circuit_exempt.add("image.baidu.com")
         # 直连 Session（无代理时使用）
         self._direct_session = _build_session()
 
@@ -298,6 +313,42 @@ class SmartHttpClient:
             if use_curl_cffi and not _CURL_CFFI_AVAILABLE:
                 raise ImportError("curl_cffi is not installed. Run: pip install curl_cffi")
             self._use_curl = use_curl_cffi
+
+    def _host_allowed(self, url: str) -> bool:
+        host = (urlparse(url).hostname or "").lower()
+        if not host or host in self._host_circuit_exempt:
+            return True
+        now = time.monotonic()
+        with self._host_lock:
+            blocked_until = self._host_blocked_until.get(host, 0.0)
+            if blocked_until > now:
+                return False
+            if blocked_until:
+                self._host_blocked_until.pop(host, None)
+                self._host_failures.pop(host, None)
+        return True
+
+    def _record_host_failure(self, url: str) -> None:
+        host = (urlparse(url).hostname or "").lower()
+        if not host or host in self._host_circuit_exempt:
+            return
+        with self._host_lock:
+            failures = self._host_failures.get(host, 0) + 1
+            self._host_failures[host] = failures
+            if failures >= self._host_failure_threshold:
+                self._host_blocked_until[host] = time.monotonic() + self._host_block_seconds
+                logger.info(
+                    f"Host circuit opened for {host} after {failures} failures "
+                    f"({self._host_block_seconds:.0f}s)"
+                )
+
+    def _record_host_success(self, url: str) -> None:
+        host = (urlparse(url).hostname or "").lower()
+        if not host or host in self._host_circuit_exempt:
+            return
+        with self._host_lock:
+            self._host_failures.pop(host, None)
+            self._host_blocked_until.pop(host, None)
 
     def _make_headers(self, engine: Optional[str] = None) -> dict:
         """生成随机化的浏览器请求头。"""
@@ -368,6 +419,10 @@ class SmartHttpClient:
         """
         last_exc = None
         for attempt in range(self._max_retries + 1):
+            if not self._host_allowed(url):
+                raise requests.ConnectionError(
+                    f"Host circuit open: {urlparse(url).hostname or url}"
+                )
             self._rate_limiter.acquire()
 
             proxy_entry = (
@@ -409,42 +464,52 @@ class SmartHttpClient:
                         pass
                     finally:
                         resp.close()
-                    wait = (2 ** attempt) + random.uniform(0, 1)
                     logger.warning(
                         f"Anti-crawl status {resp.status_code} for {url[:60]}, "
-                        f"retry {attempt + 1}/{self._max_retries} after {wait:.1f}s"
+                        f"attempt {attempt + 1}/{self._max_retries + 1}"
                     )
                     if proxy_entry:
                         self._proxy_pool.report_fail(proxy_entry)
-                    time.sleep(wait)
+                    self._record_host_failure(url)
                     last_exc = requests.HTTPError(response=resp)
+                    if attempt >= self._max_retries:
+                        break
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(wait)
                     continue
 
                 if proxy_entry:
                     self._proxy_pool.report_success(proxy_entry)
+                self._record_host_success(url)
                 return resp
 
             except (requests.ConnectionError, requests.Timeout) as e:
+                last_exc = e
+                if proxy_entry:
+                    self._proxy_pool.report_fail(proxy_entry)
+                self._record_host_failure(url)
+                if attempt >= self._max_retries:
+                    break
                 wait = (2 ** attempt) + random.uniform(0, 1)
                 logger.warning(
                     f"Request error ({type(e).__name__}) for {url[:60]}, "
-                    f"retry {attempt + 1}/{self._max_retries} after {wait:.1f}s"
+                    f"retry {attempt + 2}/{self._max_retries + 1} after {wait:.1f}s"
                 )
-                if proxy_entry:
-                    self._proxy_pool.report_fail(proxy_entry)
                 time.sleep(wait)
-                last_exc = e
             except Exception as e:
                 # curl_cffi 等可能抛出非 requests 异常
+                last_exc = e
+                if proxy_entry:
+                    self._proxy_pool.report_fail(proxy_entry)
+                self._record_host_failure(url)
+                if attempt >= self._max_retries:
+                    break
                 wait = (2 ** attempt) + random.uniform(0, 1)
                 logger.warning(
                     f"Unexpected error for {url[:60]}: {type(e).__name__}: {e}, "
-                    f"retry {attempt + 1}/{self._max_retries} after {wait:.1f}s"
+                    f"retry {attempt + 2}/{self._max_retries + 1} after {wait:.1f}s"
                 )
-                if proxy_entry:
-                    self._proxy_pool.report_fail(proxy_entry)
                 time.sleep(wait)
-                last_exc = e
 
         raise last_exc or requests.RequestException(f"Failed after {self._max_retries} retries: {url}")
 
@@ -462,6 +527,10 @@ class SmartHttpClient:
         """
         last_exc = None
         for attempt in range(self._max_retries + 1):
+            if not self._host_allowed(url):
+                raise requests.ConnectionError(
+                    f"Host circuit open: {urlparse(url).hostname or url}"
+                )
             self._rate_limiter.acquire()
             proxy_entry = (
                 self._proxy_pool.get(self._proxy_strategy)
@@ -496,35 +565,45 @@ class SmartHttpClient:
                         pass
                     finally:
                         resp.close()
-                    wait = (2 ** attempt) + random.uniform(0, 1)
                     logger.warning(
                         f"HEAD anti-crawl {resp.status_code} for {url[:60]}, "
-                        f"retry {attempt + 1}/{self._max_retries} after {wait:.1f}s"
+                        f"attempt {attempt + 1}/{self._max_retries + 1}"
                     )
                     if proxy_entry:
                         self._proxy_pool.report_fail(proxy_entry)
-                    time.sleep(wait)
+                    self._record_host_failure(url)
                     last_exc = requests.HTTPError(response=resp)
+                    if attempt >= self._max_retries:
+                        break
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(wait)
                     continue
 
                 if proxy_entry:
                     self._proxy_pool.report_success(proxy_entry)
+                self._record_host_success(url)
                 return resp
 
             except (requests.ConnectionError, requests.Timeout) as e:
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(f"HEAD error for {url[:60]}: {e}, retry {attempt + 1}")
+                last_exc = e
                 if proxy_entry:
                     self._proxy_pool.report_fail(proxy_entry)
+                self._record_host_failure(url)
+                if attempt >= self._max_retries:
+                    break
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"HEAD error for {url[:60]}: {e}, retry {attempt + 2}/{self._max_retries + 1}")
                 time.sleep(wait)
-                last_exc = e
             except Exception as e:
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(f"HEAD unexpected error for {url[:60]}: {e}")
+                last_exc = e
                 if proxy_entry:
                     self._proxy_pool.report_fail(proxy_entry)
+                self._record_host_failure(url)
+                if attempt >= self._max_retries:
+                    break
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"HEAD unexpected error for {url[:60]}: {e}, retry {attempt + 2}/{self._max_retries + 1}")
                 time.sleep(wait)
-                last_exc = e
 
         raise last_exc or requests.RequestException(f"HEAD failed after {self._max_retries} retries: {url}")
 
