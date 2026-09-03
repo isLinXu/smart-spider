@@ -30,7 +30,7 @@ def _make_png_bytes(width=50, height=50, color=(100, 150, 200)):
 
 def _make_infer_spider(target_saved=3):
     """构造一个带 CLIP stub 的 SmartSpider，不加载真实模型。"""
-    import torch
+    torch = pytest.importorskip("torch")
     from smart_spider.smart_spider import SmartSpider
 
     spider = object.__new__(SmartSpider)

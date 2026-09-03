@@ -29,7 +29,7 @@ jobs:
           pip install --upgrade pip
           # 安装测试所需最小依赖（跳过 torch/clip 重型依赖）
           pip install requests urllib3 fake-useragent loguru tqdm Pillow numpy
-          pip install pytest pytest-cov pytest-mock
+          pip install pytest pytest-cov pytest-mock tomli
           pip install ruff
 
       - name: Install optional lightweight dependencies
@@ -38,9 +38,9 @@ jobs:
           pip install pybloom-live || true
           pip install curl_cffi || true
 
-      - name: Run tests (mock clip/torch)
+      - name: Run tests (optional ML dependencies skipped)
         run: |
-          # 使用 mock 跳过 clip/torch 导入（CI 环境不安装重型 GPU 依赖）
+          # CLIP/torch tests self-skip when heavyweight ML dependencies are absent.
           pytest tests/ -v --tb=short \
             --ignore=tests/test_http_client.py \
             -k "not TestSmartHttpClient" \
