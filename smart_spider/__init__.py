@@ -73,6 +73,9 @@ from .dataset_contracts import (
     SampleRecord,
 )
 from .dataset_state import DatasetStateStore
+from .dataset_repository import DatasetCommit, DatasetRepository
+from .http_client import HttpMetrics
+from .url_policy import URLPolicy, UnsafeURLError
 from .multimodal_pipeline import (
     AdaptiveSourceRouter,
     BatchAnnotationBackend,
@@ -94,7 +97,7 @@ from .multimodal_job import (
     MultimodalJobReport,
     MultimodalManifestWriter,
 )
-from .multimodal_sources import SearchDiscoverySource, SiteDiscoverySource
+from .multimodal_sources import SearchDiscoverySource, SiteDiscoverySource, SourceMetrics
 from .multimodal_scale import QualityReport, ShardedManifestWriter
 from .image_retrieval import (
     IMAGE_SUFFIXES,
@@ -113,6 +116,13 @@ from .dataset_filter import (
     SemanticScores,
     VisualSignalAnalyzer,
     VisualSignals,
+)
+from .scene_quality import (
+    SceneQualityProfile,
+    get_scene_quality_profile,
+    list_scene_quality_profiles,
+    load_scene_quality_profile,
+    resolve_scene_quality_profile,
 )
 from .reverse_image_search import (
     BaiduReverseImageProvider,
@@ -201,6 +211,11 @@ __all__ = [
     "QualityMetrics",
     "SampleRecord",
     "DatasetStateStore",
+    "DatasetCommit",
+    "DatasetRepository",
+    "HttpMetrics",
+    "URLPolicy",
+    "UnsafeURLError",
     "PageSampleExtractor",
     "AdaptiveSourceRouter",
     "AnnotationRouter",
@@ -222,6 +237,7 @@ __all__ = [
     "QualityReport",
     "SearchDiscoverySource",
     "SiteDiscoverySource",
+    "SourceMetrics",
     "IMAGE_SUFFIXES",
     "ImageSearchResult",
     "ImageSimilarityIndex",
@@ -236,6 +252,11 @@ __all__ = [
     "SemanticScores",
     "VisualSignalAnalyzer",
     "VisualSignals",
+    "SceneQualityProfile",
+    "get_scene_quality_profile",
+    "list_scene_quality_profiles",
+    "load_scene_quality_profile",
+    "resolve_scene_quality_profile",
     "BaiduReverseImageProvider",
     "BingVisualSearchProvider",
     "BrowserDependencyError",

@@ -71,15 +71,14 @@ output_dir/
 import hashlib
 import json
 import os
-import queue
 import re
 import signal
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -92,17 +91,15 @@ from .smart_spider import (
     CrawlEvent,
     CrawlStats,
     UrlDeduplicator,
-    VideoDownloader,
-    TextExtractor,
     _detect_ext,
-    _SENTINEL,
 )
-from .engines import ENGINE_REGISTRY, MediaType, RenderMode, get_engine
+from .engines import ENGINE_REGISTRY, MediaType, get_engine
 from .site_crawler import SiteCrawler
-from .site_parser import SiteParser, get_site_parser
+from .site_parser import get_site_parser
 from .dataset_contracts import (
     CandidateResource,
     LabelDecision,
+    LabelMode,
     LabelPolicy,
     Modality,
     ModalityAsset,
@@ -110,6 +107,7 @@ from .dataset_contracts import (
     SampleRecord,
 )
 from .dataset_state import DatasetStateStore
+from .dataset_repository import DatasetRepository
 
 # torch / clip 延迟导入
 try:
@@ -155,6 +153,7 @@ class DatasetDirManager:
         self.batch_size = batch_size
         self._lock = threading.Lock()
         self._saved_count = 0
+        self._next_index = 0
         os.makedirs(output_dir, exist_ok=True)
 
     def get_save_path(self, url: str, ext: str) -> str:
@@ -164,8 +163,9 @@ class DatasetDirManager:
             完整文件路径，如 /output/batch_0100/0123_a1b2c3d4.jpg
         """
         with self._lock:
-            idx = self._saved_count
+            idx = self._next_index
             self._saved_count += 1
+            self._next_index += 1
 
         batch_dir = os.path.join(
             self.output_dir,
@@ -198,7 +198,7 @@ class DatasetDirManager:
             if max_count is not None and self._saved_count >= max_count:
                 return None
 
-            idx = self._saved_count
+            idx = self._next_index
             batch_dir = os.path.join(
                 self.output_dir,
                 f"batch_{(idx // self.batch_size) * self.batch_size:04d}",
@@ -229,14 +229,34 @@ class DatasetDirManager:
                 raise
 
             self._saved_count += 1
+            self._next_index = idx + 1
             return idx, final_path
 
     def increment(self) -> int:
         """递增计数器并返回当前值（线程安全）。"""
         with self._lock:
-            idx = self._saved_count
+            idx = self._next_index
             self._saved_count += 1
+            self._next_index += 1
             return idx
+
+    def set_existing_state(self, saved_count: int, next_index: Optional[int] = None) -> None:
+        """Restore active count without reusing indices removed by filtering."""
+        if saved_count < 0:
+            raise ValueError("saved_count must be non-negative")
+        if next_index is None:
+            next_index = saved_count
+        if next_index < saved_count:
+            raise ValueError("next_index must be >= saved_count")
+        with self._lock:
+            self._saved_count = saved_count
+            self._next_index = next_index
+
+    def record_repository_commit(self, index: int) -> None:
+        """Mirror a commit allocated by DatasetRepository."""
+        with self._lock:
+            self._saved_count += 1
+            self._next_index = max(self._next_index, index + 1)
 
     @property
     def saved_count(self) -> int:
@@ -246,7 +266,7 @@ class DatasetDirManager:
     def current_batch_dir(self) -> str:
         """返回当前分桶目录路径。"""
         with self._lock:
-            idx = self._saved_count
+            idx = self._next_index
         batch_name = f"batch_{(idx // self.batch_size) * self.batch_size:04d}"
         return os.path.join(self.output_dir, batch_name)
 
@@ -271,6 +291,19 @@ class DatasetDirManager:
                 if fname.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
                     count += 1
         return count
+
+    def infer_next_index(self) -> int:
+        """Return one past the largest numeric filename prefix on disk."""
+        maximum = -1
+        for name in os.listdir(self.output_dir):
+            batch_dir = os.path.join(self.output_dir, name)
+            if not os.path.isdir(batch_dir) or not name.startswith("batch_"):
+                continue
+            for filename in os.listdir(batch_dir):
+                prefix = filename.split("_", 1)[0]
+                if prefix.isdigit():
+                    maximum = max(maximum, int(prefix))
+        return maximum + 1
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -483,6 +516,10 @@ class DatasetCrawler:
         # 图片落盘格式（追加到末尾，保持旧位置参数兼容）
         image_output_format: Optional[str] = _DEFAULT_IMAGE_OUTPUT_FORMAT,
         jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
+        # 大规模任务保护（追加到末尾，保持旧位置参数兼容）
+        max_file_size: int = 12 * 1024 * 1024,
+        use_curl_cffi: Optional[bool] = None,
+        allow_private_hosts: bool = False,
     ):
         self.keywords = keywords
         self.total_count = total_count
@@ -519,6 +556,9 @@ class DatasetCrawler:
         self.min_height = min_height
         self.min_variance = min_variance
         self.min_file_size = min_file_size
+        if max_file_size < min_file_size:
+            raise ValueError("max_file_size must be >= min_file_size")
+        self.max_file_size = max_file_size
         self._callbacks = callbacks or []
         self._disk_guard_mb = disk_guard_mb
         self.job_id = job_id or hashlib.sha256(
@@ -558,6 +598,7 @@ class DatasetCrawler:
 
         # SQLite 状态库：传入空字符串可显式关闭，默认写入输出目录。
         self._state_store = None
+        self._repository = None
         if state_db != "":
             db_path = state_db or os.path.join(output_dir, ".dataset_state.sqlite3")
             self._state_store = DatasetStateStore(db_path)
@@ -568,6 +609,12 @@ class DatasetCrawler:
                     "total_count": total_count,
                     "label_policy": self.label_policy.to_dict(),
                 },
+            )
+            self._repository = DatasetRepository(
+                output_dir,
+                self._state_store,
+                self.job_id,
+                batch_size=batch_size,
             )
 
         # URL 去重
@@ -584,6 +631,8 @@ class DatasetCrawler:
             rate=rate,
             max_retries=max_retries,
             timeout=timeout,
+            use_curl_cffi=use_curl_cffi,
+            allow_private_hosts=allow_private_hosts,
         )
 
         # 搜索引擎
@@ -641,7 +690,12 @@ class DatasetCrawler:
             if existing > 0:
                 logger.info(f"断点续传：已存在 {existing} 张图片，从第 {existing + 1} 张继续")
                 # 同步目录管理器的计数器
-                self._dir_manager._saved_count = existing
+                next_index = existing
+                if self._repository is not None:
+                    next_index = max(existing, self._repository.next_index)
+                else:
+                    next_index = max(existing, self._dir_manager.infer_next_index())
+                self._dir_manager.set_existing_state(existing, next_index)
 
     def _should_stop(self) -> bool:
         return self._shutdown_requested.is_set() or not self._check_disk_space()
@@ -760,6 +814,16 @@ class DatasetCrawler:
             if self._query_contains_term(query, alias):
                 add(label, {"query": keyword, "alias": alias})
 
+        if (
+            not decisions
+            and self.label_policy.mode == LabelMode.FIXED
+            and len(self.label_policy.fixed_labels) == 1
+        ):
+            add(self.label_policy.fixed_labels[0], {
+                "query": keyword,
+                "fixed_assignment": True,
+            })
+
         if not decisions:
             decisions.append(LabelDecision(keyword, 1.0, "query"))
         return decisions
@@ -852,10 +916,27 @@ class DatasetCrawler:
             if ext not in (".jpg", ".png", ".webp", ".gif", ".avif", ".avis"):
                 return reject("unsupported_image_format")
 
+            response_headers = getattr(resp, "headers", {}) or {}
+            content_length = response_headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > self.max_file_size:
+                        self.stats.inc_filtered("image")
+                        return reject("file_too_large")
+                except (TypeError, ValueError):
+                    pass
+
             # 读取完整内容
             try:
-                rest = b"".join(resp.iter_content(chunk_size=65536))
-                full_content = peek + rest
+                chunks = [peek]
+                total_bytes = len(peek)
+                for chunk in resp.iter_content(chunk_size=65536):
+                    total_bytes += len(chunk)
+                    if total_bytes > self.max_file_size:
+                        self.stats.inc_filtered("image")
+                        return reject("file_too_large")
+                    chunks.append(chunk)
+                full_content = b"".join(chunks)
             except Exception as read_err:
                 logger.warning(f"Image body read failed: {url[:55]}: {read_err}")
                 return fail(f"read_error: {read_err}")
@@ -940,21 +1021,6 @@ class DatasetCrawler:
                 self._prepare_output_image(img, full_content, ext)
             )
 
-            # 原子保存图片；再次在锁内检查全局目标，避免并发超量。
-            saved = self._dir_manager.save_content(
-                url,
-                output_ext,
-                output_content,
-                max_count=self.total_count,
-            )
-            if saved is None:
-                return reject("target_reached")
-            idx, save_path = saved
-            self._dedup.commit_content(full_content)
-            content_claimed = False
-            self._dedup.commit(url)
-            url_claimed = False
-
             label_resolution = self.label_policy.resolve(
                 self._query_label_decisions(keyword)
             )
@@ -969,75 +1035,119 @@ class DatasetCrawler:
                 validated=True,
             )
 
-            sample = SampleRecord(
-                sample_id=f"sha256:{content_hash}",
-                file=os.path.relpath(save_path, self.output_dir),
-                labels=label_resolution.labels,
-                quality=quality,
-                provenance={
-                    "source": source,
-                    "query": keyword,
+            def build_records(
+                idx: int,
+                save_path: str,
+                relative_path: str,
+                final_hash: str,
+            ) -> tuple[SampleRecord, dict[str, Any]]:
+                sample = SampleRecord(
+                    sample_id=f"sha256:{final_hash}",
+                    file=relative_path,
+                    labels=label_resolution.labels,
+                    quality=quality,
+                    provenance={
+                        "source": source,
+                        "query": keyword,
+                        "url": url,
+                    },
+                    pipeline={
+                        "job_id": self.job_id,
+                        "label_policy": self.label_policy.to_dict(),
+                        "format_conversion": format_conversion,
+                        "image_query": {
+                            "path": self.query_image,
+                            "similarity": round(image_sim, 4) if image_sim is not None else None,
+                            "threshold": self.image_similarity_threshold,
+                        } if self.query_image else None,
+                        "status": "accepted",
+                    },
+                    modalities=[ModalityAsset(
+                        modality=Modality.IMAGE,
+                        role="image",
+                        uri=relative_path,
+                        mime_type=(
+                            "image/jpeg"
+                            if output_ext == ".jpg"
+                            else f"image/{output_ext.lstrip('.') }"
+                        ),
+                    )],
+                    task_type="image_classification",
+                )
+                metadata = {
+                    "index": idx,
                     "url": url,
-                },
-                pipeline={
-                    "job_id": self.job_id,
-                    "label_policy": self.label_policy.to_dict(),
+                    "file_path": save_path,
+                    "sha256": final_hash,
+                    "batch": Path(relative_path).parent.name,
+                    "keyword": keyword,
+                    "source": source,
+                    "sim": round(sim, 4),
+                    "image_sim": round(image_sim, 4) if image_sim is not None else None,
+                    "width": img.width,
+                    "height": img.height,
+                    "ext": output_ext,
+                    "source_ext": ext,
                     "format_conversion": format_conversion,
-                    "image_query": {
-                        "path": self.query_image,
-                        "similarity": round(image_sim, 4) if image_sim is not None else None,
-                        "threshold": self.image_similarity_threshold,
-                    } if self.query_image else None,
-                    "status": "accepted",
-                },
-                modalities=[ModalityAsset(
-                    modality=Modality.IMAGE,
-                    role="image",
-                    uri=os.path.relpath(save_path, self.output_dir),
-                    mime_type=(
-                        "image/jpeg"
-                        if output_ext == ".jpg"
-                        else f"image/{output_ext.lstrip('.') }"
-                    ),
-                )],
-                task_type="image_classification",
-            )
+                    "labels": [item.to_dict() for item in label_resolution.labels],
+                    "label_candidates": [item.to_dict() for item in label_resolution.candidates],
+                    "quality": quality.to_dict(),
+                }
+                return sample, metadata
 
-            if candidate_id and self._state_store is not None:
-                try:
-                    self._state_store.add_sample(
-                        self.job_id,
-                        sample,
-                        candidate_id=candidate_id,
-                        content_hash=content_hash,
+            if self._repository is not None:
+                commit = self._repository.commit_image(
+                    output_content,
+                    source_content=full_content,
+                    url=url,
+                    extension=output_ext,
+                    candidate_id=candidate_id,
+                    max_count=self.total_count,
+                    build_records=build_records,
+                )
+                if commit.status != "committed":
+                    return reject(
+                        "target_reached" if commit.status == "target_reached" else "duplicate_content"
                     )
-                except Exception as state_err:
-                    # 文件已经原子提交，状态库异常不能让样本被误报为下载失败。
-                    logger.warning(f"State store sample error: {state_err}")
+                idx = int(commit.index or 0)
+                save_path = commit.path
+                sample = commit.sample
+                if sample is None:
+                    return fail("repository_commit_missing_sample")
+                self._dir_manager.record_repository_commit(idx)
+            else:
+                # 兼容无 SQLite 状态库的旧执行模式。
+                saved = self._dir_manager.save_content(
+                    url,
+                    output_ext,
+                    output_content,
+                    max_count=self.total_count,
+                )
+                if saved is None:
+                    return reject("target_reached")
+                idx, save_path = saved
+                relative_path = os.path.relpath(save_path, self.output_dir)
+                sample, metadata = build_records(
+                    idx, save_path, relative_path, content_hash
+                )
+                if candidate_id and self._state_store is not None:
+                    try:
+                        self._state_store.add_sample(
+                            self.job_id,
+                            sample,
+                            candidate_id=candidate_id,
+                            content_hash=content_hash,
+                        )
+                    except Exception as state_err:
+                        # 文件已经原子提交，状态库异常不能让样本被误报为下载失败。
+                        logger.warning(f"State store sample error: {state_err}")
+                self._manifest_writer.write(sample)
+                self._metadata_writer.write(metadata)
 
-            self._manifest_writer.write(sample)
-
-            # 写入元数据
-            batch_name = f"batch_{(idx // self.batch_size) * self.batch_size:04d}"
-            self._metadata_writer.write({
-                "index": idx,
-                "url": url,
-                "file_path": save_path,
-                "sha256": content_hash,
-                "batch": batch_name,
-                "keyword": keyword,
-                "source": source,
-                "sim": round(sim, 4),
-                "image_sim": round(image_sim, 4) if image_sim is not None else None,
-                "width": img.width,
-                "height": img.height,
-                "ext": output_ext,
-                "source_ext": ext,
-                "format_conversion": format_conversion,
-                "labels": [item.to_dict() for item in label_resolution.labels],
-                "label_candidates": [item.to_dict() for item in label_resolution.candidates],
-                "quality": quality.to_dict(),
-            })
+            self._dedup.commit_content(full_content)
+            content_claimed = False
+            self._dedup.commit(url)
+            url_claimed = False
 
             self.stats.inc_saved("image")
             self._emit_callback(CrawlEvent(
@@ -1075,6 +1185,29 @@ class DatasetCrawler:
     # 搜索引擎爬取
     # ──────────────────────────────────────────────────────────────
 
+    def _ordered_search_engines(self) -> list[str]:
+        """Prioritize engines with observed page success and candidate yield."""
+        names = list(self.search_engines)
+        snapshot = self.stats.summary().get("source_metrics", {})
+        if not snapshot:
+            return names
+        position = {name: index for index, name in enumerate(names)}
+
+        def key(name: str) -> tuple[int, float, float, int]:
+            row = snapshot.get(name)
+            if not row or not row.get("attempts"):
+                return (1, 0.0, 0.0, position[name])
+            attempts = max(int(row["attempts"]), 1)
+            yield_per_attempt = float(row.get("candidates", 0)) / attempts
+            return (
+                0,
+                -float(row.get("success_rate", 0.0)),
+                -yield_per_attempt,
+                position[name],
+            )
+
+        return sorted(names, key=key)
+
     def _crawl_search_engines(self, keyword: str, pbar: tqdm) -> int:
         """通过搜索引擎爬取指定关键词的图片。
 
@@ -1083,7 +1216,7 @@ class DatasetCrawler:
         """
         saved_before = self._dir_manager.saved_count
 
-        for engine_name in self.search_engines:
+        for engine_name in self._ordered_search_engines():
             if self._should_stop() or self._dir_manager.saved_count >= self.total_count:
                 break
 
@@ -1121,14 +1254,24 @@ class DatasetCrawler:
             return
 
         eng = get_engine(engine_name)
+        fetch_started = time.monotonic()
         try:
             html = self._http.get_text(url, engine=engine_name)
             self.stats.inc_pages()
         except Exception as e:
             logger.debug(f"Fetch error {url[:55]}: {e}")
+            self.stats.observe_source(
+                engine_name, success=False, error=str(e)
+            )
             return
 
         items = eng.extract_items(html)
+        self.stats.observe_source(
+            engine_name,
+            success=True,
+            candidates=len(items),
+            elapsed_ms=(time.monotonic() - fetch_started) * 1000,
+        )
         for item in items:
             if self._should_stop() or self._dir_manager.saved_count >= self.total_count:
                 break
@@ -1155,6 +1298,9 @@ class DatasetCrawler:
             parser = get_site_parser(parser_name)
         except Exception as e:
             logger.error(f"Unknown site parser '{parser_name}': {e}")
+            self.stats.observe_source(
+                f"site:{parser_name}", success=False, error=str(e)
+            )
             return 0
 
         # 使用 SiteCrawler 收集图片 URL
@@ -1169,7 +1315,24 @@ class DatasetCrawler:
         )
 
         # 收集文章
-        articles = site_crawler.collect_articles()
+        started = time.monotonic()
+        try:
+            articles = site_crawler.collect_articles()
+        except Exception as exc:
+            logger.error(f"[site:{parser_name}] collection failed: {exc}")
+            self.stats.observe_source(
+                f"site:{parser_name}",
+                success=False,
+                elapsed_ms=(time.monotonic() - started) * 1000,
+                error=str(exc),
+            )
+            return 0
+        self.stats.observe_source(
+            f"site:{parser_name}",
+            success=True,
+            candidates=len(articles),
+            elapsed_ms=(time.monotonic() - started) * 1000,
+        )
         logger.info(f"[site:{parser_name}] collected {len(articles)} articles")
 
         for article in articles:
@@ -1215,8 +1378,14 @@ class DatasetCrawler:
             )
         except Exception as e:
             logger.error(f"spider_tools collection failed: {e}")
+            self.stats.observe_source(
+                "spider_tools", success=False, error=str(e)
+            )
             return 0
 
+        self.stats.observe_source(
+            "spider_tools", success=True, candidates=len(urls)
+        )
         logger.info(f"[spider_tools] collected {len(urls)} URLs from {self._st_sites}")
 
         for u in urls:
@@ -1235,6 +1404,13 @@ class DatasetCrawler:
 
     def close(self):
         """关闭元数据、去重和 SQLite 状态资源。"""
+        try:
+            self._http.close()
+        except Exception:
+            pass
+        if self._repository is not None:
+            self._repository.close()
+            self._repository = None
         self._metadata_writer.close()
         self._manifest_writer.close()
         self._dedup.close()
@@ -1318,9 +1494,13 @@ class DatasetCrawler:
         report["use_clip"] = self.use_clip
         report["image_output_format"] = self.image_output_format or "original"
         report["jpeg_quality"] = self.jpeg_quality
+        report["max_file_size"] = self.max_file_size
         report["batch_size"] = self.batch_size
         report["batches"] = self._dir_manager.list_batches()
         report["shutdown"] = self._shutdown_requested.is_set()
+        report["http_metrics"] = self._http.metrics.snapshot()
+        if self._repository is not None:
+            report["repository_recovery"] = dict(self._repository.recovery_report)
 
         report_path = os.path.join(self.output_dir, "_dataset_report.json")
         try:
