@@ -21,8 +21,20 @@ class DatasetStateStore:
     锁串行化。多进程场景可以通过 SQLite 的 busy_timeout 和短事务安全竞争。
     """
 
-    def __init__(self, path: str):
+    def __init__(
+        self,
+        path: str,
+        *,
+        event_payload_mode: str = "compact",
+        max_event_payload_bytes: int = 4096,
+    ):
         self.path = path
+        if event_payload_mode not in {"compact", "full"}:
+            raise ValueError("event_payload_mode must be 'compact' or 'full'")
+        if max_event_payload_bytes < 256:
+            raise ValueError("max_event_payload_bytes must be at least 256")
+        self.event_payload_mode = event_payload_mode
+        self.max_event_payload_bytes = max_event_payload_bytes
         parent = os.path.dirname(os.path.abspath(path))
         os.makedirs(parent, exist_ok=True)
         self._lock = threading.RLock()
@@ -84,6 +96,41 @@ class DatasetStateStore:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(job_id) REFERENCES jobs(job_id)
                 );
+                CREATE TABLE IF NOT EXISTS dataset_items (
+                    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    item_index INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    source_hash TEXT NOT NULL DEFAULT '',
+                    relative_path TEXT NOT NULL,
+                    staging_path TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    manifest_json TEXT NOT NULL DEFAULT '{}',
+                    candidate_id TEXT,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(job_id, item_index),
+                    UNIQUE(job_id, relative_path),
+                    FOREIGN KEY(job_id) REFERENCES jobs(job_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_dataset_items_state
+                    ON dataset_items(job_id, state, item_index);
+                CREATE TABLE IF NOT EXISTS dataset_content_hashes (
+                    job_id TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(job_id, content_hash),
+                    FOREIGN KEY(job_id) REFERENCES jobs(job_id),
+                    FOREIGN KEY(item_id) REFERENCES dataset_items(item_id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS dataset_counters (
+                    job_id TEXT PRIMARY KEY,
+                    next_index INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(job_id) REFERENCES jobs(job_id)
+                );
                 """
             )
 
@@ -109,16 +156,13 @@ class DatasetStateStore:
         ).hexdigest()
         payload = json.dumps(resource.to_dict(), ensure_ascii=False)
         with self._lock, self._conn:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 """
                 INSERT INTO candidates(
                     candidate_id, job_id, url, source, payload_json,
                     available_at, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(candidate_id) DO UPDATE SET
-                    payload_json=excluded.payload_json,
-                    source=excluded.source,
-                    updated_at=excluded.updated_at
+                ON CONFLICT(candidate_id) DO NOTHING
                 """,
                 (
                     candidate_id,
@@ -131,8 +175,381 @@ class DatasetStateStore:
                     now,
                 ),
             )
-            self._record_event_locked(job_id, candidate_id, "candidate_discovered", resource.to_dict())
+            if cursor.rowcount:
+                self._record_event_locked(
+                    job_id, candidate_id, "candidate_discovered", resource.to_dict()
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE candidates
+                    SET payload_json=?, source=?, updated_at=?
+                    WHERE candidate_id=?
+                    """,
+                    (payload, resource.source, now, candidate_id),
+                )
         return candidate_id
+
+    def reserve_dataset_item(
+        self,
+        job_id: str,
+        *,
+        content_hash: str,
+        source_hash: str,
+        staging_path: str,
+        batch_size: int,
+        filename_token: str,
+        extension: str,
+        max_count: Optional[int] = None,
+        candidate_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Atomically reserve a unique final hash and monotonically increasing index."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        extension = extension if extension.startswith(".") else f".{extension}"
+        now = utc_now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    "SELECT item_id FROM dataset_content_hashes WHERE job_id=? AND content_hash=?",
+                    (job_id, content_hash),
+                ).fetchone()
+                if existing is not None:
+                    self._conn.rollback()
+                    return {"status": "duplicate", "item_id": int(existing["item_id"])}
+
+                active = int(self._conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM dataset_items
+                    WHERE job_id=? AND state IN ('pending', 'prepared', 'committed')
+                    """,
+                    (job_id,),
+                ).fetchone()["count"])
+                if max_count is not None and active >= max_count:
+                    self._conn.rollback()
+                    return {"status": "target_reached"}
+
+                counter = self._conn.execute(
+                    "SELECT next_index FROM dataset_counters WHERE job_id=?",
+                    (job_id,),
+                ).fetchone()
+                if counter is None:
+                    maximum = self._conn.execute(
+                        "SELECT MAX(item_index) AS maximum FROM dataset_items WHERE job_id=?",
+                        (job_id,),
+                    ).fetchone()["maximum"]
+                    item_index = int(maximum) + 1 if maximum is not None else 0
+                else:
+                    item_index = int(counter["next_index"])
+
+                batch_start = (item_index // batch_size) * batch_size
+                relative_path = (
+                    f"batch_{batch_start:04d}/{item_index:04d}_{filename_token}{extension}"
+                )
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO dataset_items(
+                        job_id, item_index, content_hash, source_hash,
+                        relative_path, staging_path, candidate_id, state,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (
+                        job_id, item_index, content_hash, source_hash,
+                        relative_path, staging_path, candidate_id, now, now,
+                    ),
+                )
+                item_id = int(cursor.lastrowid)
+                self._conn.execute(
+                    """
+                    INSERT INTO dataset_content_hashes(job_id, content_hash, item_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (job_id, content_hash, item_id, now),
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO dataset_counters(job_id, next_index, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        next_index=excluded.next_index,
+                        updated_at=excluded.updated_at
+                    """,
+                    (job_id, item_index + 1, now),
+                )
+                self._conn.commit()
+                return {
+                    "status": "reserved",
+                    "item_id": item_id,
+                    "index": item_index,
+                    "relative_path": relative_path,
+                }
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def prepare_dataset_item(
+        self,
+        item_id: int,
+        metadata: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> None:
+        now = utc_now()
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE dataset_items
+                SET metadata_json=?, manifest_json=?, state='prepared', updated_at=?
+                WHERE item_id=? AND state='pending'
+                """,
+                (
+                    json.dumps(metadata, ensure_ascii=False),
+                    json.dumps(manifest, ensure_ascii=False),
+                    now,
+                    item_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"dataset item {item_id} is not pending")
+
+    def finalize_dataset_item(self, item_id: int) -> bool:
+        """Commit a prepared item and its sample in one SQLite transaction."""
+        now = utc_now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM dataset_items WHERE item_id=?",
+                    (item_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"unknown dataset item: {item_id}")
+                if row["state"] == "committed":
+                    self._conn.rollback()
+                    return False
+                if row["state"] != "prepared":
+                    raise RuntimeError(f"dataset item {item_id} is not prepared")
+                manifest = json.loads(row["manifest_json"])
+                sample_id = str(manifest.get("id") or f"sha256:{row['content_hash']}")
+                cursor = self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO samples(
+                        sample_id, job_id, candidate_id, content_hash,
+                        payload_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sample_id,
+                        row["job_id"],
+                        row["candidate_id"],
+                        row["content_hash"],
+                        row["manifest_json"],
+                        now,
+                        now,
+                    ),
+                )
+                if not cursor.rowcount:
+                    existing = self._conn.execute(
+                        "SELECT job_id, content_hash FROM samples WHERE sample_id=?",
+                        (sample_id,),
+                    ).fetchone()
+                    if (
+                        existing is None
+                        or existing["job_id"] != row["job_id"]
+                        or existing["content_hash"] != row["content_hash"]
+                    ):
+                        raise RuntimeError(f"sample conflict while finalizing dataset item {item_id}")
+                if row["candidate_id"]:
+                    self._conn.execute(
+                        """
+                        UPDATE candidates
+                        SET state='accepted', lease_token=NULL, lease_until=NULL, updated_at=?
+                        WHERE candidate_id=?
+                        """,
+                        (now, row["candidate_id"]),
+                    )
+                self._conn.execute(
+                    """
+                    UPDATE dataset_items
+                    SET state='committed', staging_path='', updated_at=?
+                    WHERE item_id=?
+                    """,
+                    (now, item_id),
+                )
+                self._record_event_locked(
+                    row["job_id"], row["candidate_id"], "sample_accepted", manifest
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def abort_dataset_item(self, item_id: int) -> bool:
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM dataset_items WHERE item_id=? AND state!='committed'",
+                (item_id,),
+            )
+            return bool(cursor.rowcount)
+
+    def list_dataset_items(
+        self,
+        job_id: str,
+        states: tuple[str, ...] = ("committed",),
+    ) -> list[dict[str, Any]]:
+        if not states:
+            return []
+        placeholders = ",".join("?" for _ in states)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM dataset_items
+                WHERE job_id=? AND state IN ({placeholders})
+                ORDER BY item_index, item_id
+                """,
+                (job_id, *states),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["metadata"] = json.loads(item.pop("metadata_json"))
+            item["manifest"] = json.loads(item.pop("manifest_json"))
+            result.append(item)
+        return result
+
+    def dataset_item_count(
+        self,
+        job_id: str,
+        states: tuple[str, ...] = ("committed",),
+    ) -> int:
+        if not states:
+            return 0
+        placeholders = ",".join("?" for _ in states)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT COUNT(*) AS count FROM dataset_items WHERE job_id=? AND state IN ({placeholders})",
+                (job_id, *states),
+            ).fetchone()
+        return int(row["count"])
+
+    def dataset_next_index(self, job_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT next_index FROM dataset_counters WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            if row is not None:
+                return int(row["next_index"])
+            maximum = self._conn.execute(
+                "SELECT MAX(item_index) AS maximum FROM dataset_items WHERE job_id=?",
+                (job_id,),
+            ).fetchone()["maximum"]
+        return int(maximum) + 1 if maximum is not None else 0
+
+    def import_dataset_items(
+        self,
+        job_id: str,
+        items: list[dict[str, Any]],
+    ) -> int:
+        """Register an existing legacy dataset without rewriting its files."""
+        if not items:
+            return 0
+        now = utc_now()
+        imported = 0
+        next_index = 0
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                for position, item in enumerate(items):
+                    requested_index = int(item.get("index", position))
+                    item_index = max(requested_index, next_index)
+                    next_index = item_index + 1
+                    cursor = self._conn.execute(
+                        """
+                        INSERT OR IGNORE INTO dataset_items(
+                            job_id, item_index, content_hash, source_hash,
+                            relative_path, metadata_json, manifest_json,
+                            state, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'committed', ?, ?)
+                        """,
+                        (
+                            job_id,
+                            item_index,
+                            str(item["content_hash"]),
+                            str(item.get("source_hash") or ""),
+                            str(item["relative_path"]),
+                            json.dumps(item["metadata"], ensure_ascii=False),
+                            json.dumps(item["manifest"], ensure_ascii=False),
+                            now,
+                            now,
+                        ),
+                    )
+                    if not cursor.rowcount:
+                        continue
+                    imported += 1
+                    manifest_json = json.dumps(item["manifest"], ensure_ascii=False)
+                    sample_id = str(
+                        item["manifest"].get("id")
+                        or f"sha256:{item['content_hash']}"
+                    )
+                    self._conn.execute(
+                        """
+                        INSERT OR IGNORE INTO samples(
+                            sample_id, job_id, candidate_id, content_hash,
+                            payload_json, created_at, updated_at
+                        ) VALUES (?, ?, NULL, ?, ?, ?, ?)
+                        """,
+                        (
+                            sample_id,
+                            job_id,
+                            str(item["content_hash"]),
+                            manifest_json,
+                            now,
+                            now,
+                        ),
+                    )
+                    self._conn.execute(
+                        """
+                        INSERT OR IGNORE INTO dataset_content_hashes(
+                            job_id, content_hash, item_id, created_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (job_id, str(item["content_hash"]), int(cursor.lastrowid), now),
+                    )
+                self._conn.execute(
+                    """
+                    INSERT INTO dataset_counters(job_id, next_index, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        next_index=MAX(dataset_counters.next_index, excluded.next_index),
+                        updated_at=excluded.updated_at
+                    """,
+                    (job_id, next_index, now),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return imported
+
+    def prune_events(self, job_id: str, keep_latest: int = 10_000) -> int:
+        """Delete old audit events while retaining the newest rows for a job."""
+        if keep_latest < 0:
+            raise ValueError("keep_latest must be non-negative")
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """
+                DELETE FROM events
+                WHERE job_id=? AND event_id NOT IN (
+                    SELECT event_id FROM events WHERE job_id=?
+                    ORDER BY event_id DESC LIMIT ?
+                )
+                """,
+                (job_id, job_id, keep_latest),
+            )
+            return int(cursor.rowcount)
 
     def claim_candidates(self, job_id: str, limit: int = 10, lease_seconds: int = 300) -> list[dict[str, Any]]:
         if limit <= 0:
@@ -347,13 +764,35 @@ class DatasetStateStore:
             )
             self._record_event_locked(row["job_id"], candidate_id, f"candidate_{state}", {})
 
+    def _compact_event_payload(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.event_payload_mode == "full":
+            return payload
+        compact: dict[str, Any] = {}
+        for key in ("id", "file", "url", "source", "query", "modality", "state", "error", "reason"):
+            value = payload.get(key)
+            if value not in (None, "", [], {}):
+                compact[key] = value
+        if event_type == "sample_accepted":
+            labels = payload.get("labels") or []
+            compact["labels"] = [
+                item.get("name") for item in labels
+                if isinstance(item, dict) and item.get("name")
+            ]
+        return compact
+
     def _record_event_locked(self, job_id: str, candidate_id: Optional[str], event_type: str, payload: dict[str, Any]):
+        event_payload = self._compact_event_payload(event_type, payload)
+        encoded = json.dumps(event_payload, ensure_ascii=False)
+        if len(encoded.encode("utf-8")) > self.max_event_payload_bytes:
+            encoded = json.dumps(
+                {"truncated": True, "event_type": event_type}, ensure_ascii=False
+            )
         self._conn.execute(
             """
             INSERT INTO events(job_id, candidate_id, event_type, payload_json, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (job_id, candidate_id, event_type, json.dumps(payload, ensure_ascii=False), utc_now()),
+            (job_id, candidate_id, event_type, encoded, utc_now()),
         )
 
     def close(self):

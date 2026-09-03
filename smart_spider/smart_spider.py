@@ -56,7 +56,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from io import BytesIO
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import numpy as np
 from loguru import logger
@@ -71,7 +71,7 @@ from .engines import (
     get_engine,
 )
 from .http_client import SmartHttpClient, ProxyPool
-from .utils import create_file, is_image_downloaded, print_logo_str
+from .utils import print_logo_str
 
 # torch / clip 延迟导入：仅在图片模态（CLIP 推理）需要时加载
 # 这样 SiteCrawler / UrlDeduplicator 等组件可在无 torch 环境下独立使用
@@ -129,6 +129,7 @@ class CrawlStats:
     saved: dict = field(default_factory=lambda: {})   # {media_type: count}
     filtered: dict = field(default_factory=lambda: {})  # {media_type: count}
     failed: dict = field(default_factory=lambda: {})  # {media_type: count}
+    source_metrics: dict = field(default_factory=lambda: {})  # {source: counters}
     pages_fetched: int = 0
     start_time: float = field(default_factory=time.monotonic)
     end_time: float = 0.0
@@ -150,6 +151,33 @@ class CrawlStats:
         with self._lock:
             self.pages_fetched += n
 
+    def observe_source(
+        self,
+        source: str,
+        *,
+        success: bool,
+        candidates: int = 0,
+        elapsed_ms: float = 0.0,
+        error: str = "",
+    ) -> None:
+        """Record source health without retaining response bodies or URLs."""
+        with self._lock:
+            item = self.source_metrics.setdefault(source, {
+                "attempts": 0,
+                "successes": 0,
+                "failures": 0,
+                "candidates": 0,
+                "elapsed_ms_total": 0.0,
+                "last_error": "",
+            })
+            item["attempts"] += 1
+            item["successes"] += int(success)
+            item["failures"] += int(not success)
+            item["candidates"] += max(0, int(candidates))
+            item["elapsed_ms_total"] += max(0.0, float(elapsed_ms))
+            if error:
+                item["last_error"] = str(error)[:500]
+
     @property
     def elapsed_seconds(self) -> float:
         end = self.end_time or time.monotonic()
@@ -157,12 +185,22 @@ class CrawlStats:
 
     def summary(self) -> dict:
         with self._lock:
+            source_metrics = {}
+            for source, item in self.source_metrics.items():
+                row = dict(item)
+                row["success_rate"] = round(
+                    row["successes"] / row["attempts"] if row["attempts"] else 0.0,
+                    4,
+                )
+                row["elapsed_ms_total"] = round(row["elapsed_ms_total"], 2)
+                source_metrics[source] = row
             return {
                 "saved": dict(self.saved),
                 "filtered": dict(self.filtered),
                 "failed": dict(self.failed),
                 "pages_fetched": self.pages_fetched,
                 "elapsed_seconds": round(self.elapsed_seconds, 2),
+                "source_metrics": source_metrics,
             }
 
 

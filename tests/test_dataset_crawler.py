@@ -425,6 +425,29 @@ class TestDatasetCrawlerInit:
                 crawler.close()
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_single_fixed_label_applies_to_expansion_queries(self):
+        """单一固定标签应覆盖不含标签原文的扩展检索词。"""
+        tmp = tempfile.mkdtemp()
+        crawler = None
+        try:
+            crawler = DatasetCrawler(
+                keywords=["warehouse worker phone call"],
+                total_count=1,
+                output_dir=tmp,
+                use_clip=False,
+                label_policy=LabelPolicy(
+                    mode="fixed",
+                    fixed_labels=["打电话"],
+                ),
+            )
+            decisions = crawler._query_label_decisions("warehouse worker phone call")
+            assert [item.name for item in decisions] == ["打电话"]
+            assert decisions[0].evidence["fixed_assignment"] is True
+        finally:
+            if crawler is not None:
+                crawler.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_download_and_save_valid_image(self):
         """真实图片字节应通过验证链并写入 metadata。"""
         tmp = tempfile.mkdtemp()

@@ -21,7 +21,10 @@ class TestVersionExport:
         assert __version__ == "2.2.0"
 
     def test_version_in_pyproject(self):
-        import tomllib
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            import tomli as tomllib
         with open(os.path.join(os.path.dirname(__file__), "..", "pyproject.toml"), "rb") as f:
             data = tomllib.load(f)
         assert data["project"]["version"] == "2.2.0"

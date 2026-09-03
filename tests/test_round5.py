@@ -27,7 +27,7 @@ class TestFix8FlushNoOverSave:
     def _make_mock_spider(self, tmp_path):
         """构造带 CLIP stub 的 SmartSpider，不真正加载模型。"""
         from smart_spider.smart_spider import SmartSpider, _ModalDoneEvents
-        import torch
+        torch = pytest.importorskip("torch")
 
         spider = object.__new__(SmartSpider)
         SmartSpider._ensure_stub_attrs(spider)

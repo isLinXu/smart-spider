@@ -62,3 +62,55 @@ def test_sample_submission_is_idempotent_by_content_hash():
             assert store.add_sample("job-1", sample, content_hash="same") is True
             assert store.add_sample("job-1", SampleRecord(sample_id="sample-2", file="images/2.jpg"), content_hash="same") is False
             assert len(store.list_events("job-1")) == 1
+
+
+def test_event_payload_is_compact_and_events_can_be_pruned():
+    with tempfile.TemporaryDirectory() as tmp:
+        with DatasetStateStore(os.path.join(tmp, "state.sqlite3")) as store:
+            store.create_job("job-1")
+            resource = CandidateResource("https://example.com/a.jpg", "bing", query="cat")
+            store.add_candidate("job-1", resource)
+            event = store.list_events("job-1")[0]
+            assert set(event["payload"]) <= {"url", "source", "query", "modality"}
+            assert store.prune_events("job-1", keep_latest=0) == 1
+            assert store.list_events("job-1") == []
+
+
+def test_dataset_item_reservation_is_unique_and_monotonic():
+    with tempfile.TemporaryDirectory() as tmp:
+        with DatasetStateStore(os.path.join(tmp, "state.sqlite3")) as store:
+            store.create_job("job-1")
+            first = store.reserve_dataset_item(
+                "job-1",
+                content_hash="hash-a",
+                source_hash="source-a",
+                staging_path=".dataset_staging/a.tmp",
+                batch_size=100,
+                filename_token="token-a",
+                extension=".jpg",
+                max_count=2,
+            )
+            duplicate = store.reserve_dataset_item(
+                "job-1",
+                content_hash="hash-a",
+                source_hash="source-a",
+                staging_path=".dataset_staging/b.tmp",
+                batch_size=100,
+                filename_token="token-b",
+                extension=".jpg",
+                max_count=2,
+            )
+            second = store.reserve_dataset_item(
+                "job-1",
+                content_hash="hash-b",
+                source_hash="source-b",
+                staging_path=".dataset_staging/c.tmp",
+                batch_size=100,
+                filename_token="token-c",
+                extension=".jpg",
+                max_count=2,
+            )
+            assert first["status"] == "reserved"
+            assert duplicate["status"] == "duplicate"
+            assert second["index"] == 1
+            assert store.dataset_next_index("job-1") == 2

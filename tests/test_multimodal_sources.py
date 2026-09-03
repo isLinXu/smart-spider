@@ -3,7 +3,7 @@
 from smart_spider.dataset_contracts import Modality
 from smart_spider.engines import MediaType, RenderMode
 from smart_spider.multimodal_pipeline import DiscoveryTask
-from smart_spider.multimodal_sources import SearchDiscoverySource, SiteDiscoverySource
+from smart_spider.multimodal_sources import SearchDiscoverySource, SiteDiscoverySource, SourceMetrics
 
 
 class _FakeHttp:
@@ -36,6 +36,28 @@ def test_search_discovery_source_converts_engine_items(monkeypatch):
     assert response.candidates[0].title == "A"
     assert response.html_length == len("fake html")
     assert response.metadata["item_counts"] == {"fake": 2}
+
+
+def test_search_discovery_source_records_source_metrics(monkeypatch):
+    monkeypatch.setattr("smart_spider.multimodal_sources.get_engine", lambda name: _FakeEngine())
+    metrics = SourceMetrics()
+    response = SearchDiscoverySource(_FakeHttp(), engines=["fake"], metrics=metrics)(DiscoveryTask(
+        query="cat", modalities=(Modality.IMAGE,), metadata={"pages": 2}
+    ))
+    row = response.metadata["source_metrics"]["fake"]
+    assert row["attempts"] == 2
+    assert row["successes"] == 2
+    assert row["candidates"] == 2
+    assert row["success_rate"] == 1.0
+
+
+def test_search_discovery_source_adapts_engine_order_after_observations(monkeypatch):
+    monkeypatch.setattr("smart_spider.multimodal_sources.get_engine", lambda name: _FakeEngine())
+    metrics = SourceMetrics()
+    metrics.observe("slow", success=False, error="blocked")
+    metrics.observe("fast", success=True, candidates=4)
+    source = SearchDiscoverySource(_FakeHttp(), engines=["slow", "fast"], metrics=metrics)
+    assert source._ordered_engines(["slow", "fast"]) == ["fast", "slow"]
 
 
 def test_search_discovery_source_exposes_empty_parse_diagnostic(monkeypatch):

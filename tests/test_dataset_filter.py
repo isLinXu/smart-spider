@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from smart_spider.dataset_filter import (
@@ -522,7 +523,7 @@ def test_export_review_candidates_builds_independent_dataset(tmp_path):
 
 
 def test_clip_feature_cache_reuses_image_embeddings(tmp_path):
-    import torch
+    torch = pytest.importorskip("torch")
 
     class Encoder:
         def __init__(self):

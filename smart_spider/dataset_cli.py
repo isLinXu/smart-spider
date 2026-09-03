@@ -147,6 +147,18 @@ def main():
         "--min-file-size", type=int, default=1024,
         help="最小文件大小（字节，默认 1024）",
     )
+    parser.add_argument(
+        "--max-file-size", type=int, default=12 * 1024 * 1024,
+        help="最大图片文件大小（字节，默认 12 MiB）",
+    )
+    parser.add_argument(
+        "--no-curl-cffi", action="store_true",
+        help="禁用 curl_cffi，使用 requests 流式下载（长时间批量任务更稳健）",
+    )
+    parser.add_argument(
+        "--allow-private-hosts", action="store_true",
+        help="允许访问内网/私有地址（仅限受控环境，默认拒绝以防 SSRF）",
+    )
 
     # 断点续传
     parser.add_argument(
@@ -233,6 +245,9 @@ def main():
         min_width=args.min_width,
         min_height=args.min_height,
         min_file_size=args.min_file_size,
+        max_file_size=args.max_file_size,
+        use_curl_cffi=False if args.no_curl_cffi else None,
+        allow_private_hosts=args.allow_private_hosts,
         search_engines=engines,
         site_parsers=sites,
         site_start_page=args.site_start_page,
