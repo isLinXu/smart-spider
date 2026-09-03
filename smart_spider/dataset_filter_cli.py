@@ -11,7 +11,6 @@ from .dataset_filter import (
     DatasetImageFilter,
     DecisionPolicy,
     FilterThresholds,
-    PromptSet,
     VisualSignalAnalyzer,
 )
 
@@ -22,6 +21,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dataset", required=True, help="Dataset directory")
     parser.add_argument("--query", default="货车装卸区 开关门", help="Target scene query")
+    parser.add_argument(
+        "--scene",
+        help="Built-in safety scene profile (phone_call, mobile_phone_use, smoking, no_reflective_vest, forklift_driver_no_helmet, material_stagnation)",
+    )
+    parser.add_argument(
+        "--quality-config",
+        help="Custom JSON scene quality profile; mutually exclusive with --scene",
+    )
     parser.add_argument("--model", default="ViT-B/32", help="CLIP model name")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or mps")
     parser.add_argument(
@@ -257,7 +264,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
 
-    prompts = PromptSet.truck_loading(args.query)
+    from .scene_quality import resolve_scene_quality_profile
+
+    try:
+        scene_profile = resolve_scene_quality_profile(
+            scene=args.scene,
+            config_path=args.quality_config,
+            query=args.query,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    prompts = scene_profile.prompts
     scorer = CLIPPromptScorer(
         prompts,
         model_name=args.model,
@@ -268,7 +285,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         enable_ocr=args.ocr or args.ocr_all,
         ocr_all=args.ocr_all,
     )
-    base = FilterThresholds.from_profile(args.profile)
+    base = scene_profile.thresholds if args.scene or args.quality_config else FilterThresholds.from_profile(args.profile)
     thresholds = FilterThresholds(
         min_relevance=base.min_relevance if args.min_relevance is None else args.min_relevance,
         mismatch_margin=base.mismatch_margin if args.mismatch_margin is None else args.mismatch_margin,

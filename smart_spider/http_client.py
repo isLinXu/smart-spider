@@ -17,6 +17,7 @@
 import random
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse
@@ -26,6 +27,8 @@ from fake_useragent import UserAgent
 from loguru import logger
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from .url_policy import URLPolicy, UnsafeURLError
 
 # ──────────────────────────────────────────────────────────────────────────────
 # curl_cffi 可选：TLS 指纹伪造
@@ -234,6 +237,66 @@ class ProxyPool:
             return {e.url: e.cb_state for e in self._entries}
 
 
+class HttpMetrics:
+    """Thread-safe request counters and latency summary for one client."""
+
+    def __init__(self, max_latency_samples: int = 2048) -> None:
+        if max_latency_samples <= 0:
+            raise ValueError("max_latency_samples must be positive")
+        self._lock = threading.Lock()
+        self._requests = 0
+        self._successes = 0
+        self._failures = 0
+        self._bytes = 0
+        self._status = Counter()
+        self._latencies_ms: list[float] = []
+        self._max_latency_samples = max_latency_samples
+        self._latency_seen = 0
+
+    def observe(
+        self,
+        *,
+        success: bool,
+        elapsed_ms: float,
+        status_code: Optional[int] = None,
+        bytes_received: int = 0,
+    ) -> None:
+        with self._lock:
+            self._requests += 1
+            self._successes += int(success)
+            self._failures += int(not success)
+            self._bytes += max(0, int(bytes_received))
+            self._latency_seen += 1
+            latency = max(0.0, float(elapsed_ms))
+            if len(self._latencies_ms) < self._max_latency_samples:
+                self._latencies_ms.append(latency)
+            else:
+                # Reservoir sampling keeps percentile memory bounded during
+                # long-running crawls without retaining every request.
+                slot = random.randrange(self._latency_seen)
+                if slot < self._max_latency_samples:
+                    self._latencies_ms[slot] = latency
+            if status_code is not None:
+                self._status[str(int(status_code))] += 1
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            latencies = sorted(self._latencies_ms)
+            if latencies:
+                p50 = latencies[(len(latencies) - 1) // 2]
+                p95 = latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))]
+            else:
+                p50 = p95 = 0.0
+            return {
+                "requests": self._requests,
+                "successes": self._successes,
+                "failures": self._failures,
+                "bytes_received": self._bytes,
+                "status_codes": dict(sorted(self._status.items())),
+                "latency_ms": {"p50": round(p50, 2), "p95": round(p95, 2)},
+            }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Session 工厂
 # ──────────────────────────────────────────────────────────────────────────────
@@ -281,6 +344,10 @@ class SmartHttpClient:
         timeout: int = 10,
         proxy_strategy: str = "round_robin",
         use_curl_cffi: Optional[bool] = None,
+        url_policy: Optional[URLPolicy] = None,
+        allow_private_hosts: bool = False,
+        max_redirects: int = 5,
+        metrics: Optional[HttpMetrics] = None,
     ):
         self._ua = UserAgent()
         self._proxy_pool = ProxyPool(proxies or [])
@@ -288,6 +355,13 @@ class SmartHttpClient:
         self._max_retries = max_retries
         self._timeout = timeout
         self._proxy_strategy = proxy_strategy
+        self.url_policy = url_policy or URLPolicy(
+            allow_private_hosts=allow_private_hosts
+        )
+        if max_redirects < 0:
+            raise ValueError("max_redirects must be non-negative")
+        self.max_redirects = max_redirects
+        self.metrics = metrics or HttpMetrics()
         # Host-level circuit breaker.  Image search results frequently contain
         # permanently dead CDNs; after a few failures, skip that host for the
         # remainder of this client session instead of queueing thousands of
@@ -349,6 +423,28 @@ class SmartHttpClient:
         with self._host_lock:
             self._host_failures.pop(host, None)
             self._host_blocked_until.pop(host, None)
+
+    def _validate_response_redirects(self, response: requests.Response, original_url: str) -> None:
+        """Validate every redirect hop, including the final URL.
+
+        ``requests`` follows redirects before returning, so validating only the
+        requested URL would allow a public URL to bounce into localhost or a
+        private address.  Mock responses and curl-cffi responses do not always
+        expose a string ``url``; in that case the original URL is the safest
+        fallback for compatibility.
+        """
+        history = getattr(response, "history", ()) or ()
+        if len(history) > self.max_redirects:
+            response.close()
+            raise requests.TooManyRedirects(
+                f"too many redirects for {original_url}"
+            )
+        for hop in history:
+            hop_url = getattr(hop, "url", None)
+            if isinstance(hop_url, str) and hop_url:
+                self.url_policy.validate(hop_url)
+        final_url = getattr(response, "url", None)
+        self.url_policy.validate(final_url if isinstance(final_url, str) and final_url else original_url)
 
     def _make_headers(self, engine: Optional[str] = None) -> dict:
         """生成随机化的浏览器请求头。"""
@@ -417,12 +513,26 @@ class SmartHttpClient:
         Raises:
             requests.RequestException: 重试耗尽后仍失败
         """
+        started = time.monotonic()
+        try:
+            self.url_policy.validate(url)
+        except UnsafeURLError:
+            self.metrics.observe(
+                success=False,
+                elapsed_ms=(time.monotonic() - started) * 1000,
+            )
+            raise
         last_exc = None
         for attempt in range(self._max_retries + 1):
             if not self._host_allowed(url):
-                raise requests.ConnectionError(
+                error = requests.ConnectionError(
                     f"Host circuit open: {urlparse(url).hostname or url}"
                 )
+                self.metrics.observe(
+                    success=False,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                )
+                raise error
             self._rate_limiter.acquire()
 
             proxy_entry = (
@@ -481,8 +591,22 @@ class SmartHttpClient:
                 if proxy_entry:
                     self._proxy_pool.report_success(proxy_entry)
                 self._record_host_success(url)
+                self._validate_response_redirects(resp, url)
+                self.metrics.observe(
+                    success=True,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    status_code=getattr(resp, "status_code", None),
+                    bytes_received=int(getattr(resp, "headers", {}).get("Content-Length") or 0),
+                )
                 return resp
 
+            except (UnsafeURLError, requests.TooManyRedirects) as e:
+                self.metrics.observe(
+                    success=False,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    status_code=getattr(getattr(e, "response", None), "status_code", None),
+                )
+                raise
             except (requests.ConnectionError, requests.Timeout) as e:
                 last_exc = e
                 if proxy_entry:
@@ -511,6 +635,11 @@ class SmartHttpClient:
                 )
                 time.sleep(wait)
 
+        self.metrics.observe(
+            success=False,
+            elapsed_ms=(time.monotonic() - started) * 1000,
+            status_code=getattr(getattr(last_exc, "response", None), "status_code", None),
+        )
         raise last_exc or requests.RequestException(f"Failed after {self._max_retries} retries: {url}")
 
     def head(
@@ -525,12 +654,26 @@ class SmartHttpClient:
         不消耗大量带宽，适合在下载前检查资源是否存在及大小。
         共享 get() 的限速、代理轮换、重试逻辑。
         """
+        started = time.monotonic()
+        try:
+            self.url_policy.validate(url)
+        except UnsafeURLError:
+            self.metrics.observe(
+                success=False,
+                elapsed_ms=(time.monotonic() - started) * 1000,
+            )
+            raise
         last_exc = None
         for attempt in range(self._max_retries + 1):
             if not self._host_allowed(url):
-                raise requests.ConnectionError(
+                error = requests.ConnectionError(
                     f"Host circuit open: {urlparse(url).hostname or url}"
                 )
+                self.metrics.observe(
+                    success=False,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                )
+                raise error
             self._rate_limiter.acquire()
             proxy_entry = (
                 self._proxy_pool.get(self._proxy_strategy)
@@ -582,8 +725,21 @@ class SmartHttpClient:
                 if proxy_entry:
                     self._proxy_pool.report_success(proxy_entry)
                 self._record_host_success(url)
+                self._validate_response_redirects(resp, url)
+                self.metrics.observe(
+                    success=True,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    status_code=getattr(resp, "status_code", None),
+                )
                 return resp
 
+            except (UnsafeURLError, requests.TooManyRedirects) as e:
+                self.metrics.observe(
+                    success=False,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    status_code=getattr(getattr(e, "response", None), "status_code", None),
+                )
+                raise
             except (requests.ConnectionError, requests.Timeout) as e:
                 last_exc = e
                 if proxy_entry:
@@ -605,17 +761,29 @@ class SmartHttpClient:
                 logger.warning(f"HEAD unexpected error for {url[:60]}: {e}, retry {attempt + 2}/{self._max_retries + 1}")
                 time.sleep(wait)
 
+        self.metrics.observe(
+            success=False,
+            elapsed_ms=(time.monotonic() - started) * 1000,
+            status_code=getattr(getattr(last_exc, "response", None), "status_code", None),
+        )
         raise last_exc or requests.RequestException(f"HEAD failed after {self._max_retries} retries: {url}")
 
     def get_bytes(self, url: str, engine: Optional[str] = None) -> bytes:
         """便捷方法：获取完整 bytes 内容。"""
-        return self.get(url, engine=engine).content
+        resp = self.get(url, engine=engine)
+        try:
+            return resp.content
+        finally:
+            resp.close()
 
     def get_text(self, url: str, engine: Optional[str] = None) -> str:
         """便捷方法：获取文本内容，自动检测编码。"""
         resp = self.get(url, engine=engine)
-        resp.encoding = getattr(resp, 'apparent_encoding', None) or resp.charset_encoding or "utf-8"
-        return resp.text
+        try:
+            resp.encoding = getattr(resp, 'apparent_encoding', None) or resp.charset_encoding or "utf-8"
+            return resp.text
+        finally:
+            resp.close()
 
     def get_stream(self, url: str, engine: Optional[str] = None, peek_bytes: int = 8192):
         """Stream-fetch the first peek_bytes bytes; return (peek, response).
@@ -635,15 +803,21 @@ class SmartHttpClient:
         resp = self.get(url, engine=engine, stream=True)
         peek = b""
         overflow = b""
-        for chunk in resp.iter_content(chunk_size=peek_bytes):
-            if len(peek) + len(chunk) <= peek_bytes:
-                peek += chunk
-            else:
-                needed = peek_bytes - len(peek)
-                peek += chunk[:needed]
-                overflow = chunk[needed:]
-            if len(peek) >= peek_bytes:
-                break
+        try:
+            for chunk in resp.iter_content(chunk_size=peek_bytes):
+                if len(peek) + len(chunk) <= peek_bytes:
+                    peek += chunk
+                else:
+                    needed = peek_bytes - len(peek)
+                    peek += chunk[:needed]
+                    overflow = chunk[needed:]
+                if len(peek) >= peek_bytes:
+                    break
+        except Exception:
+            # Assignment at the call site has not completed yet, so only this
+            # method can reliably release the response after a peek failure.
+            resp.close()
+            raise
 
         # Store leftover bytes so callers using resp.iter_content() get them back.
         # We attach it as a private attribute; _OverflowResponse wraps it cleanly.
@@ -659,3 +833,21 @@ class SmartHttpClient:
             resp.iter_content = _patched_iter  # type: ignore[method-assign]
 
         return peek, resp
+
+    def close(self) -> None:
+        """Close pooled sessions and release sockets."""
+        sessions = [self._direct_session]
+        sessions.extend(
+            entry.session for entry in self._proxy_pool._entries if entry.session is not None
+        )
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()

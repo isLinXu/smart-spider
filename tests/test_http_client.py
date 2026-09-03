@@ -9,12 +9,13 @@
 """
 import threading
 import time
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import requests as req_lib
 
-from smart_spider.http_client import RateLimiter, ProxyPool, ProxyEntry, SmartHttpClient
+from smart_spider.http_client import HttpMetrics, RateLimiter, ProxyPool, SmartHttpClient
+from smart_spider.url_policy import UnsafeURLError, URLPolicy
 from smart_spider.smart_spider import UrlDeduplicator
 
 
@@ -280,3 +281,36 @@ class TestSmartHttpClient:
             client = SmartHttpClient(rate=1000.0)
             data = client.get_bytes("https://example.com")
         assert isinstance(data, bytes)
+
+    def test_url_policy_rejects_private_and_credential_urls(self):
+        policy = URLPolicy(resolve_dns=False)
+        with pytest.raises(UnsafeURLError):
+            policy.validate("http://127.0.0.1/image.jpg")
+        with pytest.raises(UnsafeURLError):
+            policy.validate("http://user:pass@example.com/image.jpg")
+        with pytest.raises(UnsafeURLError):
+            policy.validate("file:///tmp/image.jpg")
+
+    @patch("smart_spider.http_client._build_session")
+    def test_metrics_capture_success(self, mock_build, mock_ok_response):
+        mock_session = MagicMock()
+        mock_ok_response.headers = {"Content-Length": "11"}
+        mock_session.get.return_value = mock_ok_response
+        mock_build.return_value = mock_session
+        metrics = HttpMetrics()
+        with patch("time.sleep"):
+            client = SmartHttpClient(rate=1000.0, metrics=metrics)
+            client._use_curl = False
+            client.get("https://example.com")
+        snapshot = metrics.snapshot()
+        assert snapshot["requests"] == 1
+        assert snapshot["successes"] == 1
+        assert snapshot["bytes_received"] == 11
+        assert snapshot["status_codes"] == {"200": 1}
+
+    def test_metrics_bound_latency_memory(self):
+        metrics = HttpMetrics(max_latency_samples=2)
+        for value in range(10):
+            metrics.observe(success=True, elapsed_ms=value)
+        assert len(metrics._latencies_ms) == 2
+        assert metrics.snapshot()["requests"] == 10

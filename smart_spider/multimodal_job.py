@@ -23,7 +23,6 @@ from .dataset_contracts import (
     Modality,
     ModalityAsset,
     ModalityRelation,
-    QualityMetrics,
     SampleRecord,
     normalize_url,
 )
@@ -170,6 +169,7 @@ class MultimodalJobReport:
     materialized_images: int = 0
     quality_report_path: str = ""
     route_counts: dict[str, int] = field(default_factory=dict)
+    source_metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -307,6 +307,9 @@ class MultimodalDatasetOrchestrator:
         source: str,
         report: MultimodalJobReport,
     ):
+        source_metrics = response.metadata.get("source_metrics", {}) if response.metadata else {}
+        if source_metrics:
+            report.source_metrics.update(source_metrics)
         diagnostics = []
         if response.error:
             diagnostics.append(f"{source}: {response.error}")
