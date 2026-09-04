@@ -403,7 +403,7 @@ CLI / API
               └─ shared: pipeline.ObjectStore / TaskQueue（本地 FS + SQLite 默认）
 ```
 
-运行产物请放在 `dataset_*` / `output_*` / `.artifacts/` 等目录（已 gitignore）。轻量任务 API：`pip install -e ".[api]" && smart-spider-api`。
+运行产物请放在 `dataset_*` / `output_*` / `.artifacts/` 等目录（已 gitignore）。轻量任务 API：`pip install -e ".[api]" && smart-spider-api`；worker：`smart-spider-worker`（与 API 共用 SQLite 队列）。可选插件：`pip install -e ".[redis]"` / `".[s3]"`。
 
 ## License
 
