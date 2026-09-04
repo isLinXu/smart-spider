@@ -118,6 +118,12 @@ from .dataset_layout import (
     ProgressManager,
 )
 from .scene_quality import get_scene_quality_profile
+from .scene_quality_gate import (
+    GateDecision,
+    JsonlSceneReviewQueue,
+    SceneQualityGate,
+    SceneSignalDetector,
+)
 
 # torch / clip 延迟导入
 try:
@@ -252,6 +258,10 @@ class DatasetCrawler:
         scene_targets: Optional[Mapping[str, int]] = None,
         max_source_share: float = 1.0,
         max_domain_share: float = 1.0,
+        scene_quality_gate_enabled: bool = False,
+        scene_review_queue_path: Optional[str] = None,
+        scene_signal_detector: Optional[SceneSignalDetector] = None,
+        scene_quality_gate: Optional[SceneQualityGate] = None,
         config: Optional[DatasetCrawlConfig] = None,
     ):
         if config is not None:
@@ -310,6 +320,8 @@ class DatasetCrawler:
             scene_targets = cfg.scene_targets
             max_source_share = cfg.max_source_share
             max_domain_share = cfg.max_domain_share
+            scene_quality_gate_enabled = cfg.scene_quality_gate_enabled
+            scene_review_queue_path = cfg.scene_review_queue_path
         else:
             if keywords is None:
                 raise TypeError("keywords or config is required")
@@ -364,6 +376,8 @@ class DatasetCrawler:
                 scene_targets=dict(scene_targets or {}),
                 max_source_share=max_source_share,
                 max_domain_share=max_domain_share,
+                scene_quality_gate_enabled=scene_quality_gate_enabled,
+                scene_review_queue_path=scene_review_queue_path,
             )
         self.config = cfg
         self.keywords = keywords
@@ -375,6 +389,19 @@ class DatasetCrawler:
             raise ValueError("total_count cannot be lower than the sum of scene_targets")
         self.max_source_share = float(max_source_share)
         self.max_domain_share = float(max_domain_share)
+        self.scene_quality_gate_enabled = bool(scene_quality_gate_enabled or scene_quality_gate)
+        self.scene_signal_detector = scene_signal_detector
+        self.scene_quality_gate = scene_quality_gate
+        self.scene_review_queue: Optional[JsonlSceneReviewQueue] = None
+        self._scene_quality_stats = {"accept": 0, "review": 0, "reject": 0}
+        if self.scene_quality_gate_enabled:
+            queue_path = scene_review_queue_path or os.path.join(
+                output_dir, "scene_review_queue.jsonl"
+            )
+            self.scene_review_queue = JsonlSceneReviewQueue(queue_path)
+            self.scene_review_queue_path = queue_path
+        else:
+            self.scene_review_queue_path = scene_review_queue_path
         self.output_dir = output_dir
         self.batch_size = batch_size
         self.use_clip = use_clip
@@ -518,6 +545,8 @@ class DatasetCrawler:
                     "scene_targets": self.scene_targets,
                     "max_source_share": self.max_source_share,
                     "max_domain_share": self.max_domain_share,
+                    "scene_quality_gate_enabled": self.scene_quality_gate_enabled,
+                    "scene_review_queue_path": scene_review_queue_path,
                     "label_policy": self.label_policy.to_dict(),
                 },
             )
@@ -675,6 +704,50 @@ class DatasetCrawler:
 
     def _scene_target_reached(self, keyword: str) -> bool:
         return self._scene_quotas.reached(self._scene_key(keyword))
+
+    def _evaluate_scene_quality(
+        self,
+        scene_profile: Any,
+        image: Image.Image,
+        semantic_score: float,
+    ) -> Optional[GateDecision]:
+        """Evaluate the optional detector-backed safety gate before commit.
+
+        The legacy image crawler still supports ordinary datasets.  The gate is
+        therefore opt-in, but once enabled it is fail-closed: a configured scene
+        without a profile or detector evidence can never be accepted silently.
+        """
+        if not self.scene_quality_gate_enabled:
+            return None
+        gate = self.scene_quality_gate
+        if gate is None:
+            if scene_profile is None:
+                raise ValueError(
+                    "scene quality gate requires a built-in/custom scene profile "
+                    "or an injected SceneQualityGate"
+                )
+            gate = SceneQualityGate(scene_profile, detector=self.scene_signal_detector)
+        if gate.detector is not None:
+            return gate.evaluate_image(image, semantic_score)
+        # Missing detector signals intentionally become a review decision for
+        # absence-based safety scenes instead of being treated as acceptance.
+        return gate.evaluate(semantic_score, signals={})
+
+    def _record_scene_quality_review(
+        self,
+        sample_ref: str,
+        decision: GateDecision,
+    ) -> None:
+        action = decision.action
+        if action not in self._scene_quality_stats:
+            self._scene_quality_stats[action] = 0
+        self._scene_quality_stats[action] += 1
+        if action == "review":
+            if self.scene_review_queue is None:
+                raise RuntimeError(
+                    "scene quality review requires a configured review queue"
+                )
+            self.scene_review_queue.append(sample_ref, decision)
 
     def _record_backpressure(self, *, in_flight_pages: Optional[int] = None) -> None:
         """Expose bounded-work gauges without sampling response payloads."""
@@ -1095,6 +1168,25 @@ class DatasetCrawler:
                     logger.debug(f"Image query inference error: {e}")
                     return reject("image_query_inference_error")
 
+            scene_quality_decision = self._evaluate_scene_quality(
+                scene_profile, img, sim
+            )
+            if scene_quality_decision is not None:
+                self._record_scene_quality_review(url, scene_quality_decision)
+                self._emit_callback(CrawlEvent(
+                    event_type="scene_quality_decision",
+                    keyword=keyword,
+                    media_type="image",
+                    url=url,
+                    detail=scene_quality_decision.to_dict(),
+                ))
+                if scene_quality_decision.action != "accept":
+                    return reject(
+                        "scene_quality_review"
+                        if scene_quality_decision.action == "review"
+                        else "scene_quality_reject"
+                    )
+
             output_content, output_ext, output_format, format_conversion = (
                 self._prepare_output_image(img, full_content, ext)
             )
@@ -1129,6 +1221,11 @@ class DatasetCrawler:
                     "dhash": fingerprint.dhash,
                     "scene_quality": scene_profile.to_dict() if scene_profile else None,
                     "scene_semantic_threshold": scene_semantic_threshold,
+                    "scene_quality_gate": (
+                        scene_quality_decision.to_dict()
+                        if scene_quality_decision is not None
+                        else None
+                    ),
                 },
             )
 
@@ -1189,6 +1286,11 @@ class DatasetCrawler:
                     "labels": [item.to_dict() for item in label_resolution.labels],
                     "label_candidates": [item.to_dict() for item in label_resolution.candidates],
                     "quality": quality.to_dict(),
+                    "scene_quality_gate": (
+                        scene_quality_decision.to_dict()
+                        if scene_quality_decision is not None
+                        else None
+                    ),
                 }
                 return sample, metadata
 

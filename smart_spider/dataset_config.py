@@ -66,6 +66,8 @@ class DatasetCrawlConfig:
     scene_targets: dict[str, int] = field(default_factory=dict)
     max_source_share: float = 1.0
     max_domain_share: float = 1.0
+    scene_quality_gate_enabled: bool = False
+    scene_review_queue_path: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.keywords:
@@ -95,6 +97,8 @@ class DatasetCrawlConfig:
             raise ValueError("max_source_share must be in (0, 1]")
         if not 0.0 < self.max_domain_share <= 1.0:
             raise ValueError("max_domain_share must be in (0, 1]")
+        if self.scene_review_queue_path is not None and not str(self.scene_review_queue_path).strip():
+            raise ValueError("scene_review_queue_path cannot be empty")
         if self.scene_targets:
             normalized: dict[str, int] = {}
             for scene, count in self.scene_targets.items():
