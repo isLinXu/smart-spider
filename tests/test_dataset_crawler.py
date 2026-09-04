@@ -180,6 +180,31 @@ def test_scene_targets_and_source_quotas_are_initialized(tmp_path):
         crawler.close()
 
 
+def test_scene_quality_gate_queues_missing_detector_evidence(tmp_path):
+    from smart_spider.scene_quality import get_scene_quality_profile
+
+    crawler = DatasetCrawler(
+        ["未穿反光衣"],
+        total_count=1,
+        output_dir=str(tmp_path),
+        use_clip=False,
+        state_db="",
+        scene_targets={"未穿反光衣": 1},
+        scene_quality_gate_enabled=True,
+    )
+    try:
+        image = Image.new("RGB", (256, 256), (30, 90, 160))
+        profile = get_scene_quality_profile("未穿反光衣")
+        decision = crawler._evaluate_scene_quality(profile, image, 0.7)
+        assert decision is not None
+        assert decision.action == "review"
+        crawler._record_scene_quality_review("https://img.example/review.jpg", decision)
+        assert crawler.scene_review_queue_path.endswith("scene_review_queue.jsonl")
+        assert crawler.scene_review_queue.path.read_text(encoding="utf-8").count("\n") == 1
+    finally:
+        crawler.close()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # ProgressManager 测试
 # ──────────────────────────────────────────────────────────────────────────────
