@@ -301,6 +301,19 @@ class LabelPolicy:
             "promote_discovered": self.promote_discovered,
         }
 
+    @classmethod
+    def from_dict(cls, data: Optional[dict[str, Any]]) -> "LabelPolicy":
+        if not data:
+            return cls()
+        return cls(
+            mode=data.get("mode", LabelMode.HYBRID),
+            fixed_labels=list(data.get("fixed_labels") or []),
+            aliases=dict(data.get("aliases") or {}),
+            min_score=float(data.get("min_score", 0.5)),
+            discovery_threshold=float(data.get("discovery_threshold", 0.75)),
+            promote_discovered=bool(data.get("promote_discovered", False)),
+        )
+
 
 @dataclass
 class SampleRecord:

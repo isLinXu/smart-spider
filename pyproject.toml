@@ -62,7 +62,12 @@ dev = [
 ]
 # 全功能安装
 all = [
-    "smart-spider[browser,video,text,tls,dedup,filter]",
+    "smart-spider[browser,video,text,tls,dedup,filter,api]",
+]
+# 轻量任务 API
+api = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
 ]
 
 [project.scripts]
@@ -71,6 +76,7 @@ smart-spider-multimodal = "smart_spider.multimodal_cli:main"
 smart-spider-image-search = "smart_spider.image_search_cli:main"
 smart-spider-reverse-image-search = "smart_spider.reverse_image_search_cli:main"
 smart-spider-filter = "smart_spider.dataset_filter_cli:main"
+smart-spider-api = "smart_spider.api:main"
 
 [tool.setuptools]
 py-modules = ["spider", "crawl_dataset", "crawl_multimodal"]

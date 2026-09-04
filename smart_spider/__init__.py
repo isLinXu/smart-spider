@@ -59,7 +59,9 @@ from .browser_controller import BrowserController
 from .browser import DynamicRenderer, PersistentBrowserSession
 
 # 数据集爬取
-from .dataset_crawler import DatasetCrawler, DatasetDirManager, ProgressManager, MetadataWriter, ManifestWriter
+from .dataset_layout import DatasetDirManager, ManifestWriter, MetadataWriter, ProgressManager
+from .dataset_crawler import DatasetCrawler
+from .dataset_config import DatasetCrawlConfig
 from .dataset_contracts import (
     CandidateResource,
     LabelDecision,
@@ -74,8 +76,9 @@ from .dataset_contracts import (
 )
 from .dataset_state import DatasetStateStore
 from .dataset_repository import DatasetCommit, DatasetRepository
-from .http_client import HttpMetrics
+from .http_client import HttpMetrics, ResponseTooLargeError
 from .url_policy import URLPolicy, UnsafeURLError
+from .image_safety import UnsafeImageError, decode_image_bytes
 from .multimodal_pipeline import (
     AdaptiveSourceRouter,
     BatchAnnotationBackend,
@@ -96,7 +99,9 @@ from .multimodal_job import (
     MultimodalJobConfig,
     MultimodalJobReport,
     MultimodalManifestWriter,
+    StagedAsset,
 )
+from .multimodal_repository import MultimodalRepository
 from .multimodal_sources import SearchDiscoverySource, SiteDiscoverySource, SourceMetrics
 from .multimodal_scale import QualityReport, ShardedManifestWriter
 from .image_retrieval import (
@@ -118,11 +123,25 @@ from .dataset_filter import (
     VisualSignals,
 )
 from .scene_quality import (
+    SceneCalibration,
     SceneQualityProfile,
+    SignalRequirement,
     get_scene_quality_profile,
     list_scene_quality_profiles,
     load_scene_quality_profile,
     resolve_scene_quality_profile,
+)
+from .scene_quality_gate import GateDecision, JsonlSceneReviewQueue, SceneQualityGate, SceneSignalDetector
+from .dataset_governance import (
+    LeakageSafeSplitter,
+    PerceptualFingerprint,
+    QuotaLedger,
+    SceneQuotaLedger,
+    SplitItem,
+    SplitPlan,
+    cluster_embeddings,
+    hash_distance,
+    perceptual_fingerprint,
 )
 from .reverse_image_search import (
     BaiduReverseImageProvider,
@@ -196,6 +215,7 @@ __all__ = [
     "PersistentBrowserSession",
     # 数据集爬取
     "DatasetCrawler",
+    "DatasetCrawlConfig",
     "DatasetDirManager",
     "ProgressManager",
     "MetadataWriter",
@@ -214,8 +234,11 @@ __all__ = [
     "DatasetCommit",
     "DatasetRepository",
     "HttpMetrics",
+    "ResponseTooLargeError",
     "URLPolicy",
     "UnsafeURLError",
+    "UnsafeImageError",
+    "decode_image_bytes",
     "PageSampleExtractor",
     "AdaptiveSourceRouter",
     "AnnotationRouter",
@@ -233,6 +256,8 @@ __all__ = [
     "MultimodalJobConfig",
     "MultimodalJobReport",
     "MultimodalManifestWriter",
+    "MultimodalRepository",
+    "StagedAsset",
     "ShardedManifestWriter",
     "QualityReport",
     "SearchDiscoverySource",
@@ -253,10 +278,25 @@ __all__ = [
     "VisualSignalAnalyzer",
     "VisualSignals",
     "SceneQualityProfile",
+    "SceneCalibration",
+    "SignalRequirement",
     "get_scene_quality_profile",
     "list_scene_quality_profiles",
     "load_scene_quality_profile",
     "resolve_scene_quality_profile",
+    "GateDecision",
+    "JsonlSceneReviewQueue",
+    "SceneQualityGate",
+    "SceneSignalDetector",
+    "LeakageSafeSplitter",
+    "PerceptualFingerprint",
+    "QuotaLedger",
+    "SceneQuotaLedger",
+    "SplitItem",
+    "SplitPlan",
+    "cluster_embeddings",
+    "hash_distance",
+    "perceptual_fingerprint",
     "BaiduReverseImageProvider",
     "BingVisualSearchProvider",
     "BrowserDependencyError",

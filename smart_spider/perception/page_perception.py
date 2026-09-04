@@ -10,7 +10,6 @@
 这是 agent 的"眼睛"，为 ReAct 决策核心提供环境感知。
 """
 import hashlib
-import io
 import os
 import re
 import tempfile
@@ -27,7 +26,9 @@ except ImportError:
     Image = None
 
 from .clip_inference import CLIPInference
+from ..image_safety import UnsafeImageError, decode_image_bytes
 from .ocr import OCRModule
+from ..url_policy import URLPolicy
 
 
 @dataclass
@@ -118,6 +119,8 @@ class PagePerception:
         clip_device: str = "cpu",
         clip_threshold: float = 0.25,
         ocr_lang: str = "ch",
+        max_image_bytes: int = 25 * 1024 * 1024,
+        max_image_pixels: int = 50_000_000,
     ):
         """初始化感知器。
 
@@ -128,7 +131,13 @@ class PagePerception:
             clip_device: CLIP 推理设备
             clip_threshold: CLIP 相似度阈值
             ocr_lang: OCR 语言
+            max_image_bytes: 单张图片最大响应字节数
+            max_image_pixels: 单张图片最大解码像素数
         """
+        if max_image_bytes <= 0 or max_image_pixels <= 0:
+            raise ValueError("image byte and pixel limits must be positive")
+        self.max_image_bytes = int(max_image_bytes)
+        self.max_image_pixels = int(max_image_pixels)
         self.enable_clip = enable_clip
         self.enable_ocr = enable_ocr
         self.clip_threshold = clip_threshold
@@ -284,7 +293,14 @@ class PagePerception:
                 # 使用 SmartHttpClient 下载（带代理、反爬）
                 get_bytes = getattr(http_client, "get_bytes", None)
                 if callable(get_bytes):
-                    content = get_bytes(src)
+                    try:
+                        content = get_bytes(src, max_bytes=self.max_image_bytes)
+                    except TypeError as exc:
+                        # Preserve compatibility with small injected clients
+                        # that implement the historical one-argument method.
+                        if "max_bytes" not in str(exc):
+                            raise
+                        content = get_bytes(src)
                 else:
                     content = http_client.get(src)
                 # 兼容自定义 HTTP 客户端返回 Response 的旧实现。
@@ -294,11 +310,25 @@ class PagePerception:
             if content is None:
                 # 降级：使用 urllib 下载
                 import urllib.request
+                URLPolicy().validate(src)
                 req = urllib.request.Request(src, headers={
                     "User-Agent": "Mozilla/5.0 (compatible; SmartSpider/2.2)"
                 })
                 with urllib.request.urlopen(req, timeout=10) as resp:
-                    content = resp.read()
+                    declared = resp.headers.get("Content-Length")
+                    if declared and int(declared) > self.max_image_bytes:
+                        return None
+                    chunks = []
+                    total = 0
+                    while True:
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > self.max_image_bytes:
+                            return None
+                        chunks.append(chunk)
+                    content = b"".join(chunks)
 
             if not content:
                 return None
@@ -306,9 +336,12 @@ class PagePerception:
             if not isinstance(content, (bytes, bytearray, memoryview)):
                 return None
 
-            buf = io.BytesIO(bytes(content))
-            img = Image.open(buf).convert("RGB")
-            return img
+            try:
+                return decode_image_bytes(
+                    bytes(content), max_pixels=self.max_image_pixels
+                )
+            except UnsafeImageError:
+                return None
         except Exception as e:
             logger.debug(f"Image download failed for {src[:50]}: {e}")
             return None

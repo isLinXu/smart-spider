@@ -49,15 +49,14 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from io import BytesIO
 from typing import Optional
 
 import numpy as np
 from loguru import logger
-from PIL import Image
 from tqdm import tqdm
 
 from .http_client import SmartHttpClient
+from .image_safety import decode_image_bytes
 from .site_parser import SiteParser
 from .smart_spider import CrawlEvent, CrawlStats, UrlDeduplicator, _detect_ext
 
@@ -93,7 +92,11 @@ class SiteCrawler:
         resume: bool = False,
         min_width: int = 200,
         min_height: int = 200,
+        max_image_bytes: int = 25 * 1024 * 1024,
+        max_image_pixels: int = 50_000_000,
         callbacks: Optional[list] = None,
+        connect_timeout: Optional[float] = None,
+        read_timeout: Optional[float] = None,
     ):
         self.parser = site_parser
         self.output_dir = output_dir
@@ -102,6 +105,10 @@ class SiteCrawler:
         self.max_workers = max_workers
         self.min_width = min_width
         self.min_height = min_height
+        if max_image_bytes <= 0 or max_image_pixels <= 0:
+            raise ValueError("image byte and pixel limits must be positive")
+        self.max_image_bytes = int(max_image_bytes)
+        self.max_image_pixels = int(max_image_pixels)
         self._callbacks = callbacks or []
 
         # HTTP 客户端（禁用 curl_cffi，因其 Response 不兼容 apparent_encoding）
@@ -110,6 +117,9 @@ class SiteCrawler:
             rate=rate,
             max_retries=max_retries,
             timeout=timeout,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_response_bytes=max_image_bytes,
             use_curl_cffi=False,
         )
 
@@ -177,12 +187,10 @@ class SiteCrawler:
             logger.info(f"[{parser.name}] 正在获取列表页: {url}")
 
             try:
-                resp = self._http.get(
+                html = self._http.get_text(
                     url,
                     extra_headers={"Referer": parser.get_listing_referer()},
                 )
-                resp.encoding = resp.apparent_encoding or "utf-8"
-                html = resp.text
                 items = parser.collect_pages(html)
                 if not items:
                     logger.warning(f"列表页 {page_num} 未找到详情页链接，可能已到达末尾")
@@ -219,12 +227,10 @@ class SiteCrawler:
         all_image_urls = []
 
         try:
-            resp = self._http.get(
+            html = self._http.get_text(
                 article_url,
                 extra_headers={"Referer": parser.get_detail_referer()},
             )
-            resp.encoding = resp.apparent_encoding or "utf-8"
-            html = resp.text
         except Exception as e:
             logger.error(f"获取详情页失败 {article_url}: {e}")
             return []
@@ -243,12 +249,10 @@ class SiteCrawler:
                     break
                 page_url = parser.build_detail_page_url(article_url, pn)
                 try:
-                    resp = self._http.get(
+                    page_html = self._http.get_text(
                         page_url,
                         extra_headers={"Referer": article_url},
                     )
-                    resp.encoding = resp.apparent_encoding or "utf-8"
-                    page_html = resp.text
                     page_imgs = parser.extract_images(page_html)
                     all_image_urls.extend(page_imgs)
                 except Exception as e:
@@ -274,16 +278,13 @@ class SiteCrawler:
             return False
 
         try:
-            # 直接下载完整内容（webp 等格式的头部信息不足以做尺寸预检）
-            resp = self._http.get(
+            # All image bytes are read through the HTTP layer's bounded stream;
+            # no crawler path is allowed to join an unbounded response body.
+            full_content = self._http.get_bytes(
                 url,
                 extra_headers={"Referer": parser.get_download_referer()},
-                stream=True,
+                max_bytes=self.max_image_bytes,
             )
-            try:
-                full_content = b"".join(resp.iter_content(chunk_size=65536))
-            finally:
-                resp.close()
 
             if len(full_content) < 1024:
                 self._inc_counter("images_filtered")
@@ -293,12 +294,9 @@ class SiteCrawler:
             # 格式检测
             ext = _detect_ext(full_content)
 
-            # 解码完整图片
-            buf = BytesIO(full_content)
-            img = Image.open(buf)
-            img.verify()
-            buf.seek(0)
-            img = Image.open(buf).convert("RGB")
+            img = decode_image_bytes(
+                full_content, max_pixels=self.max_image_pixels
+            )
 
             # 尺寸过滤
             if img.width < self.min_width or img.height < self.min_height:

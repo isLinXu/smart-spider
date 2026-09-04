@@ -54,6 +54,30 @@ def test_expired_lease_is_recoverable():
             assert store.get_candidate(candidate_id)["state"] == "retry_wait"
 
 
+def test_aborting_multimodal_prepare_releases_leased_candidates():
+    with tempfile.TemporaryDirectory() as tmp:
+        with DatasetStateStore(os.path.join(tmp, "state.sqlite3")) as store:
+            store.create_job("job-1")
+            candidate_id = store.add_candidate(
+                "job-1", CandidateResource("https://example.com/recover.jpg", "bing")
+            )
+            assert store.claim_candidate(candidate_id)
+            prepared = store.prepare_multimodal_item(
+                "job-1",
+                SampleRecord(sample_id="recover-sample"),
+                candidate_ids=[candidate_id],
+                assets=[{
+                    "relative_path": "assets/missing.jpg",
+                    "staging_path": "assets/.staging/missing.tmp",
+                    "mime_type": "image/jpeg",
+                    "digest": "missing",
+                }],
+            )
+            assert prepared["status"] == "prepared"
+            assert store.abort_multimodal_item(prepared["item_id"])
+            assert store.get_candidate(candidate_id)["state"] == "retry_wait"
+
+
 def test_sample_submission_is_idempotent_by_content_hash():
     with tempfile.TemporaryDirectory() as tmp:
         with DatasetStateStore(os.path.join(tmp, "state.sqlite3")) as store:

@@ -23,6 +23,7 @@ from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
 
 from .image_retrieval import IMAGE_SUFFIXES
+from .dataset_governance import perceptual_fingerprint
 
 
 PROMOTION_TERMS = (
@@ -1156,7 +1157,9 @@ class DatasetImageFilter:
         return report
 
     @staticmethod
-    def _perceptual_signature(path: Path) -> tuple[int, float, tuple[float, float, float]]:
+    def _perceptual_signature(
+        path: Path,
+    ) -> tuple[int, int, float, tuple[float, float, float]]:
         with Image.open(path) as opened:
             rgb = opened.convert("RGB")
             aspect = rgb.width / max(rgb.height, 1)
@@ -1164,13 +1167,8 @@ class DatasetImageFilter:
                 float(value)
                 for value in np.asarray(rgb.resize((1, 1), Image.Resampling.BOX))[0, 0]
             )
-            gray = rgb.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
-            pixels = np.asarray(gray, dtype=np.int16)
-        bits = (pixels[:, 1:] > pixels[:, :-1]).reshape(-1)
-        value = 0
-        for enabled in bits:
-            value = (value << 1) | int(enabled)
-        return value, aspect, mean_color
+            fingerprint = perceptual_fingerprint(rgb)
+        return int(fingerprint.phash, 16), int(fingerprint.dhash, 16), aspect, mean_color
 
     @classmethod
     def run_near_dedupe(
@@ -1201,18 +1199,18 @@ class DatasetImageFilter:
         run_dir.mkdir(parents=True, exist_ok=False)
 
         records = _read_jsonl(dataset / "metadata.jsonl")
-        representatives: list[tuple[str, int, float, tuple[float, float, float]]] = []
+        representatives: list[tuple[str, int, int, float, tuple[float, float, float]]] = []
         duplicate_groups: set[str] = set()
         decisions: list[FilterDecision] = []
         for position, record in enumerate(records):
             raw_path = _record_path(record)
             try:
                 absolute, relative = cls._resolve_for_verify(dataset, raw_path)
-                image_hash, aspect, mean_color = cls._perceptual_signature(absolute)
+                phash, dhash, aspect, mean_color = cls._perceptual_signature(absolute)
             except (FileNotFoundError, UnidentifiedImageError, OSError, ValueError) as exc:
                 raise RuntimeError(f"cannot inspect near duplicate {raw_path}: {exc}") from exc
-            best: Optional[tuple[str, int, float]] = None
-            for original, known_hash, known_aspect, known_color in representatives:
+            best: Optional[tuple[str, int, int, float]] = None
+            for original, known_phash, known_dhash, known_aspect, known_color in representatives:
                 aspect_delta = abs(aspect - known_aspect) / max(aspect, known_aspect, 1e-9)
                 if aspect_delta > max_aspect_delta:
                     continue
@@ -1221,11 +1219,16 @@ class DatasetImageFilter:
                 ) ** 0.5
                 if color_distance > max_color_distance:
                     continue
-                distance = (image_hash ^ known_hash).bit_count()
+                phash_distance = (phash ^ known_phash).bit_count()
+                dhash_distance = (dhash ^ known_dhash).bit_count()
+                # A lossy JPEG re-encode can perturb one fingerprint heavily.
+                # Either hash may nominate a duplicate; aspect and colour gates
+                # below remain mandatory before quarantining it.
+                distance = min(phash_distance, dhash_distance)
                 if distance <= max_distance and (best is None or distance < best[1]):
-                    best = (original, distance, color_distance)
+                    best = (original, distance, max(phash_distance, dhash_distance), color_distance)
             if best is None:
-                representatives.append((relative, image_hash, aspect, mean_color))
+                representatives.append((relative, phash, dhash, aspect, mean_color))
                 decisions.append(FilterDecision(
                     record_position=position,
                     path=relative,
@@ -1235,7 +1238,7 @@ class DatasetImageFilter:
                     confidence="high",
                 ))
                 continue
-            original, distance, color_distance = best
+            original, distance, secondary_distance, color_distance = best
             duplicate_groups.add(original)
             decisions.append(FilterDecision(
                 record_position=position,
@@ -1246,6 +1249,7 @@ class DatasetImageFilter:
                 confidence="medium",
                 error=(
                     f"duplicate_of={original};hamming_distance={distance};"
+                    f"secondary_hamming_distance={secondary_distance};"
                     f"color_distance={color_distance:.3f}"
                 ),
             ))
@@ -1275,6 +1279,7 @@ class DatasetImageFilter:
                 "max_distance": max_distance,
                 "max_aspect_delta": max_aspect_delta,
                 "max_color_distance": max_color_distance,
+                "hashes": ("phash", "dhash"),
             },
         }
         if apply:
@@ -1570,9 +1575,42 @@ class DatasetImageFilter:
                 dataset / "_quarantine" / active_runs[0]["run_id"] / "backups" / "metadata.jsonl"
             )
             baseline_paths = normalized_paths(baseline, _record_path)
-            if baseline_paths and baseline_paths != seen_paths:
-                missing = len(baseline_paths - seen_paths)
-                unexpected = len(seen_paths - baseline_paths)
+            # A later layout repair may renumber/rebucket active files and a
+            # replenishment crawl may legitimately add new paths.  Translate
+            # baseline paths through each repair map, then require every
+            # baseline path to remain represented while only allowing extras
+            # explicitly recorded as new layout targets.
+            layout_maps: list[dict[str, str]] = []
+            layout_added_paths: set[str] = set()
+            layout_root = dataset / "_layout_repairs"
+            if layout_root.is_dir():
+                for map_path in sorted(layout_root.glob("*/path_map.jsonl")):
+                    try:
+                        with map_path.open("r", encoding="utf-8") as handle:
+                            mapping: dict[str, str] = {}
+                            for line in handle:
+                                item = json.loads(line)
+                                old_path = str(item["old_rel"])
+                                new_path = str(item["new_rel"])
+                                mapping[old_path] = new_path
+                                layout_added_paths.add(new_path)
+                            if mapping:
+                                layout_maps.append(mapping)
+                    except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                        errors.append(f"invalid layout repair map {map_path}: {exc}")
+
+            def repaired_path(path: str) -> str:
+                current = path
+                for mapping in layout_maps:
+                    current = mapping.get(current, current)
+                return current
+
+            expected_paths = {repaired_path(path) for path in baseline_paths}
+            missing_paths = expected_paths - seen_paths
+            unexpected_paths = (seen_paths - expected_paths) - layout_added_paths
+            if missing_paths or unexpected_paths:
+                missing = len(missing_paths)
+                unexpected = len(unexpected_paths)
                 errors.append(
                     f"active/quarantine chain differs from baseline: "
                     f"missing={missing}, unexpected={unexpected}"

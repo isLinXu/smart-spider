@@ -13,8 +13,11 @@
 - 引入 `DatasetRepository` 作为单机任务的提交边界：最终落盘字节计算 SHA-256，SQLite 以 `(job_id, content_hash)` 唯一键分配编号，文件先写入 staging 并 `fsync`，再原子 rename，最后幂等提交样本。
 - SQLite 是事实源；`metadata.jsonl` 和 `manifest.jsonl` 是可重建兼容视图。启动时恢复 `pending/prepared` 记录，并在视图缺失或顺序不一致时重建。
 - HTTP 客户端默认仅允许 HTTP(S)，拒绝凭据、localhost、私有/保留地址，并对每个重定向 hop 和最终 URL 重复校验；`allow_private_hosts=True` 仅用于明确受控的内网任务。
+- 所有静态响应和图片下载都走有界流式读取；连接/读取超时分离，响应声明长度、实际字节数和 Pillow 解码像素数均在 HTTP/解码边界硬限制，连接后的 peer 地址必须仍属于已校验 DNS 结果。
 - HTTP 与 Discovery 层暴露线程安全的计数、状态码、字节、延迟和来源成功率指标；来源响应将快照写入任务报告。
-- 六个安全场景使用版本化 `SceneQualityProfile`，可通过内置中文别名或严格 JSON 覆盖。缺失型违规（无反光衣、未戴安全帽）默认标记为需要人工/专用检测模型复核。
+- DatasetCrawler 使用固定分页窗口、候选/下载信号量和按域名信号量；内存预算自动收紧下载并发，并通过场景、发现来源和原始域名配额防止单一来源垄断。
+- 六个安全场景使用独立校准集、提示词、阈值和版本指纹的 `SceneQualityProfile`，可通过内置中文别名或严格 JSON 覆盖。`SceneQualityGate` 只有在语义分数和专用检测器信号均完整满足时才自动接收；缺失型违规（无反光衣、未戴安全帽）以及任意缺失/矛盾信号默认进入 fsync 的人工复核 JSONL，并保存模型版本、校准集和阈值指纹。
+- 训练切分使用 pHash/dHash 近重复指纹和可选 CLIP embedding 聚类；按来源域名、页面、日期和图片簇将整组样本固定到同一 split，避免相似图片跨 train/validation/test 泄漏。
 
 ## 取舍
 
@@ -25,3 +28,4 @@ SQLite WAL 和单写者仓库适合当前单机/单输出目录模型，不能�
 - 断点续传不依赖“目录文件数”等近似值，重启后可从 SQLite 计数继续。
 - 事件默认 compact payload，避免把完整 HTML/大字段无限写入审计表；需要完整审计时可配置 `event_payload_mode="full"`。
 - 质量档案只负责高召回候选筛选，不把模型分数误认为安全事件的最终事实。
+- 感知去重和分组切分是确定性的离线治理原语；embedding 由调用方提供，避免在采集进程中强制加载额外模型或扩大网络任务的内存峰值。

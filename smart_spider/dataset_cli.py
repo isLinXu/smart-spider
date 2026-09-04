@@ -35,6 +35,28 @@ import argparse
 import sys
 
 
+def _parse_scene_targets(raw: str) -> dict[str, int]:
+    """Parse ``scene=count`` pairs without tying the CLI to profile aliases."""
+    targets: dict[str, int] = {}
+    for entry in (raw or "").split(","):
+        value = entry.strip()
+        if not value:
+            continue
+        if "=" not in value:
+            raise ValueError("scene targets must use scene=count pairs")
+        scene, count_text = (part.strip() for part in value.rsplit("=", 1))
+        try:
+            count = int(count_text)
+        except ValueError as exc:
+            raise ValueError(f"invalid scene target count: {count_text!r}") from exc
+        if not scene or count <= 0:
+            raise ValueError("scene targets need non-empty names and positive counts")
+        targets[scene] = targets.get(scene, 0) + count
+    if raw and not targets:
+        raise ValueError("scene targets cannot be empty")
+    return targets
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="数据集爬取工具：基于 SmartSpider 的大规模图片采集，按每 100 张分桶存储",
@@ -129,6 +151,8 @@ def main():
         "--timeout", type=int, default=10,
         help="HTTP 超时秒数（默认 10）",
     )
+    parser.add_argument("--connect-timeout", type=float, help="HTTP 连接超时秒数")
+    parser.add_argument("--read-timeout", type=float, help="HTTP 读取超时秒数")
     parser.add_argument(
         "--max-retries", type=int, default=3,
         help="单个请求最大重试次数（默认 3；批量采集可设为 0-1 以快速跳过失效来源）",
@@ -150,6 +174,33 @@ def main():
     parser.add_argument(
         "--max-file-size", type=int, default=12 * 1024 * 1024,
         help="最大图片文件大小（字节，默认 12 MiB）",
+    )
+    parser.add_argument(
+        "--max-image-pixels", type=int, default=50_000_000,
+        help="解码图片最大像素数（默认 50,000,000）",
+    )
+    parser.add_argument("--max-inflight-pages", type=int, help="最多并发搜索结果页")
+    parser.add_argument("--max-inflight-downloads", type=int, help="最多并发下载")
+    parser.add_argument("--max-pending-candidates", type=int, help="最多待处理候选")
+    parser.add_argument(
+        "--per-domain-concurrency", type=int, default=2,
+        help="每个图片域名的最大并发下载数（默认 2）",
+    )
+    parser.add_argument(
+        "--memory-budget-mb", type=int, default=512,
+        help="下载响应的内存预算 MiB（默认 512）",
+    )
+    parser.add_argument(
+        "--scene-targets",
+        help="独立场景目标，逗号分隔 scene=count，例如 '打电话=20000,吸烟=20000'",
+    )
+    parser.add_argument(
+        "--max-source-share", type=float, default=1.0,
+        help="单一发现来源最大占比 (0, 1]，默认不限制",
+    )
+    parser.add_argument(
+        "--max-domain-share", type=float, default=1.0,
+        help="单一原始图片域名最大占比 (0, 1]，默认不限制",
     )
     parser.add_argument(
         "--no-curl-cffi", action="store_true",
@@ -214,6 +265,16 @@ def main():
     engines = [e.strip() for e in args.engines.split(",") if e.strip()] if args.engines else None
     sites = [s.strip() for s in args.sites.split(",") if s.strip()] if args.sites else None
     proxies = [args.proxy] if args.proxy else None
+    try:
+        scene_targets = _parse_scene_targets(args.scene_targets or "")
+    except ValueError as exc:
+        parser.error(str(exc))
+    if scene_targets and args.total < sum(scene_targets.values()):
+        parser.error("--total cannot be lower than the sum of --scene-targets")
+    if not 0.0 < args.max_source_share <= 1.0:
+        parser.error("--max-source-share must be in (0, 1]")
+    if not 0.0 < args.max_domain_share <= 1.0:
+        parser.error("--max-domain-share must be in (0, 1]")
 
     # spider_tools 参数
     st_sites = [s.strip() for s in args.st_sites.split(",") if s.strip()] if args.st_sites else None
@@ -222,47 +283,62 @@ def main():
         from .spider_tools_bridge import parse_page_spec
         st_pages = parse_page_spec(args.st_pages)
 
-    # 导入并运行
+    from .dataset_config import DatasetCrawlConfig
     from .dataset_crawler import DatasetCrawler
 
-    crawler = DatasetCrawler(
-        keywords=keywords,
-        total_count=args.total,
-        output_dir=args.output,
-        batch_size=args.batch_size,
-        use_clip=not args.no_clip,
-        similarity_threshold=args.similarity_threshold,
-        clip_model=args.clip_model,
-        query_image=args.query_image,
-        image_similarity_threshold=args.image_similarity_threshold,
-        image_output_format=args.image_output_format,
-        jpeg_quality=args.jpeg_quality,
-        proxies=proxies,
-        rate=args.rate,
-        max_workers=args.max_workers,
-        timeout=args.timeout,
-        max_retries=args.max_retries,
-        min_width=args.min_width,
-        min_height=args.min_height,
-        min_file_size=args.min_file_size,
-        max_file_size=args.max_file_size,
-        use_curl_cffi=False if args.no_curl_cffi else None,
-        allow_private_hosts=args.allow_private_hosts,
-        search_engines=engines,
-        site_parsers=sites,
-        site_start_page=args.site_start_page,
-        site_end_page=args.site_end_page,
-        st_sites=st_sites,
-        st_tags=args.st_tags,
-        st_query=args.st_query,
-        st_pages=st_pages,
-        st_limit_per_site=args.st_limit,
-        resume=args.resume,
-        label_mode=args.label_mode,
-        labels=labels,
-        state_db="" if args.no_state_db else args.state_db,
-    )
+    try:
+        config = DatasetCrawlConfig(
+            keywords=keywords,
+            total_count=args.total,
+            output_dir=args.output,
+            batch_size=args.batch_size,
+            use_clip=not args.no_clip,
+            similarity_threshold=args.similarity_threshold,
+            clip_model=args.clip_model,
+            query_image=args.query_image,
+            image_similarity_threshold=args.image_similarity_threshold,
+            image_output_format=args.image_output_format,
+            jpeg_quality=args.jpeg_quality,
+            proxies=proxies,
+            rate=args.rate,
+            max_workers=args.max_workers,
+            timeout=args.timeout,
+            max_retries=args.max_retries,
+            min_width=args.min_width,
+            min_height=args.min_height,
+            min_file_size=args.min_file_size,
+            max_file_size=args.max_file_size,
+            max_image_pixels=args.max_image_pixels,
+            connect_timeout=args.connect_timeout,
+            read_timeout=args.read_timeout,
+            max_inflight_pages=args.max_inflight_pages,
+            max_inflight_downloads=args.max_inflight_downloads,
+            max_pending_candidates=args.max_pending_candidates,
+            per_domain_concurrency=args.per_domain_concurrency,
+            memory_budget_mb=args.memory_budget_mb,
+            scene_targets=scene_targets,
+            max_source_share=args.max_source_share,
+            max_domain_share=args.max_domain_share,
+            use_curl_cffi=False if args.no_curl_cffi else None,
+            allow_private_hosts=args.allow_private_hosts,
+            search_engines=engines,
+            site_parsers=sites,
+            site_start_page=args.site_start_page,
+            site_end_page=args.site_end_page,
+            st_sites=st_sites,
+            st_tags=args.st_tags,
+            st_query=args.st_query,
+            st_pages=st_pages,
+            st_limit_per_site=args.st_limit,
+            resume=args.resume,
+            label_mode=args.label_mode,
+            labels=labels,
+            state_db="" if args.no_state_db else args.state_db,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
+    crawler = DatasetCrawler.from_config(config)
     crawler.crawl()
 
 

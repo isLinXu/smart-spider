@@ -124,6 +124,30 @@ python -m smart_spider.dataset_cli \
 
 可通过 `--jpeg-quality 1-100` 调整 JPG 质量。
 
+### 六类安全场景批量采集
+
+六类场景可以分别设置目标数量。`--scene-targets` 使用 `场景=数量` 格式，
+`--total` 至少应为所有场景目标之和；任务报告会保存每个场景、发现来源和图片域名的实际配额。
+下载默认关闭自动重定向并逐跳校验目标地址，连接与读取超时分离，响应和图片解码均有硬性大小/像素上限。
+
+```bash
+python -m smart_spider.dataset_cli \
+  --keywords "打电话,使用手机,吸烟,未穿反光衣,叉车司机未戴安全帽,物品滞留" \
+  --scene-targets "打电话=20000,使用手机=20000,吸烟=20000,未穿反光衣=20000,叉车司机未戴安全帽=20000,物品滞留=20000" \
+  --total 120000 \
+  --output ./dataset_safety_scenes \
+  --connect-timeout 5 --read-timeout 20 \
+  --max-inflight-pages 8 --max-inflight-downloads 20 \
+  --max-pending-candidates 200 --per-domain-concurrency 2 \
+  --memory-budget-mb 512 --max-image-pixels 50000000 \
+  --max-source-share 0.25 --max-domain-share 0.15 \
+  --resume
+```
+
+场景质量门禁会记录模型、提示词、校准集和阈值指纹；反光衣、安全帽等专用信号缺失的样本不会被自动放行，
+而是进入人工复核队列。采集完成后可使用 `smart_spider.dataset_filter` 的 `--dedupe-near` 检查 pHash/dHash
+近重复；训练集切分应通过 `smart_spider.dataset_governance.LeakageSafeSplitter` 按域名、页面、日期和图片簇分组。
+
 ## 参数说明
 
 ### 基础参数
@@ -179,7 +203,15 @@ python -m smart_spider.dataset_cli \
 | `--rate` | `8.0` | 每秒最大请求数（令牌桶） |
 | `--max_retries` | `3` | 遭遇 429/503/超时时的最大重试次数 |
 | `--timeout` | `10` | 单次请求超时秒数 |
+| `--connect-timeout` / `--read-timeout` | 同 `--timeout` | 分离连接建立与响应读取超时 |
 | `--max_workers` | `20` | 下载线程池大小 |
+| `--max-inflight-pages` / `--max-inflight-downloads` | 自动 | 有界分页与下载窗口 |
+| `--max-pending-candidates` | 自动 | 候选处理队列上限 |
+| `--per-domain-concurrency` | `2` | 单图片域名并发上限 |
+| `--memory-budget-mb` | `512` | 下载响应内存预算，自动收紧下载并发 |
+| `--max-image-pixels` | `50000000` | Pillow 解码像素上限，防止解压炸弹 |
+| `--scene-targets` | 无 | 独立场景目标，如 `打电话=20000,吸烟=20000` |
+| `--max-source-share` / `--max-domain-share` | `1.0` | 单一来源/域名最大占比 |
 
 ### Playwright 参数
 
@@ -301,7 +333,7 @@ python -m smart_spider.dataset_filter_cli \
   --export-output ./dataset_optimized
 ```
 
-感知近重复检查结合 dHash、宽高比和平均颜色，默认仅生成报告；确认后加入
+感知近重复检查结合 pHash、dHash、宽高比和平均颜色，默认仅生成报告；确认后加入
 `--apply` 才会隔离命中项：
 
 ```bash
@@ -361,6 +393,17 @@ SmartSpider
 ├── VideoDownloader        yt-dlp 包装
 └── TextExtractor          trafilatura 正文提取
 ```
+
+数据集双轨（ADR-0009 Facade 收敛）：
+
+```
+CLI / API
+  ├─ DatasetCrawlConfig → DatasetCrawler（图片兼容门面）
+  └─ MultimodalJobConfig → MultimodalDatasetOrchestrator
+              └─ shared: pipeline.ObjectStore / TaskQueue（本地 FS + SQLite 默认）
+```
+
+运行产物请放在 `dataset_*` / `output_*` / `.artifacts/` 等目录（已 gitignore）。轻量任务 API：`pip install -e ".[api]" && smart-spider-api`。
 
 ## License
 

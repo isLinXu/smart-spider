@@ -14,7 +14,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests as req_lib
 
-from smart_spider.http_client import HttpMetrics, RateLimiter, ProxyPool, SmartHttpClient
+from smart_spider.http_client import (
+    HttpMetrics,
+    RateLimiter,
+    ProxyPool,
+    ResponseTooLargeError,
+    SmartHttpClient,
+)
 from smart_spider.url_policy import UnsafeURLError, URLPolicy
 from smart_spider.smart_spider import UrlDeduplicator
 
@@ -282,6 +288,99 @@ class TestSmartHttpClient:
             data = client.get_bytes("https://example.com")
         assert isinstance(data, bytes)
 
+    @patch("smart_spider.http_client._build_session")
+    def test_non_stream_get_is_bounded_at_http_layer(self, mock_build):
+        response = MagicMock(status_code=200, headers={})
+        response.iter_content.return_value = [b"1234", b"56"]
+        session = MagicMock()
+        session.get.return_value = response
+        mock_build.return_value = session
+
+        with patch("time.sleep"), pytest.raises(ResponseTooLargeError):
+            client = SmartHttpClient(
+                rate=1000.0,
+                max_retries=0,
+                max_response_bytes=5,
+                url_policy=URLPolicy(resolve_dns=False),
+                use_curl_cffi=False,
+            )
+            client.get("https://example.com")
+
+        response.close.assert_called()
+
+    @patch("smart_spider.http_client._build_session")
+    def test_redirect_target_is_validated_before_next_request(self, mock_build):
+        redirect = MagicMock(status_code=302, headers={"Location": "/next"})
+        final = MagicMock(status_code=200, headers={})
+        session = MagicMock()
+        session.get.side_effect = [redirect, final]
+        mock_build.return_value = session
+
+        with patch("time.sleep"):
+            client = SmartHttpClient(
+                rate=1000.0, url_policy=URLPolicy(resolve_dns=False),
+                use_curl_cffi=False,
+            )
+            client.get("https://example.com/start")
+
+        assert [call.args[0] for call in session.get.call_args_list] == [
+            "https://example.com/start", "https://example.com/next"
+        ]
+        assert all(call.kwargs["allow_redirects"] is False for call in session.get.call_args_list)
+        redirect.close.assert_called_once()
+
+    @patch("smart_spider.http_client._build_session")
+    def test_private_redirect_is_rejected_before_connection(self, mock_build):
+        redirect = MagicMock(
+            status_code=302, headers={"Location": "http://127.0.0.1/admin"}
+        )
+        session = MagicMock()
+        session.get.return_value = redirect
+        mock_build.return_value = session
+
+        with patch("time.sleep"), pytest.raises(UnsafeURLError):
+            client = SmartHttpClient(
+                rate=1000.0, url_policy=URLPolicy(resolve_dns=False),
+                use_curl_cffi=False,
+            )
+            client.get("https://example.com/start")
+
+        assert session.get.call_count == 1
+        redirect.close.assert_called_once()
+
+    @patch("smart_spider.http_client._build_session")
+    def test_bounded_bytes_rejects_declared_oversize_response(self, mock_build):
+        response = MagicMock(status_code=200, headers={"Content-Length": "16"})
+        session = MagicMock()
+        session.get.return_value = response
+        mock_build.return_value = session
+        metrics = HttpMetrics()
+
+        with patch("time.sleep"), pytest.raises(ResponseTooLargeError):
+            client = SmartHttpClient(
+                rate=1000.0, max_response_bytes=8, metrics=metrics,
+                url_policy=URLPolicy(resolve_dns=False), use_curl_cffi=False,
+            )
+            client.get_bytes("https://example.com/image")
+
+        assert response.close.called
+        assert metrics.snapshot()["oversized_responses"] == 1
+
+    @patch("smart_spider.http_client._build_session")
+    def test_split_connect_and_read_timeout_reach_requests(self, mock_build, mock_ok_response):
+        mock_session = MagicMock()
+        mock_session.get.return_value = mock_ok_response
+        mock_build.return_value = mock_session
+
+        with patch("time.sleep"):
+            client = SmartHttpClient(
+                rate=1000.0, connect_timeout=2, read_timeout=7,
+                url_policy=URLPolicy(resolve_dns=False), use_curl_cffi=False,
+            )
+            client.get("https://example.com")
+
+        assert mock_session.get.call_args.kwargs["timeout"] == (2.0, 7.0)
+
     def test_url_policy_rejects_private_and_credential_urls(self):
         policy = URLPolicy(resolve_dns=False)
         with pytest.raises(UnsafeURLError):
@@ -290,6 +389,11 @@ class TestSmartHttpClient:
             policy.validate("http://user:pass@example.com/image.jpg")
         with pytest.raises(UnsafeURLError):
             policy.validate("file:///tmp/image.jpg")
+
+    def test_url_policy_rejects_dns_rebinding_peer(self):
+        policy = URLPolicy(resolve_dns=False)
+        with pytest.raises(UnsafeURLError, match="connected peer"):
+            policy.validate_peer("8.8.8.8", frozenset({"1.1.1.1"}))
 
     @patch("smart_spider.http_client._build_session")
     def test_metrics_capture_success(self, mock_build, mock_ok_response):

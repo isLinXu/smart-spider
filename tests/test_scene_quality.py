@@ -42,7 +42,19 @@ def test_custom_json_profile_is_strict(tmp_path):
     profile = load_scene_quality_profile(path)
     assert profile.name == "custom"
     assert profile.thresholds.min_relevance == 0.3
+    assert profile.calibration.dataset_id == "custom/custom"
+    assert len(profile.fingerprint) == 16
     assert resolve_scene_quality_profile(config_path=path).name == "custom"
+
+
+def test_builtin_profiles_have_independent_calibration_and_signal_requirements():
+    phone = get_scene_quality_profile("phone_call")
+    no_vest = get_scene_quality_profile("no_reflective_vest")
+    assert phone.thresholds != no_vest.thresholds
+    assert phone.calibration.dataset_id != no_vest.calibration.dataset_id
+    assert {item.name for item in no_vest.signal_requirements} >= {
+        "person", "reflective_vest",
+    }
 
 
 def test_custom_json_profile_rejects_unknown_threshold(tmp_path):

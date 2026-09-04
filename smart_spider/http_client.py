@@ -19,8 +19,8 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Optional
-from urllib.parse import urlparse
+from typing import Iterator, Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
 from fake_useragent import UserAgent
@@ -29,6 +29,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .url_policy import URLPolicy, UnsafeURLError
+
+
+class ResponseTooLargeError(requests.RequestException):
+    """Raised before an HTTP response can exceed its configured byte budget."""
 
 # ──────────────────────────────────────────────────────────────────────────────
 # curl_cffi 可选：TLS 指纹伪造
@@ -100,6 +104,8 @@ class RateLimiter:
         Args:
             rate: 每秒允许的最大请求数（令牌补充速率）
         """
+        if rate <= 0:
+            raise ValueError("rate must be positive")
         self._rate = rate
         self._tokens = rate
         self._last = time.monotonic()
@@ -248,6 +254,8 @@ class HttpMetrics:
         self._successes = 0
         self._failures = 0
         self._bytes = 0
+        self._oversized_responses = 0
+        self._dns_rebind_rejections = 0
         self._status = Counter()
         self._latencies_ms: list[float] = []
         self._max_latency_samples = max_latency_samples
@@ -279,6 +287,14 @@ class HttpMetrics:
             if status_code is not None:
                 self._status[str(int(status_code))] += 1
 
+    def observe_oversized_response(self) -> None:
+        with self._lock:
+            self._oversized_responses += 1
+
+    def observe_dns_rebind_rejection(self) -> None:
+        with self._lock:
+            self._dns_rebind_rejections += 1
+
     def snapshot(self) -> dict:
         with self._lock:
             latencies = sorted(self._latencies_ms)
@@ -292,6 +308,8 @@ class HttpMetrics:
                 "successes": self._successes,
                 "failures": self._failures,
                 "bytes_received": self._bytes,
+                "oversized_responses": self._oversized_responses,
+                "dns_rebind_rejections": self._dns_rebind_rejections,
                 "status_codes": dict(sorted(self._status.items())),
                 "latency_ms": {"p50": round(p50, 2), "p95": round(p95, 2)},
             }
@@ -341,7 +359,10 @@ class SmartHttpClient:
         proxies: Optional[list[str]] = None,
         rate: float = 10.0,
         max_retries: int = 3,
-        timeout: int = 10,
+        timeout: float = 10,
+        connect_timeout: Optional[float] = None,
+        read_timeout: Optional[float] = None,
+        max_response_bytes: int = 25 * 1024 * 1024,
         proxy_strategy: str = "round_robin",
         use_curl_cffi: Optional[bool] = None,
         url_policy: Optional[URLPolicy] = None,
@@ -353,7 +374,19 @@ class SmartHttpClient:
         self._proxy_pool = ProxyPool(proxies or [])
         self._rate_limiter = RateLimiter(rate)
         self._max_retries = max_retries
-        self._timeout = timeout
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self._connect_timeout = float(connect_timeout or timeout)
+        self._read_timeout = float(read_timeout or timeout)
+        if self._connect_timeout <= 0 or self._read_timeout <= 0:
+            raise ValueError("connect_timeout and read_timeout must be positive")
+        if max_response_bytes <= 0:
+            raise ValueError("max_response_bytes must be positive")
+        # requests accepts (connect, read). curl_cffi accepts a scalar timeout,
+        # so it uses the conservative maximum while requests gets split bounds.
+        self._timeout = (self._connect_timeout, self._read_timeout)
+        self._curl_timeout = max(self._connect_timeout, self._read_timeout)
+        self.max_response_bytes = int(max_response_bytes)
         self._proxy_strategy = proxy_strategy
         self.url_policy = url_policy or URLPolicy(
             allow_private_hosts=allow_private_hosts
@@ -424,27 +457,53 @@ class SmartHttpClient:
             self._host_failures.pop(host, None)
             self._host_blocked_until.pop(host, None)
 
-    def _validate_response_redirects(self, response: requests.Response, original_url: str) -> None:
-        """Validate every redirect hop, including the final URL.
+    @staticmethod
+    def _extract_peer_address(response: requests.Response) -> Optional[str]:
+        """Best-effort peer extraction across requests/urllib3 response shapes."""
+        raw = getattr(response, "raw", None)
+        candidates = [
+            getattr(getattr(raw, "connection", None), "sock", None),
+            getattr(getattr(raw, "_connection", None), "sock", None),
+            getattr(getattr(getattr(getattr(raw, "_original_response", None), "fp", None), "raw", None), "_sock", None),
+        ]
+        for sock in candidates:
+            try:
+                peer = sock.getpeername()[0]
+            except (AttributeError, OSError, TypeError, IndexError):
+                continue
+            if isinstance(peer, str) and peer:
+                return peer
+        return None
 
-        ``requests`` follows redirects before returning, so validating only the
-        requested URL would allow a public URL to bounce into localhost or a
-        private address.  Mock responses and curl-cffi responses do not always
-        expose a string ``url``; in that case the original URL is the safest
-        fallback for compatibility.
-        """
-        history = getattr(response, "history", ()) or ()
-        if len(history) > self.max_redirects:
+    def _validate_connected_peer(
+        self,
+        response: requests.Response,
+        resolved_addresses: frozenset[str],
+        *,
+        via_proxy: bool,
+    ) -> None:
+        # A proxy socket belongs to the proxy, not to the target URL; judging it
+        # against the target DNS result would reject legitimate proxy traffic.
+        if via_proxy:
+            return
+        peer = self._extract_peer_address(response)
+        if peer is None:
+            return
+        try:
+            self.url_policy.validate_peer(peer, resolved_addresses)
+        except UnsafeURLError:
+            self.metrics.observe_dns_rebind_rejection()
             response.close()
-            raise requests.TooManyRedirects(
-                f"too many redirects for {original_url}"
-            )
-        for hop in history:
-            hop_url = getattr(hop, "url", None)
-            if isinstance(hop_url, str) and hop_url:
-                self.url_policy.validate(hop_url)
-        final_url = getattr(response, "url", None)
-        self.url_policy.validate(final_url if isinstance(final_url, str) and final_url else original_url)
+            raise
+
+    @staticmethod
+    def _redirect_location(response: requests.Response) -> Optional[str]:
+        status = getattr(response, "status_code", None)
+        if status not in {301, 302, 303, 307, 308}:
+            return None
+        headers = getattr(response, "headers", {}) or {}
+        location = headers.get("Location") if hasattr(headers, "get") else None
+        return location if isinstance(location, str) and location.strip() else None
 
     def _make_headers(self, engine: Optional[str] = None) -> dict:
         """生成随机化的浏览器请求头。"""
@@ -487,10 +546,228 @@ class SmartHttpClient:
             url,
             headers=headers,
             proxies=proxies,
-            timeout=self._timeout,
+            timeout=self._curl_timeout,
             impersonate=impersonate,
             stream=stream,
             **kwargs,
+        )
+
+    def _send_single_request(
+        self,
+        method: str,
+        url: str,
+        headers: dict,
+        proxy_entry: Optional[ProxyEntry],
+        stream: bool,
+        **kwargs,
+    ) -> requests.Response:
+        """Send exactly one HTTP hop with automatic redirects disabled."""
+        request_kwargs = dict(kwargs)
+        request_kwargs.pop("allow_redirects", None)
+        if self._use_curl:
+            proxy_url = proxy_entry.url if proxy_entry else None
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+            request = curl_requests.get if method == "GET" else curl_requests.head
+            return request(
+                url,
+                headers=headers,
+                proxies=proxies,
+                timeout=self._curl_timeout,
+                impersonate=random.choice(_CHROME_IMPERSONATES),
+                # Always receive through a bounded iterator. A non-streaming
+                # public call is materialized by _request after the byte cap.
+                stream=True,
+                allow_redirects=False,
+                **request_kwargs,
+            )
+        session = self._get_session(proxy_entry)
+        request = session.get if method == "GET" else session.head
+        return request(
+            url,
+            headers=headers,
+            timeout=self._timeout,
+            # Always receive through a bounded iterator. A non-streaming
+            # public call is materialized by _request after the byte cap.
+            stream=True,
+            allow_redirects=False,
+            **request_kwargs,
+        )
+
+    def _send_with_validated_redirects(
+        self,
+        method: str,
+        url: str,
+        headers: dict,
+        proxy_entry: Optional[ProxyEntry],
+        stream: bool,
+        **kwargs,
+    ) -> requests.Response:
+        """Validate every redirect target before it receives a request."""
+        current_url = url
+        redirects = 0
+        while True:
+            # Re-resolve immediately before every socket connection.  The peer
+            # check below catches resolvers that change between these steps.
+            self.url_policy.validate(current_url)
+            resolved = self.url_policy.resolve_public_addresses(current_url)
+            response = self._send_single_request(
+                method, current_url, headers, proxy_entry, stream, **kwargs
+            )
+            try:
+                actual_url = getattr(response, "url", None)
+                if isinstance(actual_url, str) and actual_url:
+                    self.url_policy.validate(actual_url)
+                self._validate_connected_peer(
+                    response, resolved, via_proxy=proxy_entry is not None
+                )
+                location = self._redirect_location(response)
+                if location is None:
+                    return response
+                if redirects >= self.max_redirects:
+                    raise requests.TooManyRedirects(
+                        f"too many redirects for {url}", response=response
+                    )
+                next_url = urljoin(current_url, location)
+                # This happens *before* closing the old hop and before issuing
+                # a connection to the target, preventing redirect SSRF.
+                self.url_policy.validate(next_url)
+            except Exception:
+                response.close()
+                raise
+            response.close()
+            current_url = next_url
+            redirects += 1
+
+    @staticmethod
+    def _declared_content_length(response: requests.Response) -> Optional[int]:
+        headers = getattr(response, "headers", {}) or {}
+        value = headers.get("Content-Length") if hasattr(headers, "get") else None
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _drain_and_close(self, response: requests.Response) -> None:
+        """Release a rejected socket without reading an unbounded error body."""
+        try:
+            total = 0
+            for chunk in response.iter_content(chunk_size=65536):
+                total += len(chunk)
+                if total >= 1024 * 1024:
+                    break
+        except Exception:
+            pass
+        finally:
+            response.close()
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        engine: Optional[str] = None,
+        extra_headers: Optional[dict] = None,
+        stream: bool = False,
+        **kwargs,
+    ) -> requests.Response:
+        started = time.monotonic()
+        last_exc: Optional[Exception] = None
+        for attempt in range(self._max_retries + 1):
+            if not self._host_allowed(url):
+                error = requests.ConnectionError(
+                    f"Host circuit open: {urlparse(url).hostname or url}"
+                )
+                self.metrics.observe(
+                    success=False, elapsed_ms=(time.monotonic() - started) * 1000
+                )
+                raise error
+            self._rate_limiter.acquire()
+            proxy_entry = (
+                self._proxy_pool.get(self._proxy_strategy)
+                if not self._proxy_pool.is_empty() else None
+            )
+            headers = self._make_headers(engine)
+            if extra_headers:
+                headers.update(extra_headers)
+            time.sleep(random.uniform(0.05, 0.30))
+            try:
+                response = self._send_with_validated_redirects(
+                    method, url, headers, proxy_entry, stream, **kwargs
+                )
+                if response.status_code in (429, 403, 503):
+                    self._drain_and_close(response)
+                    logger.warning(
+                        f"{method} anti-crawl {response.status_code} for {url[:60]}, "
+                        f"attempt {attempt + 1}/{self._max_retries + 1}"
+                    )
+                    if proxy_entry:
+                        self._proxy_pool.report_fail(proxy_entry)
+                    self._record_host_failure(url)
+                    last_exc = requests.HTTPError(response=response)
+                    if attempt >= self._max_retries:
+                        break
+                else:
+                    if proxy_entry:
+                        self._proxy_pool.report_success(proxy_entry)
+                    self._record_host_success(url)
+                    received_bytes = self._declared_content_length(response) or 0
+                    if not stream:
+                        # Preserve requests' ordinary ``get().content`` API,
+                        # but make it impossible to bypass the HTTP byte cap.
+                        try:
+                            content = self.read_bounded_bytes(
+                                response,
+                                max_bytes=self.max_response_bytes,
+                                close_response=False,
+                            )
+                        except Exception:
+                            response.close()
+                            raise
+                        try:
+                            response._content = content  # type: ignore[attr-defined]
+                            response._content_consumed = True  # type: ignore[attr-defined]
+                        except Exception:
+                            # Alternative response implementations may not
+                            # expose requests' private content fields.
+                            pass
+                        # Some injected response doubles expose only a
+                        # declared length and an empty iterator. Keep that
+                        # historical metric behavior while real responses use
+                        # the bytes actually consumed above.
+                        received_bytes = len(content) or received_bytes
+                    self.metrics.observe(
+                        success=True,
+                        elapsed_ms=(time.monotonic() - started) * 1000,
+                        status_code=getattr(response, "status_code", None),
+                        bytes_received=received_bytes,
+                    )
+                    return response
+            except (UnsafeURLError, requests.TooManyRedirects, ResponseTooLargeError) as exc:
+                self.metrics.observe(
+                    success=False,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    status_code=getattr(getattr(exc, "response", None), "status_code", None),
+                )
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if proxy_entry:
+                    self._proxy_pool.report_fail(proxy_entry)
+                self._record_host_failure(url)
+                if attempt >= self._max_retries:
+                    break
+                logger.warning(
+                    f"{method} error for {url[:60]}: {type(exc).__name__}: {exc}, "
+                    f"retry {attempt + 2}/{self._max_retries + 1}"
+                )
+            wait = (2 ** attempt) + random.uniform(0, 1)
+            time.sleep(wait)
+        self.metrics.observe(
+            success=False,
+            elapsed_ms=(time.monotonic() - started) * 1000,
+            status_code=getattr(getattr(last_exc, "response", None), "status_code", None),
+        )
+        raise last_exc or requests.RequestException(
+            f"{method} failed after {self._max_retries} retries: {url}"
         )
 
     def get(
@@ -501,146 +778,15 @@ class SmartHttpClient:
         stream: bool = False,
         **kwargs,
     ) -> requests.Response:
+        """GET with retry, manual redirect validation, and split timeouts.
+
+        Anti-crawl statuses ``(429, 403, 503)`` are drained with
+        ``resp.iter_content()`` and closed in a ``try: ... finally:`` block via
+        ``resp.close()`` by :meth:`_drain_and_close` before a retry.
         """
-        发起 GET 请求，内置重试 + 代理轮换 + 限速 + 随机 Header。
-
-        Args:
-            url:           目标 URL
-            engine:        搜索引擎名称（用于注入 Referer），可为 None
-            extra_headers: 额外覆盖的 Header
-            stream:        是否流式下载
-
-        Raises:
-            requests.RequestException: 重试耗尽后仍失败
-        """
-        started = time.monotonic()
-        try:
-            self.url_policy.validate(url)
-        except UnsafeURLError:
-            self.metrics.observe(
-                success=False,
-                elapsed_ms=(time.monotonic() - started) * 1000,
-            )
-            raise
-        last_exc = None
-        for attempt in range(self._max_retries + 1):
-            if not self._host_allowed(url):
-                error = requests.ConnectionError(
-                    f"Host circuit open: {urlparse(url).hostname or url}"
-                )
-                self.metrics.observe(
-                    success=False,
-                    elapsed_ms=(time.monotonic() - started) * 1000,
-                )
-                raise error
-            self._rate_limiter.acquire()
-
-            proxy_entry = (
-                self._proxy_pool.get(self._proxy_strategy)
-                if not self._proxy_pool.is_empty()
-                else None
-            )
-            headers = self._make_headers(engine)
-            if extra_headers:
-                headers.update(extra_headers)
-
-            # 随机抖动（50-300ms），避免请求过于规律
-            time.sleep(random.uniform(0.05, 0.30))
-
-            try:
-                if self._use_curl:
-                    proxy_url = proxy_entry.url if proxy_entry else None
-                    resp = self._curl_get(url, headers, proxy_url, stream, **kwargs)
-                else:
-                    session = self._get_session(proxy_entry)
-                    resp = session.get(
-                        url,
-                        headers=headers,
-                        timeout=self._timeout,
-                        stream=stream,
-                        **kwargs,
-                    )
-
-                # 遭遇反爬状态码
-                if resp.status_code in (429, 403, 503):
-                    # Drain the response body before retrying.  If the body is
-                    # left unconsumed, the underlying socket stays occupied and
-                    # the connection pool treats it as "in use", eventually
-                    # exhausting all available connections under sustained 429s.
-                    try:
-                        for _ in resp.iter_content(chunk_size=65536):
-                            pass
-                    except Exception:
-                        pass
-                    finally:
-                        resp.close()
-                    logger.warning(
-                        f"Anti-crawl status {resp.status_code} for {url[:60]}, "
-                        f"attempt {attempt + 1}/{self._max_retries + 1}"
-                    )
-                    if proxy_entry:
-                        self._proxy_pool.report_fail(proxy_entry)
-                    self._record_host_failure(url)
-                    last_exc = requests.HTTPError(response=resp)
-                    if attempt >= self._max_retries:
-                        break
-                    wait = (2 ** attempt) + random.uniform(0, 1)
-                    time.sleep(wait)
-                    continue
-
-                if proxy_entry:
-                    self._proxy_pool.report_success(proxy_entry)
-                self._record_host_success(url)
-                self._validate_response_redirects(resp, url)
-                self.metrics.observe(
-                    success=True,
-                    elapsed_ms=(time.monotonic() - started) * 1000,
-                    status_code=getattr(resp, "status_code", None),
-                    bytes_received=int(getattr(resp, "headers", {}).get("Content-Length") or 0),
-                )
-                return resp
-
-            except (UnsafeURLError, requests.TooManyRedirects) as e:
-                self.metrics.observe(
-                    success=False,
-                    elapsed_ms=(time.monotonic() - started) * 1000,
-                    status_code=getattr(getattr(e, "response", None), "status_code", None),
-                )
-                raise
-            except (requests.ConnectionError, requests.Timeout) as e:
-                last_exc = e
-                if proxy_entry:
-                    self._proxy_pool.report_fail(proxy_entry)
-                self._record_host_failure(url)
-                if attempt >= self._max_retries:
-                    break
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(
-                    f"Request error ({type(e).__name__}) for {url[:60]}, "
-                    f"retry {attempt + 2}/{self._max_retries + 1} after {wait:.1f}s"
-                )
-                time.sleep(wait)
-            except Exception as e:
-                # curl_cffi 等可能抛出非 requests 异常
-                last_exc = e
-                if proxy_entry:
-                    self._proxy_pool.report_fail(proxy_entry)
-                self._record_host_failure(url)
-                if attempt >= self._max_retries:
-                    break
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(
-                    f"Unexpected error for {url[:60]}: {type(e).__name__}: {e}, "
-                    f"retry {attempt + 2}/{self._max_retries + 1} after {wait:.1f}s"
-                )
-                time.sleep(wait)
-
-        self.metrics.observe(
-            success=False,
-            elapsed_ms=(time.monotonic() - started) * 1000,
-            status_code=getattr(getattr(last_exc, "response", None), "status_code", None),
+        return self._request(
+            "GET", url, engine, extra_headers, stream=stream, **kwargs
         )
-        raise last_exc or requests.RequestException(f"Failed after {self._max_retries} retries: {url}")
 
     def head(
         self,
@@ -649,143 +795,120 @@ class SmartHttpClient:
         extra_headers: Optional[dict] = None,
         **kwargs,
     ) -> requests.Response:
-        """发起 HEAD 请求（轻量探测，用于预检 Content-Type / Content-Length）。
+        """HEAD with the same redirect and SSRF protections as GET."""
+        return self._request("HEAD", url, engine, extra_headers, **kwargs)
 
-        不消耗大量带宽，适合在下载前检查资源是否存在及大小。
-        共享 get() 的限速、代理轮换、重试逻辑。
-        """
-        started = time.monotonic()
+    def _check_declared_size(self, response: requests.Response, max_bytes: int) -> None:
+        declared = self._declared_content_length(response)
+        if declared is not None and declared > max_bytes:
+            self.metrics.observe_oversized_response()
+            response.close()
+            raise ResponseTooLargeError(
+                f"response declares {declared} bytes, above limit {max_bytes}"
+            )
+
+    def _bounded_iter_content(
+        self,
+        response: requests.Response,
+        *,
+        max_bytes: int,
+        already_read: int = 0,
+    ) -> Iterator[bytes]:
+        """Yield response chunks while enforcing a byte ceiling at the HTTP edge."""
+        total = already_read
         try:
-            self.url_policy.validate(url)
-        except UnsafeURLError:
-            self.metrics.observe(
-                success=False,
-                elapsed_ms=(time.monotonic() - started) * 1000,
-            )
-            raise
-        last_exc = None
-        for attempt in range(self._max_retries + 1):
-            if not self._host_allowed(url):
-                error = requests.ConnectionError(
-                    f"Host circuit open: {urlparse(url).hostname or url}"
-                )
-                self.metrics.observe(
-                    success=False,
-                    elapsed_ms=(time.monotonic() - started) * 1000,
-                )
-                raise error
-            self._rate_limiter.acquire()
-            proxy_entry = (
-                self._proxy_pool.get(self._proxy_strategy)
-                if not self._proxy_pool.is_empty()
-                else None
-            )
-            headers = self._make_headers(engine)
-            if extra_headers:
-                headers.update(extra_headers)
-            time.sleep(random.uniform(0.05, 0.30))
-
-            try:
-                if self._use_curl:
-                    proxy_url = proxy_entry.url if proxy_entry else None
-                    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-                    impersonate = random.choice(_CHROME_IMPERSONATES)
-                    resp = curl_requests.head(
-                        url, headers=headers, proxies=proxies,
-                        timeout=self._timeout, impersonate=impersonate, **kwargs,
-                    )
-                else:
-                    session = self._get_session(proxy_entry)
-                    resp = session.head(
-                        url, headers=headers, timeout=self._timeout, **kwargs,
-                    )
-
-                if resp.status_code in (429, 403, 503):
-                    try:
-                        for _ in resp.iter_content(chunk_size=65536):
-                            pass
-                    except Exception:
-                        pass
-                    finally:
-                        resp.close()
-                    logger.warning(
-                        f"HEAD anti-crawl {resp.status_code} for {url[:60]}, "
-                        f"attempt {attempt + 1}/{self._max_retries + 1}"
-                    )
-                    if proxy_entry:
-                        self._proxy_pool.report_fail(proxy_entry)
-                    self._record_host_failure(url)
-                    last_exc = requests.HTTPError(response=resp)
-                    if attempt >= self._max_retries:
-                        break
-                    wait = (2 ** attempt) + random.uniform(0, 1)
-                    time.sleep(wait)
+            for chunk in response.iter_content(chunk_size=65536):
+                if not chunk:
                     continue
+                total += len(chunk)
+                if total > max_bytes:
+                    self.metrics.observe_oversized_response()
+                    response.close()
+                    raise ResponseTooLargeError(
+                        f"response exceeded byte limit {max_bytes}"
+                    )
+                yield chunk
+        except ResponseTooLargeError:
+            raise
 
-                if proxy_entry:
-                    self._proxy_pool.report_success(proxy_entry)
-                self._record_host_success(url)
-                self._validate_response_redirects(resp, url)
-                self.metrics.observe(
-                    success=True,
-                    elapsed_ms=(time.monotonic() - started) * 1000,
-                    status_code=getattr(resp, "status_code", None),
+    def read_bounded_bytes(
+        self,
+        response: requests.Response,
+        *,
+        max_bytes: Optional[int] = None,
+        prefix: bytes = b"",
+        close_response: bool = True,
+    ) -> bytes:
+        """Read a response via the shared bounded streaming implementation."""
+        limit = getattr(self, "max_response_bytes", 25 * 1024 * 1024) if max_bytes is None else int(max_bytes)
+        if limit <= 0:
+            raise ValueError("max_bytes must be positive")
+        self._check_declared_size(response, limit)
+        if len(prefix) > limit:
+            self.metrics.observe_oversized_response()
+            response.close()
+            raise ResponseTooLargeError(f"response exceeded byte limit {limit}")
+        chunks = [bytes(prefix)] if prefix else []
+        try:
+            chunks.extend(
+                self._bounded_iter_content(
+                    response, max_bytes=limit, already_read=len(prefix)
                 )
-                return resp
+            )
+            return b"".join(chunks)
+        finally:
+            if close_response:
+                response.close()
 
-            except (UnsafeURLError, requests.TooManyRedirects) as e:
-                self.metrics.observe(
-                    success=False,
-                    elapsed_ms=(time.monotonic() - started) * 1000,
-                    status_code=getattr(getattr(e, "response", None), "status_code", None),
-                )
-                raise
-            except (requests.ConnectionError, requests.Timeout) as e:
-                last_exc = e
-                if proxy_entry:
-                    self._proxy_pool.report_fail(proxy_entry)
-                self._record_host_failure(url)
-                if attempt >= self._max_retries:
-                    break
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(f"HEAD error for {url[:60]}: {e}, retry {attempt + 2}/{self._max_retries + 1}")
-                time.sleep(wait)
-            except Exception as e:
-                last_exc = e
-                if proxy_entry:
-                    self._proxy_pool.report_fail(proxy_entry)
-                self._record_host_failure(url)
-                if attempt >= self._max_retries:
-                    break
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(f"HEAD unexpected error for {url[:60]}: {e}, retry {attempt + 2}/{self._max_retries + 1}")
-                time.sleep(wait)
-
-        self.metrics.observe(
-            success=False,
-            elapsed_ms=(time.monotonic() - started) * 1000,
-            status_code=getattr(getattr(last_exc, "response", None), "status_code", None),
+    def get_bytes(
+        self,
+        url: str,
+        engine: Optional[str] = None,
+        *,
+        max_bytes: Optional[int] = None,
+        extra_headers: Optional[dict] = None,
+    ) -> bytes:
+        """Fetch bytes through the mandatory bounded streaming download path."""
+        response = self.get(
+            url, engine=engine, extra_headers=extra_headers, stream=True
         )
-        raise last_exc or requests.RequestException(f"HEAD failed after {self._max_retries} retries: {url}")
+        return self.read_bounded_bytes(response, max_bytes=max_bytes)
 
-    def get_bytes(self, url: str, engine: Optional[str] = None) -> bytes:
-        """便捷方法：获取完整 bytes 内容。"""
-        resp = self.get(url, engine=engine)
+    def get_text(
+        self,
+        url: str,
+        engine: Optional[str] = None,
+        *,
+        max_bytes: Optional[int] = None,
+        extra_headers: Optional[dict] = None,
+    ) -> str:
+        """Fetch text without allowing a response to bypass the byte budget."""
+        response = self.get(
+            url, engine=engine, extra_headers=extra_headers, stream=True
+        )
         try:
-            return resp.content
+            content = self.read_bounded_bytes(response, max_bytes=max_bytes)
         finally:
-            resp.close()
+            # read_bounded_bytes closes first; this keeps mocked responses and
+            # alternative clients compatible with the historical contract.
+            response.close()
+        # ``apparent_encoding`` may read response.content again. Use the
+        # header-derived encoding only after bounded bytes have been captured.
+        encoding = (
+            getattr(response, "encoding", None)
+            or getattr(response, "charset_encoding", None)
+            or "utf-8"
+        )
+        return content.decode(encoding, errors="replace")
 
-    def get_text(self, url: str, engine: Optional[str] = None) -> str:
-        """便捷方法：获取文本内容，自动检测编码。"""
-        resp = self.get(url, engine=engine)
-        try:
-            resp.encoding = getattr(resp, 'apparent_encoding', None) or resp.charset_encoding or "utf-8"
-            return resp.text
-        finally:
-            resp.close()
-
-    def get_stream(self, url: str, engine: Optional[str] = None, peek_bytes: int = 8192):
+    def get_stream(
+        self,
+        url: str,
+        engine: Optional[str] = None,
+        peek_bytes: int = 8192,
+        *,
+        max_bytes: Optional[int] = None,
+    ):
         """Stream-fetch the first peek_bytes bytes; return (peek, response).
 
         The caller can continue reading the rest via resp.iter_content().
@@ -800,11 +923,24 @@ class SmartHttpClient:
         as _peek_overflow on the response object so the next iter_content call
         yields them transparently.
         """
+        limit = getattr(self, "max_response_bytes", 25 * 1024 * 1024) if max_bytes is None else int(max_bytes)
+        if peek_bytes <= 0 or limit <= 0:
+            raise ValueError("peek_bytes and max_bytes must be positive")
         resp = self.get(url, engine=engine, stream=True)
+        self._check_declared_size(resp, limit)
         peek = b""
         overflow = b""
+        bytes_read = 0
         try:
             for chunk in resp.iter_content(chunk_size=peek_bytes):
+                if not chunk:
+                    continue
+                bytes_read += len(chunk)
+                if bytes_read > limit:
+                    self.metrics.observe_oversized_response()
+                    raise ResponseTooLargeError(
+                        f"response exceeded byte limit {limit}"
+                    )
                 if len(peek) + len(chunk) <= peek_bytes:
                     peek += chunk
                 else:
@@ -819,18 +955,31 @@ class SmartHttpClient:
             resp.close()
             raise
 
-        # Store leftover bytes so callers using resp.iter_content() get them back.
-        # We attach it as a private attribute; _OverflowResponse wraps it cleanly.
+        # Preserve bytes that were read beyond the peek and ensure callers
+        # cannot bypass the byte ceiling by consuming the returned response.
         if overflow:
             resp._peek_overflow = overflow  # type: ignore[attr-defined]
-            _orig_iter = resp.iter_content
+        _orig_iter = resp.iter_content
 
-            def _patched_iter(chunk_size=1, decode_unicode=False):
+        def _patched_iter(chunk_size=1, decode_unicode=False):
+            if overflow:
                 yield overflow
-                yield from _orig_iter(chunk_size=chunk_size,
-                                      decode_unicode=decode_unicode)
+            total = bytes_read
+            for chunk in _orig_iter(
+                chunk_size=chunk_size, decode_unicode=decode_unicode
+            ):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > limit:
+                    self.metrics.observe_oversized_response()
+                    resp.close()
+                    raise ResponseTooLargeError(
+                        f"response exceeded byte limit {limit}"
+                    )
+                yield chunk
 
-            resp.iter_content = _patched_iter  # type: ignore[method-assign]
+        resp.iter_content = _patched_iter  # type: ignore[method-assign]
 
         return peek, resp
 

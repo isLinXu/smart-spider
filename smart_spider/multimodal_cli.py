@@ -73,7 +73,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy", action="append", default=[])
     parser.add_argument("--rate", type=float, default=5.0)
     parser.add_argument("--timeout", type=int, default=15)
+    parser.add_argument("--connect-timeout", type=float, help="HTTP 连接超时秒数")
+    parser.add_argument("--read-timeout", type=float, help="HTTP 读取超时秒数")
     parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument(
+        "--max-image-bytes", type=int, default=25 * 1024 * 1024,
+        help="单张图片最大响应字节数（默认 25 MiB）",
+    )
+    parser.add_argument(
+        "--max-image-pixels", type=int, default=50_000_000,
+        help="单张图片最大解码像素数（默认 50,000,000）",
+    )
     return parser
 
 
@@ -90,6 +100,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_samples=args.max_samples,
         manifest_shard_size=args.manifest_shard_size,
         annotation_batch_size=args.annotation_batch_size,
+        max_image_bytes=args.max_image_bytes,
+        max_image_pixels=args.max_image_pixels,
         quality_report_path=args.quality_report,
         materialize_images=not args.no_materialize_images,
         allowed_modalities=modalities,
@@ -99,6 +111,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         proxies=args.proxy,
         rate=args.rate,
         timeout=args.timeout,
+        connect_timeout=args.connect_timeout,
+        read_timeout=args.read_timeout,
         max_retries=args.max_retries,
     )
     extractor = PageSampleExtractor()

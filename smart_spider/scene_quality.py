@@ -7,12 +7,47 @@ deployment without adding a YAML dependency to the crawler runtime.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from .dataset_filter import FilterThresholds, PromptSet
+
+
+@dataclass(frozen=True)
+class SignalRequirement:
+    """A detector score constraint required before an image can be accepted."""
+
+    name: str
+    minimum: Optional[float] = None
+    maximum: Optional[float] = None
+
+    def __post_init__(self):
+        if self.minimum is None and self.maximum is None:
+            raise ValueError("signal requirement needs a minimum or maximum")
+        for value in (self.minimum, self.maximum):
+            if value is not None and not 0.0 <= value <= 1.0:
+                raise ValueError("signal thresholds must be between 0 and 1")
+        if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
+            raise ValueError("signal minimum cannot exceed maximum")
+
+
+@dataclass(frozen=True)
+class SceneCalibration:
+    """Immutable identity for the held-out calibration set of one scene."""
+
+    dataset_id: str
+    version: str
+    positive_count: int = 0
+    negative_count: int = 0
+
+    def __post_init__(self):
+        if not self.dataset_id or not self.version:
+            raise ValueError("calibration dataset_id and version are required")
+        if self.positive_count < 0 or self.negative_count < 0:
+            raise ValueError("calibration counts cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -23,16 +58,42 @@ class SceneQualityProfile:
     description: str
     prompts: PromptSet
     thresholds: FilterThresholds
+    calibration: SceneCalibration
+    signal_requirements: tuple[SignalRequirement, ...] = ()
+    acceptance_score: float = 0.0
+    review_score: float = 0.0
+    version: str = "safety-gate-v1"
     review_required: bool = True
 
-    def to_dict(self) -> dict[str, Any]:
+    def __post_init__(self):
+        if not self.version:
+            raise ValueError("profile version is required")
+        if not -1.0 <= self.review_score <= self.acceptance_score <= 1.0:
+            raise ValueError("review_score and acceptance_score must be in [-1, 1]")
+
+    @property
+    def fingerprint(self) -> str:
+        payload = json.dumps(self._fingerprint_payload(), ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _fingerprint_payload(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
             "prompts": asdict(self.prompts),
             "thresholds": asdict(self.thresholds),
+            "calibration": asdict(self.calibration),
+            "signal_requirements": [asdict(item) for item in self.signal_requirements],
+            "acceptance_score": self.acceptance_score,
+            "review_score": self.review_score,
+            "version": self.version,
             "review_required": self.review_required,
         }
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self._fingerprint_payload()
+        payload["fingerprint"] = self.fingerprint
+        return payload
 
 
 def _profile(
@@ -41,6 +102,11 @@ def _profile(
     positive: tuple[str, ...],
     mismatch: tuple[str, ...],
     evidence: tuple[str, ...],
+    *,
+    thresholds: Optional[FilterThresholds] = None,
+    signals: tuple[SignalRequirement, ...] = (),
+    acceptance_score: float = 0.26,
+    review_score: float = 0.21,
 ) -> SceneQualityProfile:
     return SceneQualityProfile(
         name=name,
@@ -58,8 +124,21 @@ def _profile(
         ),
         # Safety incident datasets favor precision.  A result is still a
         # screening candidate, especially for absence-based violations.
-        thresholds=FilterThresholds.from_profile("precision"),
+        thresholds=thresholds or FilterThresholds.from_profile("precision"),
+        calibration=SceneCalibration(
+            dataset_id=f"safety-scenes/{name}", version="calibration-v1"
+        ),
+        signal_requirements=signals,
+        acceptance_score=acceptance_score,
+        review_score=review_score,
     )
+
+
+def _thresholds(**overrides: float) -> FilterThresholds:
+    """Derive independent, reviewable scene thresholds from the precision base."""
+    base = asdict(FilterThresholds.from_profile("precision"))
+    base.update(overrides)
+    return FilterThresholds(**base)
 
 
 _BUILTIN_PROFILES: dict[str, SceneQualityProfile] = {
@@ -82,6 +161,14 @@ _BUILTIN_PROFILES: dict[str, SceneQualityProfile] = {
             "a worker visibly holding a mobile phone to their ear while working",
             "a warehouse or factory worker making a phone call in an operational area",
         ),
+        thresholds=_thresholds(min_relevance=0.24, minimum_scene_evidence=0.24),
+        signals=(
+            SignalRequirement("person", minimum=0.55),
+            SignalRequirement("mobile_phone", minimum=0.45),
+            SignalRequirement("operational_area", minimum=0.45),
+        ),
+        acceptance_score=0.27,
+        review_score=0.22,
     ),
     "mobile_phone_use": _profile(
         "mobile_phone_use",
@@ -101,6 +188,14 @@ _BUILTIN_PROFILES: dict[str, SceneQualityProfile] = {
             "a worker looking at or operating a mobile smartphone in a warehouse",
             "an industrial worker holding a smartphone during an operational task",
         ),
+        thresholds=_thresholds(min_relevance=0.235, minimum_scene_evidence=0.235),
+        signals=(
+            SignalRequirement("person", minimum=0.55),
+            SignalRequirement("mobile_phone", minimum=0.42),
+            SignalRequirement("operational_area", minimum=0.42),
+        ),
+        acceptance_score=0.26,
+        review_score=0.21,
     ),
     "smoking": _profile(
         "smoking",
@@ -121,6 +216,14 @@ _BUILTIN_PROFILES: dict[str, SceneQualityProfile] = {
             "a worker visibly smoking a cigarette at an industrial workplace",
             "a person holding a cigarette with smoke visible in a warehouse or loading area",
         ),
+        thresholds=_thresholds(min_relevance=0.245, minimum_scene_evidence=0.245),
+        signals=(
+            SignalRequirement("person", minimum=0.55),
+            SignalRequirement("cigarette_or_smoke", minimum=0.42),
+            SignalRequirement("operational_area", minimum=0.4),
+        ),
+        acceptance_score=0.28,
+        review_score=0.23,
     ),
     "no_reflective_vest": _profile(
         "no_reflective_vest",
@@ -140,6 +243,15 @@ _BUILTIN_PROFILES: dict[str, SceneQualityProfile] = {
             "a full or upper-body view of a worker in a vehicle or forklift operating area without a reflective vest",
             "a clearly visible worker near material handling equipment with ordinary non-high-visibility clothing",
         ),
+        thresholds=_thresholds(min_relevance=0.25, minimum_scene_evidence=0.25),
+        signals=(
+            SignalRequirement("person", minimum=0.65),
+            SignalRequirement("upper_body", minimum=0.6),
+            SignalRequirement("operational_area", minimum=0.5),
+            SignalRequirement("reflective_vest", maximum=0.2),
+        ),
+        acceptance_score=0.29,
+        review_score=0.24,
     ),
     "forklift_driver_no_helmet": _profile(
         "forklift_driver_no_helmet",
@@ -159,6 +271,15 @@ _BUILTIN_PROFILES: dict[str, SceneQualityProfile] = {
             "a clearly visible forklift driver seated at the controls without a helmet",
             "an unobstructed view of a forklift operator head without a hard hat",
         ),
+        thresholds=_thresholds(min_relevance=0.26, minimum_scene_evidence=0.26),
+        signals=(
+            SignalRequirement("forklift", minimum=0.65),
+            SignalRequirement("forklift_operator", minimum=0.6),
+            SignalRequirement("head", minimum=0.65),
+            SignalRequirement("safety_helmet", maximum=0.2),
+        ),
+        acceptance_score=0.3,
+        review_score=0.25,
     ),
     "material_stagnation": _profile(
         "material_stagnation",
@@ -178,6 +299,14 @@ _BUILTIN_PROFILES: dict[str, SceneQualityProfile] = {
             "materials visibly left on a warehouse floor or aisle obstructing access",
             "unattended boxes or pallets blocking a passage or loading route",
         ),
+        thresholds=_thresholds(min_relevance=0.245, minimum_scene_evidence=0.245),
+        signals=(
+            SignalRequirement("materials", minimum=0.55),
+            SignalRequirement("passage_or_exit", minimum=0.5),
+            SignalRequirement("obstruction", minimum=0.45),
+        ),
+        acceptance_score=0.28,
+        review_score=0.23,
     ),
 }
 
@@ -220,6 +349,54 @@ def _string_tuple(value: Any, field_name: str, *, required: bool = False) -> tup
     return tuple(item.strip() for item in value)
 
 
+def _signal_requirements(value: Any) -> tuple[SignalRequirement, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("scene profile signal_requirements must be a list")
+    requirements: list[SignalRequirement] = []
+    for position, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"signal_requirements[{position}] must be an object")
+        unknown = set(item) - {"name", "minimum", "maximum"}
+        if unknown:
+            raise ValueError(
+                "unknown signal requirement fields: " + ", ".join(sorted(unknown))
+            )
+        name = str(item.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"signal_requirements[{position}].name is required")
+        try:
+            minimum = None if item.get("minimum") is None else float(item["minimum"])
+            maximum = None if item.get("maximum") is None else float(item["maximum"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"signal_requirements[{position}] thresholds must be numbers") from exc
+        requirements.append(SignalRequirement(name, minimum=minimum, maximum=maximum))
+    return tuple(requirements)
+
+
+def _calibration(value: Any, name: str) -> SceneCalibration:
+    if value is None:
+        return SceneCalibration(
+            dataset_id=f"custom/{name}",
+            version="unverified-custom-v1",
+        )
+    if not isinstance(value, dict):
+        raise ValueError("scene profile calibration must be an object")
+    unknown = set(value) - {"dataset_id", "version", "positive_count", "negative_count"}
+    if unknown:
+        raise ValueError("unknown calibration fields: " + ", ".join(sorted(unknown)))
+    try:
+        return SceneCalibration(
+            dataset_id=str(value.get("dataset_id") or "").strip(),
+            version=str(value.get("version") or "").strip(),
+            positive_count=int(value.get("positive_count", 0)),
+            negative_count=int(value.get("negative_count", 0)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid scene profile calibration") from exc
+
+
 def load_scene_quality_profile(path: str | Path) -> SceneQualityProfile:
     """Load a custom profile from strict JSON for calibrated deployments."""
     profile_path = Path(path).expanduser()
@@ -244,6 +421,11 @@ def load_scene_quality_profile(path: str | Path) -> SceneQualityProfile:
     name = str(payload.get("name") or profile_path.stem).strip()
     if not name:
         raise ValueError("scene profile name cannot be empty")
+    try:
+        acceptance_score = float(payload.get("acceptance_score", thresholds.get("min_relevance", 0.0)))
+        review_score = float(payload.get("review_score", acceptance_score))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("scene profile acceptance_score and review_score must be numbers") from exc
     return SceneQualityProfile(
         name=name,
         description=str(payload.get("description") or "Custom scene quality profile").strip(),
@@ -256,6 +438,11 @@ def load_scene_quality_profile(path: str | Path) -> SceneQualityProfile:
             scene_evidence=_string_tuple(prompts.get("scene_evidence"), "scene_evidence"),
         ),
         thresholds=FilterThresholds(**thresholds),
+        calibration=_calibration(payload.get("calibration"), name),
+        signal_requirements=_signal_requirements(payload.get("signal_requirements")),
+        acceptance_score=acceptance_score,
+        review_score=review_score,
+        version=str(payload.get("version") or "custom-safety-gate-v1").strip(),
         review_required=bool(payload.get("review_required", True)),
     )
 
@@ -278,5 +465,6 @@ def resolve_scene_quality_profile(
         description="Legacy cargo truck loading and door operation profile.",
         prompts=PromptSet.truck_loading(query),
         thresholds=FilterThresholds.from_profile("balanced"),
+        calibration=SceneCalibration("legacy/truck_loading", "legacy-v1"),
         review_required=True,
     )

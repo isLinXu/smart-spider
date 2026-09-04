@@ -45,3 +45,8 @@ def test_download_and_open_image_accepts_response_fallback():
     )
     assert image is not None
     assert image.mode == "RGB"
+
+
+def test_download_and_open_image_rejects_unsafe_urllib_fallback_url():
+    perception = PagePerception(enable_clip=False)
+    assert perception._download_and_open_image("file:///tmp/image.jpg") is None

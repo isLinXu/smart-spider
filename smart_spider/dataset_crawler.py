@@ -73,13 +73,13 @@ import json
 import os
 import re
 import signal
-import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional, Union
+from urllib.parse import urlsplit
 
 import numpy as np
 from loguru import logger
@@ -87,6 +87,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from .http_client import SmartHttpClient, ProxyPool
+from .image_safety import UnsafeImageError, decode_image_bytes
 from .smart_spider import (
     CrawlEvent,
     CrawlStats,
@@ -108,6 +109,15 @@ from .dataset_contracts import (
 )
 from .dataset_state import DatasetStateStore
 from .dataset_repository import DatasetRepository
+from .dataset_governance import QuotaLedger, SceneQuotaLedger, perceptual_fingerprint
+from .dataset_config import DatasetCrawlConfig
+from .dataset_layout import (
+    DatasetDirManager,
+    ManifestWriter,
+    MetadataWriter,
+    ProgressManager,
+)
+from .scene_quality import get_scene_quality_profile
 
 # torch / clip 延迟导入
 try:
@@ -133,305 +143,6 @@ _DEFAULT_DISK_GUARD_MB = 100
 _QUEUE_PUT_TIMEOUT = 5.0
 _DEFAULT_IMAGE_OUTPUT_FORMAT = "jpg"
 _DEFAULT_JPEG_QUALITY = 95
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 数据集目录管理器
-# ──────────────────────────────────────────────────────────────────────────────
-
-class DatasetDirManager:
-    """管理数据集分桶目录，每 100 张图片一个子目录。
-
-    目录命名规则：batch_0000/, batch_0100/, batch_0200/, ...
-    文件命名规则：{全局序号:04d}_{url_hash[:8]}{ext}
-
-    线程安全：所有公共方法通过内部锁保护。
-    """
-
-    def __init__(self, output_dir: str, batch_size: int = _BATCH_SIZE):
-        self.output_dir = output_dir
-        self.batch_size = batch_size
-        self._lock = threading.Lock()
-        self._saved_count = 0
-        self._next_index = 0
-        os.makedirs(output_dir, exist_ok=True)
-
-    def get_save_path(self, url: str, ext: str) -> str:
-        """获取图片保存路径，自动分配到正确的分桶目录。
-
-        Returns:
-            完整文件路径，如 /output/batch_0100/0123_a1b2c3d4.jpg
-        """
-        with self._lock:
-            idx = self._next_index
-            self._saved_count += 1
-            self._next_index += 1
-
-        batch_dir = os.path.join(
-            self.output_dir,
-            f"batch_{(idx // self.batch_size) * self.batch_size:04d}",
-        )
-        os.makedirs(batch_dir, exist_ok=True)
-
-        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
-        filename = f"{idx:04d}_{url_hash}{ext}"
-        return os.path.join(batch_dir, filename)
-
-    def save_content(
-        self,
-        url: str,
-        ext: str,
-        content: bytes,
-        max_count: Optional[int] = None,
-    ) -> Optional[tuple[int, str]]:
-        """原子保存内容并返回 ``(index, path)``。
-
-        与历史上的 ``get_save_path`` 不同，这个方法把目标数量检查、编号
-        分配和文件提交放在同一把锁中。只有 ``os.replace`` 成功后计数器才
-        增加，因此并发 worker 不会因为失败写入消耗编号，也不会超过全局
-        目标数量。
-        """
-        if not isinstance(content, (bytes, bytearray, memoryview)):
-            raise TypeError("content must be bytes-like")
-
-        with self._lock:
-            if max_count is not None and self._saved_count >= max_count:
-                return None
-
-            idx = self._next_index
-            batch_dir = os.path.join(
-                self.output_dir,
-                f"batch_{(idx // self.batch_size) * self.batch_size:04d}",
-            )
-            os.makedirs(batch_dir, exist_ok=True)
-            url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
-            final_path = os.path.join(batch_dir, f"{idx:04d}_{url_hash}{ext}")
-            temp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="wb",
-                    dir=batch_dir,
-                    prefix=f".{idx:04d}_",
-                    suffix=".tmp",
-                    delete=False,
-                ) as temp_file:
-                    temp_path = temp_file.name
-                    temp_file.write(bytes(content))
-                    temp_file.flush()
-                    os.fsync(temp_file.fileno())
-                os.replace(temp_path, final_path)
-            except Exception:
-                if temp_path:
-                    try:
-                        os.unlink(temp_path)
-                    except OSError:
-                        pass
-                raise
-
-            self._saved_count += 1
-            self._next_index = idx + 1
-            return idx, final_path
-
-    def increment(self) -> int:
-        """递增计数器并返回当前值（线程安全）。"""
-        with self._lock:
-            idx = self._next_index
-            self._saved_count += 1
-            self._next_index += 1
-            return idx
-
-    def set_existing_state(self, saved_count: int, next_index: Optional[int] = None) -> None:
-        """Restore active count without reusing indices removed by filtering."""
-        if saved_count < 0:
-            raise ValueError("saved_count must be non-negative")
-        if next_index is None:
-            next_index = saved_count
-        if next_index < saved_count:
-            raise ValueError("next_index must be >= saved_count")
-        with self._lock:
-            self._saved_count = saved_count
-            self._next_index = next_index
-
-    def record_repository_commit(self, index: int) -> None:
-        """Mirror a commit allocated by DatasetRepository."""
-        with self._lock:
-            self._saved_count += 1
-            self._next_index = max(self._next_index, index + 1)
-
-    @property
-    def saved_count(self) -> int:
-        with self._lock:
-            return self._saved_count
-
-    def current_batch_dir(self) -> str:
-        """返回当前分桶目录路径。"""
-        with self._lock:
-            idx = self._next_index
-        batch_name = f"batch_{(idx // self.batch_size) * self.batch_size:04d}"
-        return os.path.join(self.output_dir, batch_name)
-
-    def list_batches(self) -> list[str]:
-        """列出所有已创建的分桶目录。"""
-        batches = []
-        for name in sorted(os.listdir(self.output_dir)):
-            if name.startswith("batch_") and os.path.isdir(
-                os.path.join(self.output_dir, name)
-            ):
-                batches.append(name)
-        return batches
-
-    def count_existing_images(self) -> int:
-        """统计已保存的图片数量（扫描磁盘）。"""
-        count = 0
-        for name in os.listdir(self.output_dir):
-            batch_dir = os.path.join(self.output_dir, name)
-            if not os.path.isdir(batch_dir) or not name.startswith("batch_"):
-                continue
-            for fname in os.listdir(batch_dir):
-                if fname.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
-                    count += 1
-        return count
-
-    def infer_next_index(self) -> int:
-        """Return one past the largest numeric filename prefix on disk."""
-        maximum = -1
-        for name in os.listdir(self.output_dir):
-            batch_dir = os.path.join(self.output_dir, name)
-            if not os.path.isdir(batch_dir) or not name.startswith("batch_"):
-                continue
-            for filename in os.listdir(batch_dir):
-                prefix = filename.split("_", 1)[0]
-                if prefix.isdigit():
-                    maximum = max(maximum, int(prefix))
-        return maximum + 1
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 断点续传进度管理器
-# ──────────────────────────────────────────────────────────────────────────────
-
-class ProgressManager:
-    """管理数据集爬取的断点续传状态。
-
-    状态文件：{output_dir}/.dataset_progress.json
-    格式：
-    {
-        "saved_count": 1234,
-        "total_target": 5000,
-        "keywords_done": ["cat", "dog"],
-        "keywords_remaining": ["bird", "fish"],
-        "last_update": "2026-06-16T17:00:00"
-    }
-    """
-
-    def __init__(self, output_dir: str):
-        self._path = os.path.join(output_dir, ".dataset_progress.json")
-        self._lock = threading.Lock()
-        self._data: dict = {}
-
-    def load(self) -> dict:
-        """加载进度文件。"""
-        if os.path.exists(self._path):
-            try:
-                with open(self._path, "r", encoding="utf-8") as f:
-                    self._data = json.load(f)
-                logger.info(f"ProgressManager: loaded from {self._path}, "
-                           f"saved_count={self._data.get('saved_count', 0)}")
-            except Exception as e:
-                logger.warning(f"ProgressManager: failed to load {self._path}: {e}")
-                self._data = {}
-        return self._data
-
-    def save(self, saved_count: int, total_target: int,
-             keywords_done: list[str], keywords_remaining: list[str]):
-        """保存进度。"""
-        from datetime import datetime
-        with self._lock:
-            self._data = {
-                "saved_count": saved_count,
-                "total_target": total_target,
-                "keywords_done": keywords_done,
-                "keywords_remaining": keywords_remaining,
-                "last_update": datetime.now().isoformat(),
-            }
-        try:
-            with open(self._path, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"ProgressManager: failed to save: {e}")
-
-    @property
-    def saved_count(self) -> int:
-        return self._data.get("saved_count", 0)
-
-    @property
-    def keywords_done(self) -> list[str]:
-        return self._data.get("keywords_done", [])
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 元数据写入器
-# ──────────────────────────────────────────────────────────────────────────────
-
-class MetadataWriter:
-    """线程安全的元数据追加写入器。
-
-    输出格式：JSONL（每行一条 JSON 记录）
-    字段：index, url, file_path, batch, keyword, source, sim, width, height, ext
-    """
-
-    def __init__(self, output_dir: str):
-        self._path = os.path.join(output_dir, "metadata.jsonl")
-        self._lock = threading.Lock()
-        self._file = open(self._path, "a", encoding="utf-8", buffering=1)
-
-    def write(self, record: dict):
-        """写入一条元数据记录。"""
-        with self._lock:
-            try:
-                self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
-            except Exception as e:
-                logger.warning(f"MetadataWriter: write error: {e}")
-
-    def close(self):
-        with self._lock:
-            try:
-                self._file.close()
-            except Exception:
-                pass
-
-    def __del__(self):
-        self.close()
-
-
-class ManifestWriter:
-    """通用多模态 manifest 写入器。
-
-    ``metadata.jsonl`` 是旧图像采集格式；这里的 ``manifest.jsonl`` 是新
-    的任务事实来源，样本可以同时包含文本、图片和其他模态资产。
-    """
-
-    def __init__(self, output_dir: str):
-        self._path = os.path.join(output_dir, "manifest.jsonl")
-        self._lock = threading.Lock()
-        self._file = open(self._path, "a", encoding="utf-8", buffering=1)
-
-    def write(self, sample: SampleRecord):
-        with self._lock:
-            try:
-                self._file.write(json.dumps(sample.to_dict(), ensure_ascii=False) + "\n")
-            except Exception as e:
-                logger.warning(f"ManifestWriter: write error: {e}")
-
-    def close(self):
-        with self._lock:
-            try:
-                self._file.close()
-            except Exception:
-                pass
-
-    def __del__(self):
-        self.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -464,9 +175,19 @@ class DatasetCrawler:
     >>> crawler.crawl()
     """
 
+    @classmethod
+    def from_config(
+        cls,
+        config: DatasetCrawlConfig,
+        *,
+        callbacks: Optional[list[Callable]] = None,
+    ) -> "DatasetCrawler":
+        """Construct from a validated ``DatasetCrawlConfig``."""
+        return cls(config=config, callbacks=callbacks)
+
     def __init__(
         self,
-        keywords: list[str],
+        keywords: Optional[list[str]] = None,
         total_count: int = 1000,
         output_dir: str = "./dataset_output",
         # 分桶参数
@@ -480,6 +201,8 @@ class DatasetCrawler:
         rate: float = 8.0,
         max_retries: int = 3,
         timeout: int = 10,
+        connect_timeout: Optional[float] = None,
+        read_timeout: Optional[float] = None,
         max_workers: int = 20,
         # 图片过滤
         min_width: int = 200,
@@ -518,11 +241,140 @@ class DatasetCrawler:
         jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
         # 大规模任务保护（追加到末尾，保持旧位置参数兼容）
         max_file_size: int = 12 * 1024 * 1024,
+        max_image_pixels: int = 50_000_000,
         use_curl_cffi: Optional[bool] = None,
         allow_private_hosts: bool = False,
+        max_inflight_pages: Optional[int] = None,
+        max_inflight_downloads: Optional[int] = None,
+        max_pending_candidates: Optional[int] = None,
+        per_domain_concurrency: int = 2,
+        memory_budget_mb: int = 512,
+        scene_targets: Optional[Mapping[str, int]] = None,
+        max_source_share: float = 1.0,
+        max_domain_share: float = 1.0,
+        config: Optional[DatasetCrawlConfig] = None,
     ):
+        if config is not None:
+            if keywords is not None:
+                raise TypeError(
+                    "DatasetCrawler() accepts either config=... or keyword args, not both"
+                )
+            cfg = config
+            keywords = list(cfg.keywords)
+            total_count = cfg.total_count
+            output_dir = cfg.output_dir
+            batch_size = cfg.batch_size
+            use_clip = cfg.use_clip
+            similarity_threshold = cfg.similarity_threshold
+            clip_model = cfg.clip_model
+            proxies = cfg.proxies
+            rate = cfg.rate
+            max_retries = cfg.max_retries
+            timeout = cfg.timeout
+            connect_timeout = cfg.connect_timeout
+            read_timeout = cfg.read_timeout
+            max_workers = cfg.max_workers
+            min_width = cfg.min_width
+            min_height = cfg.min_height
+            min_variance = cfg.min_variance
+            min_file_size = cfg.min_file_size
+            search_engines = cfg.search_engines
+            site_parsers = cfg.site_parsers
+            site_start_page = cfg.site_start_page
+            site_end_page = cfg.site_end_page
+            st_sites = cfg.st_sites
+            st_tags = cfg.st_tags
+            st_query = cfg.st_query
+            st_pages = cfg.st_pages
+            st_limit_per_site = cfg.st_limit_per_site
+            resume = cfg.resume
+            label_mode = cfg.label_mode
+            labels = cfg.labels
+            label_policy = cfg.label_policy
+            state_db = cfg.state_db
+            job_id = cfg.job_id
+            disk_guard_mb = cfg.disk_guard_mb
+            query_image = cfg.query_image
+            image_similarity_threshold = cfg.image_similarity_threshold
+            image_output_format = cfg.image_output_format
+            jpeg_quality = cfg.jpeg_quality
+            max_file_size = cfg.max_file_size
+            max_image_pixels = cfg.max_image_pixels
+            use_curl_cffi = cfg.use_curl_cffi
+            allow_private_hosts = cfg.allow_private_hosts
+            max_inflight_pages = cfg.max_inflight_pages
+            max_inflight_downloads = cfg.max_inflight_downloads
+            max_pending_candidates = cfg.max_pending_candidates
+            per_domain_concurrency = cfg.per_domain_concurrency
+            memory_budget_mb = cfg.memory_budget_mb
+            scene_targets = cfg.scene_targets
+            max_source_share = cfg.max_source_share
+            max_domain_share = cfg.max_domain_share
+        else:
+            if keywords is None:
+                raise TypeError("keywords or config is required")
+            cfg = DatasetCrawlConfig(
+                keywords=list(keywords),
+                total_count=total_count,
+                output_dir=output_dir,
+                batch_size=batch_size,
+                use_clip=use_clip,
+                similarity_threshold=similarity_threshold,
+                clip_model=clip_model,
+                proxies=proxies,
+                rate=rate,
+                max_retries=max_retries,
+                timeout=timeout,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                max_workers=max_workers,
+                min_width=min_width,
+                min_height=min_height,
+                min_variance=min_variance,
+                min_file_size=min_file_size,
+                search_engines=search_engines,
+                site_parsers=site_parsers,
+                site_start_page=site_start_page,
+                site_end_page=site_end_page,
+                st_sites=st_sites,
+                st_tags=st_tags,
+                st_query=st_query,
+                st_pages=st_pages,
+                st_limit_per_site=st_limit_per_site,
+                resume=resume,
+                label_mode=label_mode,
+                labels=labels,
+                label_policy=label_policy,
+                state_db=state_db,
+                job_id=job_id,
+                disk_guard_mb=disk_guard_mb,
+                query_image=query_image,
+                image_similarity_threshold=image_similarity_threshold,
+                image_output_format=image_output_format,
+                jpeg_quality=jpeg_quality,
+                max_file_size=max_file_size,
+                max_image_pixels=max_image_pixels,
+                use_curl_cffi=use_curl_cffi,
+                allow_private_hosts=allow_private_hosts,
+                max_inflight_pages=max_inflight_pages,
+                max_inflight_downloads=max_inflight_downloads,
+                max_pending_candidates=max_pending_candidates,
+                per_domain_concurrency=per_domain_concurrency,
+                memory_budget_mb=memory_budget_mb,
+                scene_targets=dict(scene_targets or {}),
+                max_source_share=max_source_share,
+                max_domain_share=max_domain_share,
+            )
+        self.config = cfg
         self.keywords = keywords
         self.total_count = total_count
+        if total_count <= 0:
+            raise ValueError("total_count must be positive")
+        self.scene_targets = self._normalize_scene_targets(scene_targets)
+        if self.scene_targets and sum(self.scene_targets.values()) > total_count:
+            raise ValueError("total_count cannot be lower than the sum of scene_targets")
+        self.max_source_share = float(max_source_share)
+        self.max_domain_share = float(max_domain_share)
         self.output_dir = output_dir
         self.batch_size = batch_size
         self.use_clip = use_clip
@@ -551,14 +403,52 @@ class DatasetCrawler:
             raise RuntimeError(
                 "query_image requires CLIP; remove --no-clip and install openai-clip"
             )
+        if max_workers <= 0:
+            raise ValueError("max_workers must be positive")
+        if per_domain_concurrency <= 0:
+            raise ValueError("per_domain_concurrency must be positive")
+        if memory_budget_mb <= 0:
+            raise ValueError("memory_budget_mb must be positive")
         self.max_workers = max_workers
         self.min_width = min_width
         self.min_height = min_height
         self.min_variance = min_variance
         self.min_file_size = min_file_size
-        if max_file_size < min_file_size:
-            raise ValueError("max_file_size must be >= min_file_size")
+        if max_file_size <= 0 or max_file_size < min_file_size:
+            raise ValueError("max_file_size must be positive and >= min_file_size")
+        if max_image_pixels <= 0:
+            raise ValueError("max_image_pixels must be positive")
         self.max_file_size = max_file_size
+        self.max_image_pixels = int(max_image_pixels)
+        self.memory_budget_bytes = int(memory_budget_mb * 1024 * 1024)
+        if self.memory_budget_bytes < max_file_size:
+            raise ValueError(
+                "memory budget must accommodate at least one max_file_size response"
+            )
+        memory_limited_downloads = self.memory_budget_bytes // max_file_size
+        configured_downloads = (
+            max_inflight_downloads
+            if max_inflight_downloads is not None
+            else min(max_workers, memory_limited_downloads)
+        )
+        if configured_downloads <= 0:
+            raise ValueError("max_inflight_downloads must be positive")
+        self.max_inflight_downloads = min(int(configured_downloads), memory_limited_downloads)
+        self.max_inflight_pages = int(max_inflight_pages or max_workers)
+        if self.max_inflight_pages <= 0:
+            raise ValueError("max_inflight_pages must be positive")
+        self.max_pending_candidates = int(
+            max_pending_candidates or self.max_inflight_downloads * 2
+        )
+        if self.max_pending_candidates <= 0:
+            raise ValueError("max_pending_candidates must be positive")
+        self.per_domain_concurrency = int(per_domain_concurrency)
+        self._download_slots = threading.BoundedSemaphore(self.max_inflight_downloads)
+        self._candidate_slots = threading.BoundedSemaphore(self.max_pending_candidates)
+        self._domain_slots: dict[str, threading.BoundedSemaphore] = {}
+        self._backpressure_lock = threading.Lock()
+        self._inflight_downloads = 0
+        self._inflight_candidates = 0
         self._callbacks = callbacks or []
         self._disk_guard_mb = disk_guard_mb
         self.job_id = job_id or hashlib.sha256(
@@ -585,6 +475,7 @@ class DatasetCrawler:
 
         # 采集统计
         self.stats = CrawlStats()
+        self._record_backpressure()
 
         # 目录管理器
         self._dir_manager = DatasetDirManager(output_dir, batch_size)
@@ -595,6 +486,23 @@ class DatasetCrawler:
 
         # 进度管理器
         self._progress = ProgressManager(output_dir)
+
+        resumed_scene_counts, resumed_source_counts, resumed_domain_counts = (
+            self._load_resumed_quota_counts() if resume else ({}, {}, {})
+        )
+        self._scene_quotas = SceneQuotaLedger(
+            self.scene_targets, initial_counts=resumed_scene_counts
+        )
+        self._source_quotas = QuotaLedger(
+            self.total_count,
+            max_share=self.max_source_share,
+            initial_counts=resumed_source_counts,
+        )
+        self._domain_quotas = QuotaLedger(
+            self.total_count,
+            max_share=self.max_domain_share,
+            initial_counts=resumed_domain_counts,
+        )
 
         # SQLite 状态库：传入空字符串可显式关闭，默认写入输出目录。
         self._state_store = None
@@ -607,6 +515,9 @@ class DatasetCrawler:
                 {
                     "keywords": keywords,
                     "total_count": total_count,
+                    "scene_targets": self.scene_targets,
+                    "max_source_share": self.max_source_share,
+                    "max_domain_share": self.max_domain_share,
                     "label_policy": self.label_policy.to_dict(),
                 },
             )
@@ -631,9 +542,15 @@ class DatasetCrawler:
             rate=rate,
             max_retries=max_retries,
             timeout=timeout,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_response_bytes=max_file_size,
             use_curl_cffi=use_curl_cffi,
             allow_private_hosts=allow_private_hosts,
         )
+        self.timeout = timeout
+        self.connect_timeout = connect_timeout
+        self.read_timeout = read_timeout
 
         # 搜索引擎
         if search_engines:
@@ -699,6 +616,138 @@ class DatasetCrawler:
 
     def _should_stop(self) -> bool:
         return self._shutdown_requested.is_set() or not self._check_disk_space()
+
+    @staticmethod
+    def _normalize_scene_targets(
+        scene_targets: Optional[Mapping[str, int]],
+    ) -> dict[str, int]:
+        if scene_targets is None:
+            return {}
+        if not isinstance(scene_targets, Mapping):
+            raise ValueError("scene_targets must be a mapping of scene names to counts")
+        result: dict[str, int] = {}
+        for raw_name, raw_target in scene_targets.items():
+            try:
+                name = get_scene_quality_profile(str(raw_name)).name
+            except ValueError:
+                name = str(raw_name).strip()
+            try:
+                target = int(raw_target)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid scene target for {raw_name!r}") from exc
+            if not name or target <= 0:
+                raise ValueError("scene targets need non-empty names and positive counts")
+            result[name] = result.get(name, 0) + target
+        return result
+
+    @staticmethod
+    def _scene_key(keyword: str) -> str:
+        try:
+            return get_scene_quality_profile(keyword).name
+        except ValueError:
+            return keyword.strip()
+
+    def _load_resumed_quota_counts(self) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+        scene_counts: dict[str, int] = {}
+        source_counts: dict[str, int] = {}
+        domain_counts: dict[str, int] = {}
+        path = Path(self.output_dir) / "metadata.jsonl"
+        if not path.is_file():
+            return scene_counts, source_counts, domain_counts
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for line in lines:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                scene = self._scene_key(str(record.get("keyword") or ""))
+                if scene in self.scene_targets:
+                    scene_counts[scene] = scene_counts.get(scene, 0) + 1
+                source = str(record.get("source") or "").strip()
+                if source:
+                    source_counts[source] = source_counts.get(source, 0) + 1
+                domain = (urlsplit(str(record.get("url") or "")).hostname or "").casefold()
+                if domain:
+                    domain_counts[domain] = domain_counts.get(domain, 0) + 1
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot restore quota counts from {path}: {exc}") from exc
+        return scene_counts, source_counts, domain_counts
+
+    def _scene_target_reached(self, keyword: str) -> bool:
+        return self._scene_quotas.reached(self._scene_key(keyword))
+
+    def _record_backpressure(self, *, in_flight_pages: Optional[int] = None) -> None:
+        """Expose bounded-work gauges without sampling response payloads."""
+        try:
+            import shutil
+            disk_free_bytes = shutil.disk_usage(self.output_dir).free
+        except OSError:
+            disk_free_bytes = None
+        with self._backpressure_lock:
+            active_downloads = self._inflight_downloads
+            active_candidates = self._inflight_candidates
+        self.stats.set_resource_metrics(
+            max_inflight_pages=self.max_inflight_pages,
+            in_flight_pages=in_flight_pages,
+            max_inflight_downloads=self.max_inflight_downloads,
+            in_flight_downloads=active_downloads,
+            max_pending_candidates=self.max_pending_candidates,
+            in_flight_candidates=active_candidates,
+            per_domain_concurrency=self.per_domain_concurrency,
+            max_response_bytes=self.max_file_size,
+            estimated_download_memory_bytes=active_downloads * self.max_file_size,
+            memory_budget_bytes=self.memory_budget_bytes,
+            disk_guard_bytes=self._disk_guard_mb * 1024 * 1024,
+            disk_free_bytes=disk_free_bytes,
+            configured_scene_targets=len(self.scene_targets),
+            source_quota_max_share=self.max_source_share,
+            domain_quota_max_share=self.max_domain_share,
+        )
+
+    def _acquire_candidate_slot(self) -> bool:
+        while not self._candidate_slots.acquire(timeout=0.2):
+            if self._should_stop():
+                return False
+        with self._backpressure_lock:
+            self._inflight_candidates += 1
+        self._record_backpressure()
+        return True
+
+    def _release_candidate_slot(self) -> None:
+        with self._backpressure_lock:
+            self._inflight_candidates = max(0, self._inflight_candidates - 1)
+        self._candidate_slots.release()
+        self._record_backpressure()
+
+    def _domain_slot(self, url: str) -> threading.BoundedSemaphore:
+        hostname = (urlsplit(url).hostname or "_unknown").casefold()
+        with self._backpressure_lock:
+            slot = self._domain_slots.get(hostname)
+            if slot is None:
+                slot = threading.BoundedSemaphore(self.per_domain_concurrency)
+                self._domain_slots[hostname] = slot
+            return slot
+
+    def _acquire_download_slot(self, url: str) -> Optional[threading.BoundedSemaphore]:
+        while not self._download_slots.acquire(timeout=0.2):
+            if self._should_stop():
+                return None
+        domain_slot = self._domain_slot(url)
+        while not domain_slot.acquire(timeout=0.2):
+            if self._should_stop():
+                self._download_slots.release()
+                return None
+        with self._backpressure_lock:
+            self._inflight_downloads += 1
+        self._record_backpressure()
+        return domain_slot
+
+    def _release_download_slot(self, domain_slot: threading.BoundedSemaphore) -> None:
+        with self._backpressure_lock:
+            self._inflight_downloads = max(0, self._inflight_downloads - 1)
+        domain_slot.release()
+        self._download_slots.release()
+        self._record_backpressure()
 
     def _check_disk_space(self) -> bool:
         try:
@@ -876,6 +925,22 @@ class DatasetCrawler:
             return False
         url_claimed = True
         content_claimed = False
+        scene_key = self._scene_key(keyword)
+        scene_profile = None
+        try:
+            scene_profile = get_scene_quality_profile(scene_key)
+        except ValueError:
+            pass
+        scene_semantic_threshold = (
+            scene_profile.acceptance_score
+            if scene_profile is not None
+            else self.similarity_threshold
+        )
+        source_quota_key = str(source).strip()
+        domain_quota_key = (urlsplit(url).hostname or "").casefold()
+        scene_reserved = False
+        source_reserved = False
+        domain_reserved = False
 
         candidate_id = None
         if self._state_store is not None:
@@ -908,9 +973,19 @@ class DatasetCrawler:
                     logger.warning(f"State store failure error: {state_err}")
             return False
 
+        candidate_slot_acquired = self._acquire_candidate_slot()
+        if not candidate_slot_acquired:
+            return fail("crawl_stopped_before_candidate_processing")
+        domain_slot = None
         resp = None
         full_content = None
         try:
+            domain_slot = self._acquire_download_slot(url)
+            if domain_slot is None:
+                return fail("crawl_stopped_before_download")
+            # The client is constructed with max_response_bytes=max_file_size.
+            # Keep the call signature compatible with injected test/custom
+            # clients while retaining the HTTP-level hard limit.
             peek, resp = self._http.get_stream(url, peek_bytes=8192)
             ext = _detect_ext(peek)
             if ext not in (".jpg", ".png", ".webp", ".gif", ".avif", ".avis"):
@@ -945,14 +1020,12 @@ class DatasetCrawler:
                 self.stats.inc_filtered("image")
                 return reject("file_too_small")
 
-            # 解码图片
+            # Decode under the shared decompression-bomb and pixel budget.
             try:
-                buf = BytesIO(full_content)
-                img = Image.open(buf)
-                img.verify()
-                buf.seek(0)
-                img = Image.open(buf).convert("RGB")
-            except Exception:
+                img = decode_image_bytes(
+                    full_content, max_pixels=self.max_image_pixels
+                )
+            except UnsafeImageError:
                 logger.debug(f"Image verification failed: {url[:55]}")
                 self.stats.inc_failed("image")
                 return reject("invalid_image")
@@ -984,12 +1057,17 @@ class DatasetCrawler:
                         sim = torch.nn.functional.cosine_similarity(
                             img_feat, text_feat
                         ).item()
-                        if sim < self.similarity_threshold:
+                        if sim < scene_semantic_threshold:
                             self.stats.inc_filtered("image")
                             self._emit_callback(CrawlEvent(
                                 event_type="item_filtered", keyword=keyword,
                                 media_type="image", url=url,
-                                detail={"sim": round(sim, 4), "reason": "clip_low_sim"},
+                                detail={
+                                    "sim": round(sim, 4),
+                                    "threshold": scene_semantic_threshold,
+                                    "reason": "clip_low_sim",
+                                    "scene_profile": scene_profile.name if scene_profile else None,
+                                },
                             ))
                             return reject("clip_low_sim")
                     except Exception as e:
@@ -1021,10 +1099,23 @@ class DatasetCrawler:
                 self._prepare_output_image(img, full_content, ext)
             )
 
+            # Reserve every quota immediately before materialization.  The
+            # reservation is released in finally on any failed commit.
+            if not self._scene_quotas.try_reserve(scene_key):
+                return reject("scene_target_reached")
+            scene_reserved = scene_key in self.scene_targets
+            if not self._source_quotas.try_reserve(source_quota_key):
+                return reject("source_quota_reached")
+            source_reserved = bool(source_quota_key)
+            if not self._domain_quotas.try_reserve(domain_quota_key):
+                return reject("domain_quota_reached")
+            domain_reserved = bool(domain_quota_key)
+
             label_resolution = self.label_policy.resolve(
                 self._query_label_decisions(keyword)
             )
             content_hash = hashlib.sha256(output_content).hexdigest()
+            fingerprint = perceptual_fingerprint(img)
             quality = QualityMetrics(
                 modality=Modality.IMAGE.value,
                 width=img.width,
@@ -1032,7 +1123,13 @@ class DatasetCrawler:
                 file_size=len(output_content),
                 format=output_format,
                 variance=float(np.var(arr)),
+                phash=fingerprint.phash,
                 validated=True,
+                attributes={
+                    "dhash": fingerprint.dhash,
+                    "scene_quality": scene_profile.to_dict() if scene_profile else None,
+                    "scene_semantic_threshold": scene_semantic_threshold,
+                },
             )
 
             def build_records(
@@ -1148,6 +1245,15 @@ class DatasetCrawler:
             content_claimed = False
             self._dedup.commit(url)
             url_claimed = False
+            if scene_reserved:
+                self._scene_quotas.commit(scene_key)
+                scene_reserved = False
+            if source_reserved:
+                self._source_quotas.commit(source_quota_key)
+                source_reserved = False
+            if domain_reserved:
+                self._domain_quotas.commit(domain_quota_key)
+                domain_reserved = False
 
             self.stats.inc_saved("image")
             self._emit_callback(CrawlEvent(
@@ -1178,8 +1284,18 @@ class DatasetCrawler:
                     pass
             if content_claimed and full_content is not None:
                 self._dedup.release_content(full_content)
+            if domain_reserved:
+                self._domain_quotas.release(domain_quota_key)
+            if source_reserved:
+                self._source_quotas.release(source_quota_key)
+            if scene_reserved:
+                self._scene_quotas.release(scene_key)
             if url_claimed:
                 self._dedup.release(url)
+            if domain_slot is not None:
+                self._release_download_slot(domain_slot)
+            if candidate_slot_acquired:
+                self._release_candidate_slot()
 
     # ──────────────────────────────────────────────────────────────
     # 搜索引擎爬取
@@ -1217,7 +1333,11 @@ class DatasetCrawler:
         saved_before = self._dir_manager.saved_count
 
         for engine_name in self._ordered_search_engines():
-            if self._should_stop() or self._dir_manager.saved_count >= self.total_count:
+            if (
+                self._should_stop()
+                or self._dir_manager.saved_count >= self.total_count
+                or self._scene_target_reached(keyword)
+            ):
                 break
 
             eng = get_engine(engine_name)
@@ -1231,26 +1351,52 @@ class DatasetCrawler:
 
             logger.info(f"[{engine_name}] keyword='{keyword}', pages={pages_needed}")
 
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = {}
-                for page_offset in range(0, pages_needed * eng.page_step, eng.page_step):
-                    if self._should_stop() or self._dir_manager.saved_count >= self.total_count:
-                        break
-                    url = eng.build_search_url(keyword, page_offset)
-                    future = executor.submit(self._fetch_and_process_page, url, keyword, engine_name, pbar)
-                    futures[future] = page_offset
+            page_offsets = iter(range(0, pages_needed * eng.page_step, eng.page_step))
+            page_workers = min(self.max_workers, self.max_inflight_pages)
+            page_window = page_workers
+            with ThreadPoolExecutor(max_workers=page_workers) as executor:
+                futures = set()
 
-                for future in as_completed(futures):
+                def submit_next_page() -> bool:
+                    if (
+                        self._should_stop()
+                        or self._dir_manager.saved_count >= self.total_count
+                        or self._scene_target_reached(keyword)
+                    ):
+                        return False
                     try:
-                        future.result()
-                    except Exception as e:
-                        logger.debug(f"Page processing error: {e}")
+                        page_offset = next(page_offsets)
+                    except StopIteration:
+                        return False
+                    url = eng.build_search_url(keyword, page_offset)
+                    futures.add(executor.submit(
+                        self._fetch_and_process_page, url, keyword, engine_name, pbar
+                    ))
+                    self._record_backpressure(in_flight_pages=len(futures))
+                    return True
+
+                while len(futures) < page_window and submit_next_page():
+                    pass
+                while futures:
+                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    futures.difference_update(done)
+                    for future in done:
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            logger.debug(f"Page processing error: {exc}")
+                        submit_next_page()
+                    self._record_backpressure(in_flight_pages=len(futures))
 
         return self._dir_manager.saved_count - saved_before
 
     def _fetch_and_process_page(self, url: str, keyword: str, engine_name: str, pbar: tqdm):
         """获取搜索结果页并处理其中的图片。"""
-        if self._should_stop() or self._dir_manager.saved_count >= self.total_count:
+        if (
+            self._should_stop()
+            or self._dir_manager.saved_count >= self.total_count
+            or self._scene_target_reached(keyword)
+        ):
             return
 
         eng = get_engine(engine_name)
@@ -1266,14 +1412,24 @@ class DatasetCrawler:
             return
 
         items = eng.extract_items(html)
+        discovered_count = len(items)
+        # A malformed search page can advertise thousands of URLs.  Only keep
+        # one bounded candidate window; later pages remain available if the
+        # current window is filtered out.
+        if discovered_count > self.max_pending_candidates:
+            items = items[:self.max_pending_candidates]
         self.stats.observe_source(
             engine_name,
             success=True,
-            candidates=len(items),
+            candidates=discovered_count,
             elapsed_ms=(time.monotonic() - fetch_started) * 1000,
         )
         for item in items:
-            if self._should_stop() or self._dir_manager.saved_count >= self.total_count:
+            if (
+                self._should_stop()
+                or self._dir_manager.saved_count >= self.total_count
+                or self._scene_target_reached(keyword)
+            ):
                 break
             img_url = item.get("url", "")
             if not img_url:
@@ -1312,6 +1468,11 @@ class DatasetCrawler:
             max_workers=self.max_workers,
             min_width=self.min_width,
             min_height=self.min_height,
+            timeout=self.timeout,
+            connect_timeout=self.connect_timeout,
+            read_timeout=self.read_timeout,
+            max_image_bytes=self.max_file_size,
+            max_image_pixels=self.max_image_pixels,
         )
 
         # 收集文章
@@ -1495,6 +1656,9 @@ class DatasetCrawler:
         report["image_output_format"] = self.image_output_format or "original"
         report["jpeg_quality"] = self.jpeg_quality
         report["max_file_size"] = self.max_file_size
+        report["scene_targets"] = self._scene_quotas.snapshot()
+        report["source_quotas"] = self._source_quotas.snapshot()
+        report["domain_quotas"] = self._domain_quotas.snapshot()
         report["batch_size"] = self.batch_size
         report["batches"] = self._dir_manager.list_batches()
         report["shutdown"] = self._shutdown_requested.is_set()

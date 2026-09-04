@@ -668,11 +668,30 @@ def check_engine_health(
             html = http_client.get_text(url, engine=engine_name)
         else:
             import requests as _req
-            resp = _req.get(url, timeout=timeout, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-            })
-            resp.encoding = resp.apparent_encoding or "utf-8"
-            html = resp.text
+            resp = _req.get(
+                url,
+                timeout=timeout,
+                stream=True,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            try:
+                max_health_bytes = 2 * 1024 * 1024
+                declared = resp.headers.get("Content-Length")
+                if declared and int(declared) > max_health_bytes:
+                    raise ValueError("health response exceeds 2 MiB")
+                chunks = []
+                total = 0
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_health_bytes:
+                        raise ValueError("health response exceeds 2 MiB")
+                    chunks.append(chunk)
+                encoding = getattr(resp, "encoding", None) or "utf-8"
+                html = b"".join(chunks).decode(encoding, errors="replace")
+            finally:
+                resp.close()
         items = eng.extract_items(html)
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"

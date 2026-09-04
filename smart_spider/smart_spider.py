@@ -56,7 +56,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from io import BytesIO
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 from loguru import logger
@@ -130,6 +130,7 @@ class CrawlStats:
     filtered: dict = field(default_factory=lambda: {})  # {media_type: count}
     failed: dict = field(default_factory=lambda: {})  # {media_type: count}
     source_metrics: dict = field(default_factory=lambda: {})  # {source: counters}
+    resource_metrics: dict = field(default_factory=lambda: {})  # bounded-work gauges
     pages_fetched: int = 0
     start_time: float = field(default_factory=time.monotonic)
     end_time: float = 0.0
@@ -178,6 +179,15 @@ class CrawlStats:
             if error:
                 item["last_error"] = str(error)[:500]
 
+    def set_resource_metrics(self, **metrics: Any) -> None:
+        """Store small scalar gauges; never retain response bodies or URLs."""
+        with self._lock:
+            self.resource_metrics = {
+                str(key): value
+                for key, value in metrics.items()
+                if isinstance(value, (str, int, float, bool)) or value is None
+            }
+
     @property
     def elapsed_seconds(self) -> float:
         end = self.end_time or time.monotonic()
@@ -201,6 +211,7 @@ class CrawlStats:
                 "pages_fetched": self.pages_fetched,
                 "elapsed_seconds": round(self.elapsed_seconds, 2),
                 "source_metrics": source_metrics,
+                "resource_metrics": dict(self.resource_metrics),
             }
 
 
