@@ -203,6 +203,15 @@ def main():
         help="单一原始图片域名最大占比 (0, 1]，默认不限制",
     )
     parser.add_argument(
+        "--scene-quality-gate",
+        action="store_true",
+        help="启用检测器感知的场景质量门；缺失信号进入人工复核队列",
+    )
+    parser.add_argument(
+        "--scene-review-queue",
+        help="场景质量人工复核 JSONL 路径（默认 output/scene_review_queue.jsonl）",
+    )
+    parser.add_argument(
         "--no-curl-cffi", action="store_true",
         help="禁用 curl_cffi，使用 requests 流式下载（长时间批量任务更稳健）",
     )
@@ -319,6 +328,8 @@ def main():
             scene_targets=scene_targets,
             max_source_share=args.max_source_share,
             max_domain_share=args.max_domain_share,
+            scene_quality_gate_enabled=args.scene_quality_gate,
+            scene_review_queue_path=args.scene_review_queue,
             use_curl_cffi=False if args.no_curl_cffi else None,
             allow_private_hosts=args.allow_private_hosts,
             search_engines=engines,
