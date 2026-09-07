@@ -652,10 +652,9 @@ class DatasetImageFilter:
     ) -> dict[str, Any]:
         """Find visually near-identical images with conservative safety gates.
 
-        When ``use_embedding_clusters`` is true (default), images are first
-        grouped via :func:`cluster_embeddings` (caller embeddings or a
-        deterministic perceptual signature vector), then pairwise pHash /
-        aspect / colour gates run only inside each cluster.
+        When ``embeddings`` are provided or ``use_embedding_clusters`` is true,
+        images are first grouped via :func:`cluster_embeddings`, then pairwise
+        pHash / aspect / colour gates run only inside each cluster.
         """
         if not 0 <= max_distance <= 64:
             raise ValueError("near-duplicate hash distance must be between 0 and 64")
@@ -794,7 +793,7 @@ class DatasetImageFilter:
                 "hashes": ("phash", "dhash"),
             },
             "embedding_clusters": {
-                "enabled": use_embedding_clusters,
+                "enabled": embeddings is not None or use_embedding_clusters,
                 "similarity_threshold": embedding_similarity,
                 "cluster_count": len(by_cluster),
                 "external_embeddings": embeddings is not None,
