@@ -2,6 +2,8 @@
 """Worker claim → DatasetCrawler 接线测试。"""
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from smart_spider.dataset_config import DatasetCrawlConfig
@@ -35,11 +37,79 @@ def test_worker_runs_dataset_crawl_once(tmp_path, monkeypatch):
             return cls(cfg)
 
     monkeypatch.setattr("smart_spider.worker.DatasetCrawler", FakeCrawler)
-    processed = run_worker(queue, once=True)
+    processed = run_worker(queue, once=True, worker_id="test-worker")
     assert processed == 1
     assert calls == [["cat"], "crawled"]
-    assert queue.get(enqueued.task_id).status == "succeeded"
+    done = queue.get(enqueued.task_id)
+    assert done.status == "succeeded"
+    assert done.attempts == 1
     assert queue.claim() is None
+
+
+def test_worker_failure_retries_then_dead(tmp_path, monkeypatch):
+    queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"), default_max_attempts=2)
+    config = DatasetCrawlConfig(
+        keywords=["dog"],
+        total_count=1,
+        output_dir=str(tmp_path / "out"),
+        use_clip=False,
+        state_db="",
+    )
+    enqueued = queue.enqueue(
+        "dataset_crawl", {"config": config.to_dict()}, max_attempts=2
+    )
+
+    class BoomCrawler:
+        def crawl(self):
+            raise RuntimeError("explode")
+
+        @classmethod
+        def from_config(cls, cfg, **kwargs):
+            return cls()
+
+    monkeypatch.setattr("smart_spider.worker.DatasetCrawler", BoomCrawler)
+    assert run_worker(queue, once=True) == 1
+    mid = queue.get(enqueued.task_id)
+    assert mid.status == "pending"
+    assert mid.attempts == 1
+
+    assert run_worker(queue, once=True) == 1
+    dead = queue.get(enqueued.task_id)
+    assert dead.status == "dead"
+    assert dead.attempts == 2
+
+
+def test_worker_recovers_expired_claims_before_poll(tmp_path, monkeypatch):
+    queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"), default_max_attempts=2)
+    config = DatasetCrawlConfig(
+        keywords=["bird"],
+        total_count=1,
+        output_dir=str(tmp_path / "out"),
+        use_clip=False,
+        state_db="",
+    )
+    enqueued = queue.enqueue("dataset_crawl", {"config": config.to_dict()})
+    claimed = queue.claim(lease_seconds=1, worker_id="stale")
+    assert claimed is not None
+    with queue._lock, queue._connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET lease_until=? WHERE task_id=?",
+            (time.time() - 10, enqueued.task_id),
+        )
+        conn.commit()
+
+    class FakeCrawler:
+        def crawl(self):
+            return None
+
+        @classmethod
+        def from_config(cls, cfg, **kwargs):
+            return cls()
+
+    monkeypatch.setattr("smart_spider.worker.DatasetCrawler", FakeCrawler)
+    processed = run_worker(queue, once=True, recover_every=1)
+    assert processed == 1
+    assert queue.get(enqueued.task_id).status == "succeeded"
 
 
 def test_handle_task_rejects_unknown_kind():

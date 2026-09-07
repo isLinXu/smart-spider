@@ -1,5 +1,5 @@
 # coding=utf-8
-"""轻量任务 API 骨架（optional FastAPI，ADR-0009）。
+"""轻量任务 API（optional FastAPI，ADR-0009 / ADR-0013）。
 
 安装::
 
@@ -10,6 +10,8 @@
 
     SMART_SPIDER_API_QUEUE  队列 SQLite 路径（默认 ./runs/task_queue.sqlite3）
     SMART_SPIDER_API_STORE  对象存储根目录（默认 ./runs/objects）
+    SMART_SPIDER_QUEUE_BACKEND  sqlite|redis
+    SMART_SPIDER_REDIS_URL  Redis 连接串
 """
 
 import argparse
@@ -17,27 +19,38 @@ import os
 from typing import Any, Dict, Optional
 
 from .dataset_config import DatasetCrawlConfig
-from .pipeline import LocalFilesystemObjectStore, LocalSqliteTaskQueue, TaskRecord
+from .pipeline import LocalFilesystemObjectStore, TaskRecord, get_object_store, get_task_queue
 
 
 def create_app(
-    queue: Optional[LocalSqliteTaskQueue] = None,
-    store: Optional[LocalFilesystemObjectStore] = None,
+    queue=None,
+    store=None,
 ):
     """构建 FastAPI app；未安装 fastapi 时抛出 ImportError。"""
     try:
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, Query
     except ImportError as exc:
         raise ImportError(
             "smart-spider API requires fastapi; install with: pip install -e '.[api]'"
         ) from exc
 
-    queue = queue or LocalSqliteTaskQueue(
-        os.environ.get("SMART_SPIDER_API_QUEUE", os.path.join("runs", "task_queue.sqlite3"))
-    )
-    store = store or LocalFilesystemObjectStore(
-        os.environ.get("SMART_SPIDER_API_STORE", os.path.join("runs", "objects"))
-    )
+    if queue is None:
+        backend = os.environ.get("SMART_SPIDER_QUEUE_BACKEND", "sqlite")
+        if backend == "redis":
+            queue = get_task_queue("redis", url=os.environ.get("SMART_SPIDER_REDIS_URL"))
+        else:
+            queue = get_task_queue(
+                "sqlite",
+                path=os.environ.get(
+                    "SMART_SPIDER_API_QUEUE",
+                    os.path.join("runs", "task_queue.sqlite3"),
+                ),
+            )
+    if store is None:
+        store = get_object_store(
+            "fs",
+            root=os.environ.get("SMART_SPIDER_API_STORE", os.path.join("runs", "objects")),
+        )
 
     def _to_response(record: TaskRecord) -> Dict[str, Any]:
         return {
@@ -46,6 +59,12 @@ def create_app(
             "status": record.status,
             "error": record.error,
             "payload": record.payload,
+            "attempts": record.attempts,
+            "max_attempts": record.max_attempts,
+            "lease_until": record.lease_until,
+            "claimed_by": record.claimed_by,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
         }
 
     app = FastAPI(title="smart-spider", version="2.2.0")
@@ -63,11 +82,33 @@ def create_app(
             config = DatasetCrawlConfig.from_mapping(raw)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        max_attempts = int(payload.get("max_attempts") or 3)
         record = queue.enqueue(
             "dataset_crawl",
             {"config": config.to_dict()},
+            max_attempts=max_attempts,
         )
         return _to_response(record)
+
+    @app.get("/v1/jobs")
+    def list_jobs(
+        status: Optional[str] = None,
+        kind: Optional[str] = None,
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+    ) -> Dict[str, Any]:
+        try:
+            records = queue.list_tasks(
+                status=status, kind=kind, limit=limit, offset=offset
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "items": [_to_response(item) for item in records],
+            "count": len(records),
+            "limit": limit,
+            "offset": offset,
+        }
 
     @app.get("/v1/jobs/{task_id}")
     def get_job(task_id: str) -> Dict[str, Any]:
@@ -76,10 +117,39 @@ def create_app(
             raise HTTPException(status_code=404, detail="task not found")
         return _to_response(record)
 
+    @app.post("/v1/jobs/{task_id}/retry")
+    def retry_job(
+        task_id: str,
+        reset_attempts: bool = False,
+    ) -> Dict[str, Any]:
+        try:
+            record = queue.retry(task_id, reset_attempts=reset_attempts)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="task not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _to_response(record)
+
     @app.post("/v1/worker/claim")
-    def worker_claim(kind: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        record = queue.claim(kind=kind)
+    def worker_claim(
+        kind: Optional[str] = None,
+        lease_seconds: float = 300.0,
+        worker_id: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            record = queue.claim(
+                kind=kind,
+                lease_seconds=lease_seconds,
+                worker_id=worker_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return None if record is None else _to_response(record)
+
+    @app.post("/v1/worker/recover")
+    def worker_recover() -> Dict[str, Any]:
+        recovered = queue.recover_expired_claims()
+        return {"recovered": int(recovered)}
 
     @app.post("/v1/jobs/{task_id}/complete")
     def complete_job(task_id: str, error: str = "") -> Dict[str, Any]:

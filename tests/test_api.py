@@ -33,18 +33,51 @@ def test_api_health_and_dataset_job(tmp_path):
                 "total_count": 1,
                 "output_dir": str(tmp_path / "out"),
                 "use_clip": False,
-            }
+            },
+            "max_attempts": 2,
         },
     )
     assert ok.status_code == 200
-    task_id = ok.json()["task_id"]
+    body = ok.json()
+    task_id = body["task_id"]
+    assert body["max_attempts"] == 2
+    assert body["attempts"] == 0
     got = client.get(f"/v1/jobs/{task_id}")
     assert got.status_code == 200
     assert got.json()["status"] == "pending"
 
-    claimed = client.post("/v1/worker/claim", params={"kind": "dataset_crawl"})
+    listed = client.get("/v1/jobs", params={"kind": "dataset_crawl"})
+    assert listed.status_code == 200
+    assert listed.json()["count"] == 1
+    assert listed.json()["items"][0]["task_id"] == task_id
+
+    claimed = client.post(
+        "/v1/worker/claim",
+        params={"kind": "dataset_crawl", "worker_id": "api-worker", "lease_seconds": 60},
+    )
     assert claimed.status_code == 200
     assert claimed.json()["task_id"] == task_id
+    assert claimed.json()["claimed_by"] == "api-worker"
+    assert claimed.json()["attempts"] == 1
 
+    failed = client.post(f"/v1/jobs/{task_id}/complete", params={"error": "boom"})
+    assert failed.json()["status"] == "pending"
+
+    claimed2 = client.post("/v1/worker/claim", params={"kind": "dataset_crawl"})
+    assert claimed2.json()["attempts"] == 2
+    dead = client.post(f"/v1/jobs/{task_id}/complete", params={"error": "boom2"})
+    assert dead.json()["status"] == "dead"
+
+    retried = client.post(f"/v1/jobs/{task_id}/retry", params={"reset_attempts": True})
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "pending"
+    assert retried.json()["attempts"] == 0
+
+    recovered = client.post("/v1/worker/recover")
+    assert recovered.status_code == 200
+    assert recovered.json()["recovered"] == 0
+
+    claimed3 = client.post("/v1/worker/claim", params={"kind": "dataset_crawl"})
     done = client.post(f"/v1/jobs/{task_id}/complete")
     assert done.json()["status"] == "succeeded"
+    assert claimed3.json()["task_id"] == task_id

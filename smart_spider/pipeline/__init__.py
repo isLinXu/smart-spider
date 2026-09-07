@@ -18,11 +18,19 @@ def get_task_queue(backend: str = "sqlite", **kwargs):
     """按名称构造 TaskQueue；redis 需安装 ``.[redis]``。"""
     if backend in {"sqlite", "local", ""}:
         path = kwargs.get("path") or kwargs.get("db_path") or "runs/task_queue.sqlite3"
-        return LocalSqliteTaskQueue(path)
+        return LocalSqliteTaskQueue(
+            path,
+            default_max_attempts=int(kwargs.get("default_max_attempts") or 3),
+        )
     if backend == "redis":
         from .redis_queue import RedisTaskQueue
 
-        return RedisTaskQueue(kwargs.get("url"), prefix=kwargs.get("prefix", "smart_spider"))
+        return RedisTaskQueue(
+            kwargs.get("url"),
+            prefix=kwargs.get("prefix", "smart_spider"),
+            default_max_attempts=int(kwargs.get("default_max_attempts") or 3),
+            client=kwargs.get("client"),
+        )
     raise ValueError(f"unknown task queue backend: {backend}")
 
 

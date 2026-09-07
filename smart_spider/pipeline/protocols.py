@@ -1,9 +1,16 @@
 # coding=utf-8
-"""队列与对象存储插件协议（ADR-0009）。"""
+"""队列与对象存储插件协议（ADR-0009 / ADR-0013）。"""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Optional, Protocol, runtime_checkable
+from dataclasses import asdict, dataclass, field
+from typing import Any, Optional, Protocol, Sequence, runtime_checkable
+
+# pending → running → succeeded
+#                 ↘ failed (attempt exhausted mid-flight via recover) → dead
+#                 ↘ pending (retry after failure / lease expiry)
+TASK_STATUSES = frozenset(
+    {"pending", "running", "succeeded", "failed", "dead"}
+)
 
 
 @dataclass
@@ -13,10 +20,17 @@ class TaskRecord:
     task_id: str
     kind: str
     payload: dict[str, Any] = field(default_factory=dict)
-    status: str = "pending"  # pending | running | succeeded | failed
+    status: str = "pending"
     error: str = ""
     created_at: float = 0.0
     updated_at: float = 0.0
+    attempts: int = 0
+    max_attempts: int = 3
+    lease_until: float = 0.0
+    claimed_by: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @runtime_checkable
@@ -38,16 +52,45 @@ class ObjectStore(Protocol):
 
 @runtime_checkable
 class TaskQueue(Protocol):
-    """任务队列抽象：单机 SQLite 默认，后续可换 Redis 等。"""
+    """任务队列抽象：单机 SQLite 默认，可换 Redis。"""
 
-    def enqueue(self, kind: str, payload: dict[str, Any], *, task_id: Optional[str] = None) -> TaskRecord:
+    def enqueue(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        task_id: Optional[str] = None,
+        max_attempts: int = 3,
+    ) -> TaskRecord:
         """入队并返回任务记录。"""
 
-    def claim(self, *, kind: Optional[str] = None) -> Optional[TaskRecord]:
-        """领取一条 pending 任务并标记为 running。"""
+    def claim(
+        self,
+        *,
+        kind: Optional[str] = None,
+        lease_seconds: float = 300.0,
+        worker_id: str = "",
+    ) -> Optional[TaskRecord]:
+        """领取一条 pending 任务并标记为 running（带租约）。"""
 
     def complete(self, task_id: str, *, error: str = "") -> TaskRecord:
-        """标记成功或失败。"""
+        """标记成功；失败时按 attempts/max_attempts 重试或进入 dead。"""
 
     def get(self, task_id: str) -> Optional[TaskRecord]:
         """按 id 查询。"""
+
+    def list_tasks(
+        self,
+        *,
+        status: Optional[str] = None,
+        kind: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Sequence[TaskRecord]:
+        """列出任务（最新更新优先）。"""
+
+    def recover_expired_claims(self, *, now: Optional[float] = None) -> int:
+        """回收超时 running：可重试则回 pending，否则进 dead。"""
+
+    def retry(self, task_id: str, *, reset_attempts: bool = False) -> TaskRecord:
+        """将 failed/dead 任务重新入队为 pending。"""
