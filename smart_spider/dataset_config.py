@@ -122,6 +122,18 @@ class DatasetCrawlConfig:
                 )
         if self.labels is not None:
             self.labels = [str(x).strip() for x in self.labels if str(x).strip()]
+        self.validate()
+
+    def validate(self) -> None:
+        """Cross-field constraints previously enforced only in CLI."""
+        if self.scene_quality_gate_enabled and not self.scene_targets:
+            raise ValueError(
+                "scene_quality_gate_enabled requires non-empty scene_targets"
+            )
+        if self.scene_targets and self.total_count < sum(self.scene_targets.values()):
+            raise ValueError("total_count cannot be lower than the sum of scene_targets")
+        if self.query_image and not self.use_clip:
+            raise ValueError("query_image requires use_clip=True")
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

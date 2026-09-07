@@ -14,6 +14,12 @@ from enum import Enum
 from typing import Any, Iterable, Optional
 from urllib.parse import urldefrag, urlsplit, urlunsplit
 
+CONTRACT_FORMAT_VERSION = 1
+
+
+class ContractValidationError(ValueError):
+    """Raised when a persisted data contract fails validation."""
+
 
 def utc_now() -> str:
     """返回可排序的 UTC ISO-8601 时间字符串。"""
@@ -73,17 +79,37 @@ class CandidateResource:
         data = asdict(self)
         data["modality"] = self.modality.value
         data["candidate_id"] = self.candidate_id
+        data["format_version"] = CONTRACT_FORMAT_VERSION
         return data
+
+    def validate(self) -> None:
+        if not normalize_url(self.url):
+            raise ContractValidationError("CandidateResource.url is required")
+        if not str(self.source or "").strip():
+            raise ContractValidationError("CandidateResource.source is required")
+        if not isinstance(self.modality, Modality):
+            raise ContractValidationError("CandidateResource.modality must be Modality")
+        if self.page < 0:
+            raise ContractValidationError("CandidateResource.page must be >= 0")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CandidateResource":
+        version = int(data.get("format_version", CONTRACT_FORMAT_VERSION))
+        if version != CONTRACT_FORMAT_VERSION:
+            raise ContractValidationError(
+                f"unsupported candidate format_version={version}; "
+                f"expected {CONTRACT_FORMAT_VERSION}"
+            )
         fields = {
             "url", "source", "query", "referer", "page", "title", "alt",
             "source_meta", "discovered_at",
         }
         values = {key: data[key] for key in fields if key in data}
         values["modality"] = Modality(data.get("modality", Modality.IMAGE))
-        return cls(**values)
+        item = cls(**values)
+        item.url = normalize_url(item.url)
+        item.validate()
+        return item
 
 
 @dataclass
@@ -338,6 +364,7 @@ class SampleRecord:
         if not modalities and self.file:
             modalities = [ModalityAsset(Modality.IMAGE, role="image", uri=self.file)]
         return {
+            "format_version": CONTRACT_FORMAT_VERSION,
             "id": self.sample_id,
             "file": self.file,
             "task_type": self.task_type,
@@ -349,14 +376,42 @@ class SampleRecord:
             "pipeline": self.pipeline,
         }
 
+    def validate(self) -> None:
+        if not str(self.sample_id or "").strip():
+            raise ContractValidationError("SampleRecord.sample_id is required")
+        if not self.file and not self.modalities:
+            raise ContractValidationError(
+                "SampleRecord requires file or at least one modality asset"
+            )
+        asset_ids = {
+            str(getattr(asset, "asset_id", "") or getattr(asset, "uri", "") or idx)
+            for idx, asset in enumerate(self.modalities)
+        }
+        for relation in self.relations:
+            src = str(getattr(relation, "source", "") or "")
+            dst = str(getattr(relation, "target", "") or "")
+            # Soft check: only enforce when relation endpoints look like asset ids.
+            if src and src in asset_ids and dst and dst not in asset_ids and self.modalities:
+                raise ContractValidationError(
+                    f"SampleRecord relation target missing asset: {dst}"
+                )
+        if not isinstance(self.provenance, dict) or not isinstance(self.pipeline, dict):
+            raise ContractValidationError("provenance and pipeline must be objects")
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SampleRecord":
+        version = int(data.get("format_version", CONTRACT_FORMAT_VERSION))
+        if version != CONTRACT_FORMAT_VERSION:
+            raise ContractValidationError(
+                f"unsupported sample format_version={version}; "
+                f"expected {CONTRACT_FORMAT_VERSION}"
+            )
         file = str(data.get("file", ""))
         modality_data = data.get("modalities", [])
         modalities = [ModalityAsset.from_dict(item) for item in modality_data]
         if not modalities and file:
             modalities = [ModalityAsset(Modality.IMAGE, role="image", uri=file)]
-        return cls(
+        record = cls(
             sample_id=str(data.get("id", data.get("sample_id", ""))),
             file=file,
             labels=[LabelDecision.from_dict(item) for item in data.get("labels", [])],
@@ -367,6 +422,8 @@ class SampleRecord:
             relations=[ModalityRelation.from_dict(item) for item in data.get("relations", [])],
             task_type=str(data.get("task_type", "multimodal")),
         )
+        record.validate()
+        return record
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True)

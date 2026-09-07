@@ -23,7 +23,7 @@
 git clone <repo-url>
 cd smart-spider-v260518
 
-# 基础依赖
+# 基础依赖（requirements.txt 是 pyproject.toml 的兼容入口）
 pip install -r requirements.txt
 
 # CLIP（必须从 GitHub 安装）
@@ -147,6 +147,19 @@ python -m smart_spider.dataset_cli \
 场景质量门禁会记录模型、提示词、校准集和阈值指纹；反光衣、安全帽等专用信号缺失的样本不会被自动放行，
 而是进入人工复核队列。采集完成后可使用 `smart_spider.dataset_filter` 的 `--dedupe-near` 检查 pHash/dHash
 近重复；训练集切分应通过 `smart_spider.dataset_governance.LeakageSafeSplitter` 按域名、页面、日期和图片簇分组。
+
+启用主流程质量门禁时必须显式声明场景目标。缺少专用检测器信号的样本会写入
+`scene_review_queue.jsonl`，不会进入数据集：
+
+```bash
+python -m smart_spider.dataset_cli \
+  --keywords "未穿反光衣" --scene-targets "未穿反光衣=100" \
+  --scene-quality-gate --total 100 --output ./dataset_safety
+```
+
+多模态任务同样支持 `--scene <profile> --scene-quality-gate`。浏览器与 HTTP
+路径默认拒绝 localhost、私网和保留地址；只有在明确受控的内网任务中才使用
+`--allow-private-hosts`。
 
 ## 参数说明
 
@@ -403,7 +416,14 @@ CLI / API
               └─ shared: pipeline.ObjectStore / TaskQueue（本地 FS + SQLite 默认）
 ```
 
-运行产物请放在 `dataset_*` / `output_*` / `.artifacts/` 等目录（已 gitignore）。轻量任务 API：`pip install -e ".[api]" && smart-spider-api`；worker：`smart-spider-worker`（与 API 共用 SQLite 队列）。可选插件：`pip install -e ".[redis]"` / `".[s3]"`。
+运行产物请放在 `dataset_*` / `output_*` / `.artifacts/` 等目录（已 gitignore）。轻量任务 API：`pip install -e ".[api]" && smart-spider-api`；worker：`smart-spider-worker`（与 API 共用 SQLite 队列）。可选插件：`pip install -e ".[redis]"` / `".[s3]"` / `".[config]"`（YAML）。
+
+配置文件示例：
+
+```bash
+python -m smart_spider.dataset_cli --config job.yaml --dump-config resolved.json
+python -m smart_spider.dataset_cli --config job.yaml --total 100
+```
 
 ## License
 

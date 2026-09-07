@@ -57,3 +57,16 @@ def test_dataset_crawler_rejects_mixed_config_and_keywords(tmp_path):
     )
     with pytest.raises(TypeError):
         DatasetCrawler(keywords=["x"], config=config)
+
+
+def test_dataset_crawler_quality_gate_rejects_unknown_scene(tmp_path):
+    with pytest.raises(ValueError, match="unknown scenes"):
+        DatasetCrawler(
+            keywords=["custom scene"],
+            total_count=1,
+            output_dir=str(tmp_path / "unknown-scene"),
+            use_clip=False,
+            state_db="",
+            scene_quality_gate_enabled=True,
+            scene_targets={"custom scene": 1},
+        )
