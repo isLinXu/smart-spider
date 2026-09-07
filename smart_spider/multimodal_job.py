@@ -25,7 +25,12 @@ from .dataset_contracts import (
 )
 from .dataset_state import DatasetStateStore
 from .http_client import SmartHttpClient
-from .image_safety import UnsafeImageError, decode_image_bytes
+from .image_safety import (
+    UnsafeImageError,
+    assert_header_within_budget,
+    decode_image_bytes,
+    write_bytes_with_sha256,
+)
 from .multimodal_repository import MultimodalRepository
 from .multimodal_pipeline import (
     AdaptiveSourceRouter,
@@ -96,6 +101,7 @@ class AssetStore:
         if len(content) > self.max_image_bytes:
             raise AssetMaterializationError("image exceeds max_image_bytes")
         try:
+            assert_header_within_budget(content, max_pixels=self.max_image_pixels)
             image = decode_image_bytes(content, max_pixels=self.max_image_pixels)
             image_format = (image.format or "JPEG").lower()
         except UnsafeImageError as exc:
@@ -109,22 +115,26 @@ class AssetStore:
             "gif": ".gif",
             "avif": ".avif",
         }.get(image_format, ".bin")
-        digest = hashlib.sha256(content).hexdigest()
-        relative = os.path.join("assets", digest[:2], digest + extension)
-        staging_relative = os.path.join("assets", ".staging", f"{digest}-{uuid.uuid4().hex}.tmp")
-        staging_path = os.path.join(os.path.dirname(self.root), staging_relative)
+        staging_dir = os.path.join(os.path.dirname(self.root), "assets", ".staging")
+        os.makedirs(staging_dir, exist_ok=True)
+        tmp_name = f"stage-{uuid.uuid4().hex}.tmp"
+        staging_tmp = os.path.join(staging_dir, tmp_name)
         try:
-            with open(staging_path, "xb") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
+            digest = write_bytes_with_sha256(staging_tmp, content, fsync=True)
+            staging_relative = os.path.join(
+                "assets", ".staging", f"{digest}-{uuid.uuid4().hex}.tmp"
+            )
+            staging_path = os.path.join(os.path.dirname(self.root), staging_relative)
+            os.replace(staging_tmp, staging_path)
             self._fsync_directory(os.path.dirname(staging_path))
         except Exception as exc:
-            try:
-                os.unlink(staging_path)
-            except OSError:
-                pass
+            for path in (staging_tmp,):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
             raise AssetMaterializationError(f"cannot stage image: {exc}") from exc
+        relative = os.path.join("assets", digest[:2], digest + extension)
         return StagedAsset(
             relative_path=relative,
             staging_path=staging_relative,

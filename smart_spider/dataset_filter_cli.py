@@ -37,6 +37,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--batch-size", type=int, default=32, help="CLIP batch size")
     parser.add_argument("--limit", type=int, help="Evenly sample N records for a dry run")
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Reuse decisions for unchanged files (mtime+size) from _filter_cache",
+    )
     parser.add_argument("--run-id", help="Explicit run identifier")
     parser.add_argument(
         "--profile",
@@ -323,7 +328,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         policy=policy,
         batch_size=args.batch_size,
     )
-    report = dataset_filter.run(limit=args.limit, apply=args.apply, run_id=args.run_id)
+    report = dataset_filter.run(
+        limit=args.limit,
+        apply=args.apply,
+        run_id=args.run_id,
+        incremental=args.incremental,
+    )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 

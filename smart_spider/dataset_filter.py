@@ -16,14 +16,14 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional, Protocol, Sequence
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
 
 from .image_retrieval import IMAGE_SUFFIXES
-from .dataset_governance import perceptual_fingerprint
+from .dataset_governance import cluster_embeddings, perceptual_fingerprint
 
 
 from .dataset_filter_types import (  # noqa: F401
@@ -131,6 +131,7 @@ class DatasetImageFilter:
 
     ACTIVE_RUN_FILE = ".active_filter_run.json"
     RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    INCREMENTAL_STATE_FILE = "_filter_cache/incremental_state.json"
 
     @classmethod
     def _read_active_runs(cls, dataset: Path) -> list[dict[str, Any]]:
@@ -222,50 +223,125 @@ class DatasetImageFilter:
             return [0]
         return [round(index * (total - 1) / (limit - 1)) for index in range(limit)]
 
-    def evaluate(self, *, limit: Optional[int] = None) -> tuple[list[FilterDecision], int]:
+    def evaluate(
+        self,
+        *,
+        limit: Optional[int] = None,
+        incremental: bool = False,
+    ) -> tuple[list[FilterDecision], int]:
         records = self._load_records()
         positions = self._select_positions(len(records), limit)
         decisions: list[FilterDecision] = []
+        reused = 0
+        state = self._load_incremental_state() if incremental else {"entries": {}}
+        entries: dict[str, Any] = dict(state.get("entries") or {})
         progress = tqdm(total=len(positions), desc="DatasetFilter")
         try:
-            for offset in range(0, len(positions), self.batch_size):
-                batch_positions = positions[offset:offset + self.batch_size]
-                valid: list[tuple[int, str, Image.Image]] = []
-                for position in batch_positions:
-                    raw_path = _record_path(records[position])
-                    try:
-                        absolute, relative = self._resolve_path(raw_path)
-                        with Image.open(absolute) as opened:
-                            image = opened.convert("RGB")
-                        valid.append((position, relative, image))
-                    except (FileNotFoundError, UnidentifiedImageError, OSError, ValueError) as exc:
-                        decisions.append(FilterDecision(
+            pending: list[tuple[int, str, Image.Image, dict[str, Any]]] = []
+            for position in positions:
+                raw_path = _record_path(records[position])
+                try:
+                    absolute, relative = self._resolve_path(raw_path)
+                    fingerprint = self._file_fingerprint(absolute)
+                    cached = entries.get(relative) if incremental else None
+                    if (
+                        incremental
+                        and isinstance(cached, dict)
+                        and cached.get("mtime_ns") == fingerprint["mtime_ns"]
+                        and cached.get("size") == fingerprint["size"]
+                        and isinstance(cached.get("decision"), dict)
+                    ):
+                        decision = FilterDecision.from_dict(cached["decision"])
+                        # Positions can shift when metadata is rewritten; keep path identity.
+                        decision = FilterDecision(
                             record_position=position,
-                            path=raw_path,
-                            action="quarantine",
-                            category="invalid",
-                            reasons=("invalid_or_missing_image",),
-                            error=str(exc),
-                        ))
+                            path=relative,
+                            action=decision.action,
+                            category=decision.category,
+                            reasons=decision.reasons,
+                            scores=decision.scores,
+                            signals=decision.signals,
+                            confidence=decision.confidence,
+                            error=decision.error,
+                        )
+                        decisions.append(decision)
+                        reused += 1
                         progress.update(1)
-                if not valid:
-                    continue
-                scores = self.scorer.score_images([item[2] for item in valid])
-                if len(scores) != len(valid):
+                        continue
+                    with Image.open(absolute) as opened:
+                        image = opened.convert("RGB")
+                    pending.append((position, relative, image, fingerprint))
+                except (FileNotFoundError, UnidentifiedImageError, OSError, ValueError) as exc:
+                    decisions.append(FilterDecision(
+                        record_position=position,
+                        path=raw_path,
+                        action="quarantine",
+                        category="invalid",
+                        reasons=("invalid_or_missing_image",),
+                        error=str(exc),
+                    ))
+                    progress.update(1)
+
+            for offset in range(0, len(pending), self.batch_size):
+                batch = pending[offset:offset + self.batch_size]
+                scores = self.scorer.score_images([item[2] for item in batch])
+                if len(scores) != len(batch):
                     raise ValueError("scorer returned a row count different from input images")
-                for (position, relative, image), semantic_scores in zip(valid, scores):
+                for (position, relative, image, fingerprint), semantic_scores in zip(batch, scores):
                     signals = self.analyzer.analyze(image, semantic_scores)
-                    decisions.append(self.policy.decide(
+                    decision = self.policy.decide(
                         record_position=position,
                         path=relative,
                         scores=semantic_scores,
                         signals=signals,
-                    ))
+                    )
+                    decisions.append(decision)
+                    if incremental:
+                        entries[relative] = {
+                            **fingerprint,
+                            "decision": decision.to_dict(),
+                        }
                     progress.update(1)
         finally:
             progress.close()
         decisions.sort(key=lambda item: item.record_position)
+        if incremental:
+            self._write_incremental_state({"version": 1, "entries": entries})
+            self._last_incremental_reused = reused
+        else:
+            self._last_incremental_reused = 0
         return decisions, len(records)
+
+    @staticmethod
+    def _file_fingerprint(path: Path) -> dict[str, int]:
+        stat = path.stat()
+        return {
+            "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            "size": int(stat.st_size),
+        }
+
+    def _incremental_state_path(self) -> Path:
+        return self.dataset_dir / self.INCREMENTAL_STATE_FILE
+
+    def _load_incremental_state(self) -> dict[str, Any]:
+        path = self._incremental_state_path()
+        if not path.exists():
+            return {"version": 1, "entries": {}}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"version": 1, "entries": {}}
+        if not isinstance(payload, dict):
+            return {"version": 1, "entries": {}}
+        entries = payload.get("entries")
+        if not isinstance(entries, dict):
+            entries = {}
+        return {"version": 1, "entries": entries}
+
+    def _write_incremental_state(self, payload: dict[str, Any]) -> None:
+        path = self._incremental_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(path, payload)
 
     @staticmethod
     def _percentiles(values: Sequence[float]) -> dict[str, float]:
@@ -322,6 +398,12 @@ class DatasetImageFilter:
                 ]),
             },
         }
+        reused = int(getattr(self, "_last_incremental_reused", 0) or 0)
+        if reused:
+            report["incremental"] = {
+                "reused_decisions": reused,
+                "rescored": max(0, len(decisions) - reused),
+            }
         if hasattr(self.scorer, "cache_hits"):
             report["feature_cache"] = {
                 "enabled": getattr(self.scorer, "cache_dir", None) is not None,
@@ -423,6 +505,7 @@ class DatasetImageFilter:
         limit: Optional[int] = None,
         apply: bool = False,
         run_id: Optional[str] = None,
+        incremental: bool = False,
     ) -> dict[str, Any]:
         if apply and limit is not None:
             raise ValueError("--apply cannot be combined with --limit")
@@ -432,7 +515,7 @@ class DatasetImageFilter:
         base = "_quarantine" if apply else "_filter_runs"
         run_dir = self.dataset_dir / base / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
-        decisions, total_records = self.evaluate(limit=limit)
+        decisions, total_records = self.evaluate(limit=limit, incremental=incremental)
         records = self._load_records()
         _atomic_write_jsonl(
             run_dir / "decisions.jsonl",
@@ -563,14 +646,25 @@ class DatasetImageFilter:
         max_color_distance: float = 35.0,
         apply: bool = False,
         run_id: Optional[str] = None,
+        embedding_similarity: float = 0.98,
+        embeddings: Optional[Mapping[str, Sequence[float]]] = None,
+        use_embedding_clusters: bool = False,
     ) -> dict[str, Any]:
-        """Find visually near-identical images with conservative safety gates."""
+        """Find visually near-identical images with conservative safety gates.
+
+        When ``use_embedding_clusters`` is true (default), images are first
+        grouped via :func:`cluster_embeddings` (caller embeddings or a
+        deterministic perceptual signature vector), then pairwise pHash /
+        aspect / colour gates run only inside each cluster.
+        """
         if not 0 <= max_distance <= 64:
             raise ValueError("near-duplicate hash distance must be between 0 and 64")
         if max_aspect_delta < 0.0:
             raise ValueError("near-duplicate aspect delta cannot be negative")
         if max_color_distance < 0.0:
             raise ValueError("near-duplicate color distance cannot be negative")
+        if not -1.0 <= embedding_similarity <= 1.0:
+            raise ValueError("embedding_similarity must be between -1 and 1")
         dataset = Path(dataset_dir).expanduser().resolve()
         if not dataset.is_dir():
             raise NotADirectoryError(f"dataset directory not found: {dataset}")
@@ -582,9 +676,7 @@ class DatasetImageFilter:
         run_dir.mkdir(parents=True, exist_ok=False)
 
         records = _read_jsonl(dataset / "metadata.jsonl")
-        representatives: list[tuple[str, int, int, float, tuple[float, float, float]]] = []
-        duplicate_groups: set[str] = set()
-        decisions: list[FilterDecision] = []
+        inspected: list[tuple[int, str, int, int, float, tuple[float, float, float]]] = []
         for position, record in enumerate(records):
             raw_path = _record_path(record)
             try:
@@ -592,51 +684,88 @@ class DatasetImageFilter:
                 phash, dhash, aspect, mean_color = cls._perceptual_signature(absolute)
             except (FileNotFoundError, UnidentifiedImageError, OSError, ValueError) as exc:
                 raise RuntimeError(f"cannot inspect near duplicate {raw_path}: {exc}") from exc
-            best: Optional[tuple[str, int, int, float]] = None
-            for original, known_phash, known_dhash, known_aspect, known_color in representatives:
-                aspect_delta = abs(aspect - known_aspect) / max(aspect, known_aspect, 1e-9)
-                if aspect_delta > max_aspect_delta:
+            inspected.append((position, relative, phash, dhash, aspect, mean_color))
+
+        if embeddings is not None or use_embedding_clusters:
+            vector_map: dict[str, Sequence[float]] = {}
+            if embeddings is not None:
+                for _, relative, *_rest in inspected:
+                    if relative not in embeddings:
+                        raise ValueError(f"missing embedding for {relative}")
+                    vector_map[relative] = embeddings[relative]
+            else:
+                # Coarse colour/aspect vectors only — bit-level pHash vectors are
+                # a poor cosine blocking key across JPEG recompressions.
+                for _, relative, _phash, _dhash, aspect, mean_color in inspected:
+                    vector_map[relative] = [
+                        float(aspect),
+                        float(mean_color[0]) / 255.0,
+                        float(mean_color[1]) / 255.0,
+                        float(mean_color[2]) / 255.0,
+                    ]
+            clusters = cluster_embeddings(
+                vector_map,
+                similarity_threshold=embedding_similarity,
+            )
+        else:
+            # Legacy all-pairs path: one cluster containing every image.
+            clusters = {relative: "all" for _, relative, *_ in inspected}
+
+        by_cluster: dict[str, list[tuple[int, str, int, int, float, tuple[float, float, float]]]] = {}
+        for item in inspected:
+            by_cluster.setdefault(clusters[item[1]], []).append(item)
+
+        decisions: list[FilterDecision] = []
+        duplicate_groups: set[str] = set()
+        for members in by_cluster.values():
+            representatives: list[tuple[str, int, int, float, tuple[float, float, float]]] = []
+            for position, relative, phash, dhash, aspect, mean_color in members:
+                best: Optional[tuple[str, int, int, float]] = None
+                for original, known_phash, known_dhash, known_aspect, known_color in representatives:
+                    aspect_delta = abs(aspect - known_aspect) / max(aspect, known_aspect, 1e-9)
+                    if aspect_delta > max_aspect_delta:
+                        continue
+                    color_distance = sum(
+                        (left - right) ** 2 for left, right in zip(mean_color, known_color)
+                    ) ** 0.5
+                    if color_distance > max_color_distance:
+                        continue
+                    phash_distance = (phash ^ known_phash).bit_count()
+                    dhash_distance = (dhash ^ known_dhash).bit_count()
+                    # A lossy JPEG re-encode can perturb one fingerprint heavily.
+                    # Either hash may nominate a duplicate; aspect and colour gates
+                    # below remain mandatory before quarantining it.
+                    distance = min(phash_distance, dhash_distance)
+                    if distance <= max_distance and (best is None or distance < best[1]):
+                        best = (original, distance, max(phash_distance, dhash_distance), color_distance)
+                if best is None:
+                    representatives.append((relative, phash, dhash, aspect, mean_color))
+                    decisions.append(FilterDecision(
+                        record_position=position,
+                        path=relative,
+                        action="keep",
+                        category="perceptually_unique",
+                        reasons=(),
+                        confidence="high",
+                    ))
                     continue
-                color_distance = sum(
-                    (left - right) ** 2 for left, right in zip(mean_color, known_color)
-                ) ** 0.5
-                if color_distance > max_color_distance:
-                    continue
-                phash_distance = (phash ^ known_phash).bit_count()
-                dhash_distance = (dhash ^ known_dhash).bit_count()
-                # A lossy JPEG re-encode can perturb one fingerprint heavily.
-                # Either hash may nominate a duplicate; aspect and colour gates
-                # below remain mandatory before quarantining it.
-                distance = min(phash_distance, dhash_distance)
-                if distance <= max_distance and (best is None or distance < best[1]):
-                    best = (original, distance, max(phash_distance, dhash_distance), color_distance)
-            if best is None:
-                representatives.append((relative, phash, dhash, aspect, mean_color))
+                original, distance, secondary_distance, color_distance = best
+                duplicate_groups.add(original)
                 decisions.append(FilterDecision(
                     record_position=position,
                     path=relative,
-                    action="keep",
-                    category="perceptually_unique",
-                    reasons=(),
-                    confidence="high",
+                    action="quarantine",
+                    category="near_duplicate",
+                    reasons=("perceptual_hash_near_duplicate",),
+                    confidence="medium",
+                    error=(
+                        f"duplicate_of={original};hamming_distance={distance};"
+                        f"secondary_hamming_distance={secondary_distance};"
+                        f"color_distance={color_distance:.3f}"
+                    ),
                 ))
-                continue
-            original, distance, secondary_distance, color_distance = best
-            duplicate_groups.add(original)
-            decisions.append(FilterDecision(
-                record_position=position,
-                path=relative,
-                action="quarantine",
-                category="near_duplicate",
-                reasons=("perceptual_hash_near_duplicate",),
-                confidence="medium",
-                error=(
-                    f"duplicate_of={original};hamming_distance={distance};"
-                    f"secondary_hamming_distance={secondary_distance};"
-                    f"color_distance={color_distance:.3f}"
-                ),
-            ))
 
+        decisions.sort(key=lambda item: item.record_position)
         _atomic_write_jsonl(
             run_dir / "decisions.jsonl",
             [decision.to_dict() for decision in decisions],
@@ -664,6 +793,12 @@ class DatasetImageFilter:
                 "max_color_distance": max_color_distance,
                 "hashes": ("phash", "dhash"),
             },
+            "embedding_clusters": {
+                "enabled": use_embedding_clusters,
+                "similarity_threshold": embedding_similarity,
+                "cluster_count": len(by_cluster),
+                "external_embeddings": embeddings is not None,
+            },
         }
         if apply:
             active_runs = cls._read_active_runs(dataset)
@@ -675,6 +810,28 @@ class DatasetImageFilter:
             report["remaining"] = len(records) - duplicate_count
         _atomic_write_json(run_dir / "report.json", report)
         return report
+
+    @staticmethod
+    def _signature_embedding(
+        phash: int,
+        dhash: int,
+        aspect: float,
+        mean_color: tuple[float, float, float],
+    ) -> list[float]:
+        """Deterministic vector used to block near-dup comparisons via clustering."""
+        bits: list[float] = []
+        for value in (phash, dhash):
+            for shift in range(64):
+                bits.append(1.0 if (value >> shift) & 1 else -1.0)
+        bits.extend(
+            [
+                float(aspect),
+                float(mean_color[0]) / 255.0,
+                float(mean_color[1]) / 255.0,
+                float(mean_color[2]) / 255.0,
+            ]
+        )
+        return bits
 
     @classmethod
     def run_review_rejections(

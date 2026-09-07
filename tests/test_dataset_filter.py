@@ -584,3 +584,57 @@ def test_qr_signal_requires_successful_decode():
     assert analyzer._detect_qr(image) is False
     detector.decoded = "https://example.com"
     assert analyzer._detect_qr(image) is True
+
+
+def test_incremental_filter_reuses_unchanged_decisions(tmp_path):
+    _write_dataset(tmp_path)
+    calls = {"n": 0}
+
+    class CountingScorer(ColorScorer):
+        def score_images(self, images):
+            calls["n"] += len(images)
+            return super().score_images(images)
+
+    filt = DatasetImageFilter(
+        tmp_path,
+        CountingScorer(),
+        ColorSignals(),
+        policy=DecisionPolicy(FilterThresholds()),
+        batch_size=2,
+    )
+    first = filt.run(run_id="incr-1", incremental=True)
+    assert first["scanned"] == 3
+    assert calls["n"] == 3
+
+    second = filt.run(run_id="incr-2", incremental=True)
+    assert second["incremental"]["reused_decisions"] == 3
+    assert second["incremental"]["rescored"] == 0
+    assert calls["n"] == 3
+
+    changed = tmp_path / "batch_0000/0000.jpg"
+    Image.new("RGB", (32, 24), (200, 10, 10)).save(changed)
+    third = filt.run(run_id="incr-3", incremental=True)
+    assert third["incremental"]["reused_decisions"] == 2
+    assert third["incremental"]["rescored"] == 1
+    assert calls["n"] == 4
+
+
+def test_near_dedupe_embedding_clusters_preserve_behavior(tmp_path):
+    _write_dataset(tmp_path)
+    near_copy = tmp_path / "batch_0000/0002.jpg"
+    Image.new("RGB", (40, 30), (220, 20, 20)).save(near_copy, quality=70)
+
+    clustered = DatasetImageFilter.run_near_dedupe(
+        tmp_path,
+        run_id="near-cluster",
+        use_embedding_clusters=True,
+        embedding_similarity=0.98,
+    )
+    baseline = DatasetImageFilter.run_near_dedupe(
+        tmp_path,
+        run_id="near-baseline",
+        use_embedding_clusters=False,
+    )
+    assert clustered["actions"]["quarantine"] == baseline["actions"]["quarantine"] == 1
+    assert clustered["embedding_clusters"]["enabled"] is True
+    assert clustered["embedding_clusters"]["cluster_count"] >= 1

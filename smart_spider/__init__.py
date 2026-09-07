@@ -78,7 +78,7 @@ from .dataset_state import DatasetStateStore
 from .dataset_repository import DatasetCommit, DatasetRepository
 from .http_client import HttpMetrics, ResponseTooLargeError
 from .url_policy import URLPolicy, UnsafeURLError
-from .image_safety import UnsafeImageError, decode_image_bytes
+from .image_safety import UnsafeImageError, decode_image_bytes, probe_image_header, assert_header_within_budget
 from .multimodal_pipeline import (
     AdaptiveSourceRouter,
     BatchAnnotationBackend,
@@ -244,6 +244,8 @@ __all__ = [
     "UnsafeURLError",
     "UnsafeImageError",
     "decode_image_bytes",
+    "probe_image_header",
+    "assert_header_within_budget",
     "PageSampleExtractor",
     "AdaptiveSourceRouter",
     "AnnotationRouter",

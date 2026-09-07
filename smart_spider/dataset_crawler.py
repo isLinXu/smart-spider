@@ -87,7 +87,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from .http_client import SmartHttpClient, ProxyPool
-from .image_safety import UnsafeImageError, decode_image_bytes
+from .image_safety import UnsafeImageError, assert_header_within_budget, decode_image_bytes
 from .smart_spider import (
     CrawlEvent,
     CrawlStats,
@@ -1110,17 +1110,37 @@ class DatasetCrawler:
                 except (TypeError, ValueError):
                     pass
 
-            # 读取完整内容
+            # 读取完整内容（流式 SHA-256；头部可提前拒掉超像素图）
             try:
+                hasher = hashlib.sha256()
+                hasher.update(peek)
+                try:
+                    assert_header_within_budget(peek, max_pixels=self.max_image_pixels)
+                except UnsafeImageError:
+                    self.stats.inc_failed("image")
+                    return reject("image_too_large_pixels")
                 chunks = [peek]
                 total_bytes = len(peek)
                 for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
                     total_bytes += len(chunk)
                     if total_bytes > self.max_file_size:
                         self.stats.inc_filtered("image")
                         return reject("file_too_large")
+                    hasher.update(chunk)
                     chunks.append(chunk)
+                    # Re-probe once the SOF / IHDR is likely present.
+                    if total_bytes < 65536 or len(chunks) == 2:
+                        try:
+                            assert_header_within_budget(
+                                b"".join(chunks), max_pixels=self.max_image_pixels
+                            )
+                        except UnsafeImageError:
+                            self.stats.inc_failed("image")
+                            return reject("image_too_large_pixels")
                 full_content = b"".join(chunks)
+                source_content_hash = hasher.hexdigest()
             except Exception as read_err:
                 logger.warning(f"Image body read failed: {url[:55]}: {read_err}")
                 return fail(f"read_error: {read_err}")
@@ -1339,6 +1359,7 @@ class DatasetCrawler:
                     candidate_id=candidate_id,
                     max_count=self.total_count,
                     build_records=build_records,
+                    source_hash=source_content_hash,
                 )
                 if commit.status != "committed":
                     return reject(

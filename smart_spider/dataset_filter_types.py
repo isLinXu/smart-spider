@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional, Protocol, Sequence
+from typing import Any, Mapping, Optional, Protocol, Sequence
 
 from PIL import Image
 
@@ -208,6 +208,45 @@ class FilterDecision:
         payload["reasons"] = list(self.reasons)
         payload["signals"]["promotion_hits"] = list(self.signals.promotion_hits)
         return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "FilterDecision":
+        raw_scores = payload.get("scores")
+        scores = None
+        if isinstance(raw_scores, dict) and raw_scores:
+            scores = SemanticScores(
+                relevance=float(raw_scores.get("relevance") or 0.0),
+                advertisement=float(raw_scores.get("advertisement") or 0.0),
+                mismatch=float(raw_scores.get("mismatch") or 0.0),
+                relevance_prompt=str(raw_scores.get("relevance_prompt") or ""),
+                advertisement_prompt=str(raw_scores.get("advertisement_prompt") or ""),
+                mismatch_prompt=str(raw_scores.get("mismatch_prompt") or ""),
+                scene_evidence=float(raw_scores.get("scene_evidence") or 0.0),
+                scene_evidence_prompt=str(raw_scores.get("scene_evidence_prompt") or ""),
+            )
+        raw_signals = payload.get("signals") or {}
+        if not isinstance(raw_signals, dict):
+            raw_signals = {}
+        promotion = raw_signals.get("promotion_hits") or ()
+        signals = VisualSignals(
+            text_area_ratio=float(raw_signals.get("text_area_ratio") or 0.0),
+            text_box_count=int(raw_signals.get("text_box_count") or 0),
+            qr_detected=bool(raw_signals.get("qr_detected")),
+            ocr_text=str(raw_signals.get("ocr_text") or ""),
+            promotion_hits=tuple(str(item) for item in promotion),
+            contact_hits=int(raw_signals.get("contact_hits") or 0),
+        )
+        return cls(
+            record_position=int(payload.get("record_position") or 0),
+            path=str(payload.get("path") or ""),
+            action=str(payload.get("action") or "keep"),
+            category=str(payload.get("category") or ""),
+            reasons=tuple(str(item) for item in (payload.get("reasons") or ())),
+            scores=scores,
+            signals=signals,
+            confidence=str(payload.get("confidence") or ""),
+            error=str(payload.get("error") or ""),
+        )
 
 
 class PromptScorer(Protocol):
