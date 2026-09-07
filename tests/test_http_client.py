@@ -236,6 +236,65 @@ class TestSmartHttpClient:
         assert mock_session.get.call_count == 3
 
     @patch("smart_spider.http_client._build_session")
+    def test_get_retries_on_503(self, mock_build, mock_ok_response):
+        mock_session = MagicMock()
+        server = MagicMock()
+        server.status_code = 503
+        mock_session.get.side_effect = [server, mock_ok_response]
+        mock_build.return_value = mock_session
+        with patch("time.sleep"):
+            client = SmartHttpClient(rate=1000.0, max_retries=3)
+            client._use_curl = False
+            resp = client.get("https://example.com")
+        assert resp.status_code == 200
+        assert mock_session.get.call_count == 2
+
+    @patch("smart_spider.http_client._build_session")
+    def test_429_honors_retry_after_cap(self, mock_build, mock_ok_response):
+        mock_session = MagicMock()
+        limited = MagicMock()
+        limited.status_code = 429
+        limited.headers = {"Retry-After": "999"}
+        mock_session.get.side_effect = [limited, mock_ok_response]
+        mock_build.return_value = mock_session
+        sleeps: list[float] = []
+
+        def _sleep(seconds):
+            sleeps.append(float(seconds))
+
+        with patch("time.sleep", side_effect=_sleep):
+            client = SmartHttpClient(rate=1000.0, max_retries=3, retry_after_cap=2.5)
+            client._use_curl = False
+            resp = client.get("https://example.com")
+        assert resp.status_code == 200
+        # First sleep is the jitter before send; Retry-After wait follows.
+        assert any(abs(value - 2.5) < 1e-6 for value in sleeps)
+
+    @patch("smart_spider.http_client._build_session")
+    def test_hard_4xx_is_not_retried(self, mock_build):
+        mock_session = MagicMock()
+        missing = MagicMock()
+        missing.status_code = 404
+        missing.content = b"missing"
+        missing.headers = {"Content-Length": "7"}
+        missing.iter_content = MagicMock(return_value=iter([b"missing"]))
+        mock_session.get.return_value = missing
+        mock_build.return_value = mock_session
+        with patch("time.sleep"):
+            client = SmartHttpClient(rate=1000.0, max_retries=3)
+            client._use_curl = False
+            resp = client.get("https://example.com/missing")
+        assert resp.status_code == 404
+        assert mock_session.get.call_count == 1
+
+    def test_retry_class_matrix(self):
+        assert SmartHttpClient._retry_class(429) == "rate_limit"
+        assert SmartHttpClient._retry_class(403) == "anti_crawl"
+        assert SmartHttpClient._retry_class(503) == "server"
+        assert SmartHttpClient._retry_class(404) == "client"
+        assert SmartHttpClient._retry_class(200) == "ok"
+
+    @patch("smart_spider.http_client._build_session")
     def test_get_raises_after_max_retries(self, mock_build):
         mock_session = MagicMock()
         mock_session.get.side_effect = req_lib.ConnectionError("connection refused")

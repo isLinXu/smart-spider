@@ -1013,7 +1013,106 @@ class DatasetStateStore:
 
     def close(self):
         with self._lock:
+            try:
+                self.checkpoint(mode="TRUNCATE")
+            except Exception:
+                pass
             self._conn.close()
+
+    def checkpoint(self, mode: str = "PASSIVE") -> dict[str, int]:
+        """Run ``PRAGMA wal_checkpoint`` and return ``(busy, log, checkpointed)``.
+
+        ``mode`` is one of PASSIVE / FULL / RESTART / TRUNCATE (SQLite spelling).
+        """
+        normalized = str(mode or "PASSIVE").strip().upper()
+        if normalized not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+            raise ValueError(f"unsupported wal checkpoint mode: {mode!r}")
+        with self._lock:
+            row = self._conn.execute(f"PRAGMA wal_checkpoint({normalized})").fetchone()
+        busy = int(row[0]) if row else 0
+        log = int(row[1]) if row and len(row) > 1 else 0
+        checkpointed = int(row[2]) if row and len(row) > 2 else 0
+        return {"busy": busy, "log": log, "checkpointed": checkpointed}
+
+    def collect_stats(self) -> dict[str, Any]:
+        """Return table counts, candidate state histogram, and WAL file size."""
+        tables = (
+            "jobs",
+            "candidates",
+            "samples",
+            "events",
+            "dataset_items",
+            "dataset_content_hashes",
+            "dataset_counters",
+            "multimodal_items",
+        )
+        with self._lock:
+            table_counts: dict[str, int] = {}
+            for table in tables:
+                try:
+                    row = self._conn.execute(
+                        f"SELECT COUNT(*) AS n FROM {table}"
+                    ).fetchone()
+                    table_counts[table] = int(row["n"] if row is not None else 0)
+                except sqlite3.Error:
+                    table_counts[table] = -1
+            state_rows = self._conn.execute(
+                """
+                SELECT state, COUNT(*) AS n
+                FROM candidates
+                GROUP BY state
+                ORDER BY state
+                """
+            ).fetchall()
+            candidate_states = {
+                str(row["state"]): int(row["n"]) for row in state_rows
+            }
+            leased = self._conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM candidates
+                WHERE state='leased'
+                  AND lease_until IS NOT NULL
+                  AND lease_until < ?
+                """,
+                (time.time(),),
+            ).fetchone()
+            expired_leases = int(leased["n"] if leased is not None else 0)
+            page_count = self._conn.execute("PRAGMA page_count").fetchone()
+            page_size = self._conn.execute("PRAGMA page_size").fetchone()
+            freelist = self._conn.execute("PRAGMA freelist_count").fetchone()
+        db_bytes = 0
+        wal_bytes = 0
+        shm_bytes = 0
+        try:
+            db_bytes = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+        except OSError:
+            db_bytes = 0
+        for suffix, target in (("-wal", "wal"), ("-shm", "shm")):
+            path = f"{self.path}{suffix}"
+            try:
+                size = os.path.getsize(path) if os.path.exists(path) else 0
+            except OSError:
+                size = 0
+            if target == "wal":
+                wal_bytes = size
+            else:
+                shm_bytes = size
+        pages = int(page_count[0]) if page_count else 0
+        psz = int(page_size[0]) if page_size else 0
+        free = int(freelist[0]) if freelist else 0
+        return {
+            "path": self.path,
+            "table_counts": table_counts,
+            "candidate_states": candidate_states,
+            "expired_leases": expired_leases,
+            "db_bytes": db_bytes,
+            "wal_bytes": wal_bytes,
+            "shm_bytes": shm_bytes,
+            "page_count": pages,
+            "page_size": psz,
+            "freelist_count": free,
+            "approx_db_bytes": pages * psz,
+        }
 
     def __enter__(self):
         return self

@@ -175,6 +175,7 @@ class QualityReport:
     task_type_counts: Counter = field(default_factory=Counter)
     label_counts: Counter = field(default_factory=Counter)
     route_counts: Counter = field(default_factory=Counter)
+    scene_decisions: Counter = field(default_factory=Counter)
     rejection_reasons: Counter = field(default_factory=Counter)
     errors: list[str] = field(default_factory=list)
 
@@ -184,6 +185,11 @@ class QualityReport:
 
     def observe_materialized_image(self, count: int = 1):
         self.materialized_images += max(0, int(count))
+
+    def observe_scene_decision(self, action: str):
+        """Record detector-backed scene gate outcomes without retaining images."""
+        if action:
+            self.scene_decisions[str(action)] += 1
 
     def observe_sample(self, sample: SampleRecord):
         self.accepted += 1
@@ -213,6 +219,7 @@ class QualityReport:
             "task_type_counts": dict(sorted(self.task_type_counts.items())),
             "label_counts": dict(sorted(self.label_counts.items())),
             "route_counts": dict(sorted(self.route_counts.items())),
+            "scene_decisions": dict(sorted(self.scene_decisions.items())),
             "rejection_reasons": dict(sorted(self.rejection_reasons.items())),
             "errors": list(self.errors),
         }

@@ -36,6 +36,13 @@ from .multimodal_pipeline import (
     StaticPageSource,
 )
 from .multimodal_scale import QualityReport, ShardedManifestWriter
+from .scene_quality_gate import (
+    JsonlSceneReviewQueue,
+    SceneQualityGate,
+    SceneSignalDetector,
+)
+from .scene_quality import get_scene_quality_profile
+from .scene_signal_detector import default_scene_signal_detector
 
 
 class AssetMaterializationError(RuntimeError):
@@ -191,6 +198,9 @@ class MultimodalJobConfig:
         Modality.WEBPAGE,
     )
     label_policy: LabelPolicy = field(default_factory=LabelPolicy)
+    scene_quality_gate_enabled: bool = False
+    scene: Optional[str] = None
+    scene_review_queue_path: Optional[str] = None
 
     def __post_init__(self):
         self.allowed_modalities = tuple(
@@ -205,6 +215,10 @@ class MultimodalJobConfig:
             raise ValueError("annotation_batch_size must be positive")
         if self.max_image_bytes <= 0 or self.max_image_pixels <= 0:
             raise ValueError("image size limits must be positive")
+        if self.scene_quality_gate_enabled and not self.scene:
+            raise ValueError("scene is required when scene quality gate is enabled")
+        if self.scene_review_queue_path is not None and not str(self.scene_review_queue_path).strip():
+            raise ValueError("scene_review_queue_path cannot be empty")
         if not self.job_id:
             self.job_id = hashlib.sha256(
                 os.path.abspath(self.output_dir).encode("utf-8")
@@ -222,6 +236,9 @@ class MultimodalJobConfig:
             "annotation_batch_size": self.annotation_batch_size,
             "allowed_modalities": [item.value for item in self.allowed_modalities],
             "label_policy": self.label_policy.to_dict(),
+            "scene_quality_gate_enabled": self.scene_quality_gate_enabled,
+            "scene": self.scene,
+            "scene_review_queue_path": self.scene_review_queue_path,
         }
 
 
@@ -235,6 +252,7 @@ class MultimodalJobReport:
     materialized_images: int = 0
     quality_report_path: str = ""
     route_counts: dict[str, int] = field(default_factory=dict)
+    scene_decisions: dict[str, int] = field(default_factory=dict)
     source_metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
@@ -255,6 +273,7 @@ class MultimodalDatasetOrchestrator:
         state_store: Optional[DatasetStateStore] = None,
         manifest_writer: Optional[MultimodalManifestWriter] = None,
         image_fetcher: Optional[Any] = None,
+        scene_signal_detector: Optional[SceneSignalDetector] = None,
     ):
         self.config = config
         os.makedirs(config.output_dir, exist_ok=True)
@@ -296,6 +315,20 @@ class MultimodalDatasetOrchestrator:
         )
         self._owns_state = state_store is None
         self._owns_manifest = manifest_writer is None
+        self.scene_quality_gate = None
+        self.scene_review_queue = None
+        self.scene_signal_detector = scene_signal_detector
+        if config.scene_quality_gate_enabled:
+            if self.scene_signal_detector is None:
+                self.scene_signal_detector = default_scene_signal_detector()
+            self.scene_quality_gate = SceneQualityGate(
+                get_scene_quality_profile(config.scene or ""),
+                detector=self.scene_signal_detector,
+            )
+            queue_path = config.scene_review_queue_path or os.path.join(
+                config.output_dir, "scene_review_queue.jsonl"
+            )
+            self.scene_review_queue = JsonlSceneReviewQueue(queue_path)
 
     def _resolve_quality_report_path(self, path: Optional[str]) -> str:
         if not path:
@@ -376,6 +409,7 @@ class MultimodalDatasetOrchestrator:
                     report.accepted += sum(1 for item in accepted if item)
                     report.rejected += sum(1 for item in accepted if not item)
         finally:
+            report.scene_decisions = dict(self.quality_report.scene_decisions)
             self.close()
         return report
 
@@ -623,6 +657,44 @@ class MultimodalDatasetOrchestrator:
         staged_assets: list[StagedAsset],
     ) -> bool:
         try:
+            if self.scene_quality_gate is not None:
+                semantic_score = self._sample_semantic_score(sample)
+                signals = sample.pipeline.get("scene_signals")
+                if not isinstance(signals, dict):
+                    signals = sample.quality.attributes.get("scene_signals", {})
+                if not isinstance(signals, dict):
+                    signals = {}
+                if self.scene_signal_detector is not None and sample.modalities:
+                    image = self._load_local_scene_image(sample)
+                    if image is not None:
+                        decision = self.scene_quality_gate.evaluate_image(
+                            image, semantic_score
+                        )
+                    else:
+                        decision = self.scene_quality_gate.evaluate(
+                            semantic_score, signals=signals
+                        )
+                else:
+                    decision = self.scene_quality_gate.evaluate(
+                        semantic_score, signals=signals
+                    )
+                sample.pipeline["scene_quality_gate"] = decision.to_dict()
+                if decision.signals:
+                    sample.quality.attributes["scene_signals"] = dict(decision.signals)
+                    sample.pipeline["scene_signals"] = dict(decision.signals)
+                if decision.action == "review":
+                    self.scene_review_queue.append(sample.sample_id, decision)
+                self.quality_report.observe_scene_decision(decision.action)
+                if decision.action != "accept":
+                    self._discard_staged_assets(staged_assets)
+                    self._reject_sample(
+                        sample,
+                        claimed,
+                        page_id,
+                        "scene_quality_review" if decision.action == "review" else "scene_quality_reject",
+                        report,
+                    )
+                    return False
             sample.labels = annotation.resolution.labels
             sample.pipeline["annotation"] = {
                 "used_backends": annotation.used_backends,
@@ -647,6 +719,35 @@ class MultimodalDatasetOrchestrator:
         except Exception as exc:
             self._reject_sample(sample, claimed, page_id, str(exc), report)
             return False
+
+    @staticmethod
+    def _sample_semantic_score(sample: SampleRecord) -> float:
+        """Read an optional upstream score, defaulting to review-safe zero."""
+        raw = sample.pipeline.get("semantic_score", sample.quality.attributes.get("semantic_score"))
+        try:
+            score = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(-1.0, min(1.0, score))
+
+    def _load_local_scene_image(self, sample: SampleRecord) -> Optional[Any]:
+        """Load a materialized image for an injected detector, if available."""
+        from PIL import Image
+
+        for asset in sample.modalities:
+            if asset.modality != Modality.IMAGE or not asset.uri:
+                continue
+            path = asset.uri
+            if not os.path.isabs(path):
+                path = os.path.join(self.config.output_dir, path)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with Image.open(path) as image:
+                    return image.convert("RGB")
+            except (OSError, ValueError):
+                return None
+        return None
 
     def _discard_staged_assets(self, staged_assets: Iterable[StagedAsset]):
         for asset in staged_assets:

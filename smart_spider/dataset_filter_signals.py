@@ -1,0 +1,160 @@
+# coding=utf-8
+"""Visual advertising signal analysis (QR / OCR / text density)."""
+from __future__ import annotations
+
+from typing import Optional
+
+import numpy as np
+from PIL import Image
+
+from .dataset_filter_types import (
+    CONTACT_PATTERNS,
+    PROMOTION_TERMS,
+    SemanticScores,
+    SignalAnalyzer,
+    VisualSignals,
+)
+
+
+class VisualSignalAnalyzer:
+    """Detect QR codes and text-heavy advertising signals with optional OCR."""
+
+    def __init__(
+        self,
+        *,
+        enable_ocr: bool = False,
+        ocr_all: bool = False,
+        ocr_candidate_text_ratio: float = 0.015,
+    ) -> None:
+        self.enable_ocr = enable_ocr
+        self.ocr_all = ocr_all
+        self.ocr_candidate_text_ratio = ocr_candidate_text_ratio
+        try:
+            import cv2
+
+            self.cv2 = cv2
+            self._qr_detector = cv2.QRCodeDetector()
+        except ImportError:
+            self.cv2 = None
+            self._qr_detector = None
+        self.pytesseract = None
+        if enable_ocr:
+            try:
+                import pytesseract
+
+                pytesseract.get_tesseract_version()
+                self.pytesseract = pytesseract
+            except (ImportError, OSError):
+                pass
+
+    def _estimate_text_area(self, image: Image.Image) -> tuple[float, int]:
+        if self.cv2 is None:
+            return 0.0, 0
+        cv2 = self.cv2
+        rgb = np.asarray(image.convert("RGB"))
+        height, width = rgb.shape[:2]
+        scale = min(1.0, 1000.0 / max(height, width))
+        if scale < 1.0:
+            rgb = cv2.resize(rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        gradient = cv2.Sobel(gray, cv2.CV_8U, 1, 0, ksize=3)
+        _, binary = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        kernel_width = max(5, int(binary.shape[1] * 0.012))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 3))
+        connected = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask = np.zeros_like(gray)
+        box_count = 0
+        image_area = float(gray.shape[0] * gray.shape[1])
+        for contour in contours:
+            x, y, box_width, box_height = cv2.boundingRect(contour)
+            box_area = box_width * box_height
+            if box_width < 12 or box_height < 4:
+                continue
+            if box_height > gray.shape[0] * 0.18 or box_area > image_area * 0.12:
+                continue
+            aspect = box_width / max(box_height, 1)
+            if not 1.2 <= aspect <= 30.0:
+                continue
+            cv2.rectangle(mask, (x, y), (x + box_width, y + box_height), 255, -1)
+            box_count += 1
+        ratio = float(np.count_nonzero(mask) / image_area) if image_area else 0.0
+        return min(ratio, 1.0), box_count
+
+    def _detect_qr(self, image: Image.Image) -> bool:
+        if self._qr_detector is None:
+            return False
+        try:
+            rgb = np.asarray(image.convert("RGB"))
+            height, width = rgb.shape[:2]
+            scale = min(1.0, 1400.0 / max(height, width))
+            if scale < 1.0:
+                rgb = self.cv2.resize(
+                    rgb, None, fx=scale, fy=scale, interpolation=self.cv2.INTER_AREA
+                )
+            decoded, _, _ = self._qr_detector.detectAndDecode(
+                rgb
+            )
+            return bool(str(decoded).strip())
+        except Exception:
+            return False
+
+    def _run_ocr(self, image: Image.Image) -> tuple[str, float, int]:
+        if not self.enable_ocr or self.pytesseract is None:
+            return "", 0.0, 0
+        resized = image.convert("RGB")
+        if max(resized.size) > 1600:
+            resized.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+        try:
+            output = self.pytesseract.image_to_data(
+                resized,
+                lang="eng",
+                config="--psm 11",
+                output_type=self.pytesseract.Output.DICT,
+            )
+        except Exception:
+            return "", 0.0, 0
+        texts: list[str] = []
+        area = 0
+        count = 0
+        for index, text in enumerate(output.get("text", [])):
+            text = str(text or "").strip()
+            try:
+                confidence = float(output["conf"][index])
+            except (KeyError, IndexError, TypeError, ValueError):
+                confidence = -1.0
+            if not text or confidence < 35:
+                continue
+            texts.append(text)
+            width = int(output["width"][index])
+            height = int(output["height"][index])
+            area += max(width, 0) * max(height, 0)
+            count += 1
+        total_area = float(resized.width * resized.height)
+        return " ".join(texts), min(area / total_area, 1.0) if total_area else 0.0, count
+
+    def analyze(
+        self,
+        image: Image.Image,
+        scores: Optional[SemanticScores] = None,
+    ) -> VisualSignals:
+        estimated_ratio, estimated_boxes = self._estimate_text_area(image)
+        qr_detected = self._detect_qr(image)
+        should_ocr = self.ocr_all or qr_detected or estimated_ratio >= self.ocr_candidate_text_ratio
+        if scores is not None and scores.ad_margin >= -0.035:
+            should_ocr = True
+        ocr_text, ocr_ratio, ocr_boxes = (
+            self._run_ocr(image) if should_ocr else ("", 0.0, 0)
+        )
+        lowered = ocr_text.casefold()
+        promotion_hits = tuple(term for term in PROMOTION_TERMS if term.casefold() in lowered)
+        contact_hits = sum(len(pattern.findall(ocr_text)) for pattern in CONTACT_PATTERNS)
+        return VisualSignals(
+            text_area_ratio=max(estimated_ratio, ocr_ratio),
+            text_box_count=max(estimated_boxes, ocr_boxes),
+            qr_detected=qr_detected,
+            ocr_text=ocr_text[:1000],
+            promotion_hits=promotion_hits,
+            contact_hits=contact_hits,
+        )
+

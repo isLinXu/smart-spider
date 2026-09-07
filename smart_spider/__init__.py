@@ -132,6 +132,11 @@ from .scene_quality import (
     resolve_scene_quality_profile,
 )
 from .scene_quality_gate import GateDecision, JsonlSceneReviewQueue, SceneQualityGate, SceneSignalDetector
+from .scene_signal_detector import (
+    HeuristicSceneSignalDetector,
+    YoloSceneSignalDetector,
+    default_scene_signal_detector,
+)
 from .dataset_governance import (
     LeakageSafeSplitter,
     PerceptualFingerprint,
@@ -288,6 +293,9 @@ __all__ = [
     "JsonlSceneReviewQueue",
     "SceneQualityGate",
     "SceneSignalDetector",
+    "HeuristicSceneSignalDetector",
+    "YoloSceneSignalDetector",
+    "default_scene_signal_detector",
     "LeakageSafeSplitter",
     "PerceptualFingerprint",
     "QuotaLedger",

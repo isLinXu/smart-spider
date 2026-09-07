@@ -78,7 +78,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Union
+from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -124,6 +124,7 @@ from .scene_quality_gate import (
     SceneQualityGate,
     SceneSignalDetector,
 )
+from .scene_signal_detector import default_scene_signal_detector
 
 # torch / clip 延迟导入
 try:
@@ -392,6 +393,25 @@ class DatasetCrawler:
         self.scene_quality_gate_enabled = bool(scene_quality_gate_enabled or scene_quality_gate)
         self.scene_signal_detector = scene_signal_detector
         self.scene_quality_gate = scene_quality_gate
+        if self.scene_quality_gate_enabled and self.scene_quality_gate is None:
+            scene_names = set(self.scene_targets)
+            scene_names.update(
+                self._scene_key(keyword) for keyword in (keywords or [])
+            )
+            unknown_scenes = []
+            for scene_name in scene_names:
+                try:
+                    get_scene_quality_profile(scene_name)
+                except ValueError:
+                    unknown_scenes.append(str(scene_name))
+            if unknown_scenes:
+                raise ValueError(
+                    "scene quality gate requires a built-in scene profile or an "
+                    "injected SceneQualityGate; unknown scenes: "
+                    + ", ".join(sorted(unknown_scenes))
+                )
+            if self.scene_signal_detector is None:
+                self.scene_signal_detector = default_scene_signal_detector()
         self.scene_review_queue: Optional[JsonlSceneReviewQueue] = None
         self._scene_quality_stats = {"accept": 0, "review": 0, "reject": 0}
         if self.scene_quality_gate_enabled:
@@ -507,9 +527,10 @@ class DatasetCrawler:
         # 目录管理器
         self._dir_manager = DatasetDirManager(output_dir, batch_size)
 
-        # 元数据写入器
-        self._metadata_writer = MetadataWriter(output_dir)
-        self._manifest_writer = ManifestWriter(output_dir)
+        # JSONL compatibility writers are opened only after repository recovery;
+        # DatasetRepository may atomically replace these files on startup.
+        self._metadata_writer = None
+        self._manifest_writer = None
 
         # 进度管理器
         self._progress = ProgressManager(output_dir)
@@ -546,7 +567,7 @@ class DatasetCrawler:
                     "max_source_share": self.max_source_share,
                     "max_domain_share": self.max_domain_share,
                     "scene_quality_gate_enabled": self.scene_quality_gate_enabled,
-                    "scene_review_queue_path": scene_review_queue_path,
+                    "scene_review_queue_path": self.scene_review_queue_path,
                     "label_policy": self.label_policy.to_dict(),
                 },
             )
@@ -556,6 +577,9 @@ class DatasetCrawler:
                 self.job_id,
                 batch_size=batch_size,
             )
+
+        self._metadata_writer = MetadataWriter(output_dir)
+        self._manifest_writer = ManifestWriter(output_dir)
 
         # URL 去重
         _dedup_path = None
@@ -1004,11 +1028,23 @@ class DatasetCrawler:
             scene_profile = get_scene_quality_profile(scene_key)
         except ValueError:
             pass
-        scene_semantic_threshold = (
-            scene_profile.acceptance_score
-            if scene_profile is not None
-            else self.similarity_threshold
-        )
+        if self.scene_quality_gate_enabled:
+            gate_profile = (
+                self.scene_quality_gate.profile
+                if self.scene_quality_gate is not None
+                else scene_profile
+            )
+            scene_semantic_threshold = (
+                gate_profile.review_score
+                if gate_profile is not None
+                else self.similarity_threshold
+            )
+        else:
+            scene_semantic_threshold = (
+                scene_profile.acceptance_score
+                if scene_profile is not None
+                else self.similarity_threshold
+            )
         source_quota_key = str(source).strip()
         domain_quota_key = (urlsplit(url).hostname or "").casefold()
         scene_reserved = False
@@ -1674,8 +1710,10 @@ class DatasetCrawler:
         if self._repository is not None:
             self._repository.close()
             self._repository = None
-        self._metadata_writer.close()
-        self._manifest_writer.close()
+        if self._metadata_writer is not None:
+            self._metadata_writer.close()
+        if self._manifest_writer is not None:
+            self._manifest_writer.close()
         self._dedup.close()
         if self._state_store is not None:
             self._state_store.close()
@@ -1759,6 +1797,11 @@ class DatasetCrawler:
         report["jpeg_quality"] = self.jpeg_quality
         report["max_file_size"] = self.max_file_size
         report["scene_targets"] = self._scene_quotas.snapshot()
+        report["scene_quality_gate"] = {
+            "enabled": self.scene_quality_gate_enabled,
+            "review_queue_path": self.scene_review_queue_path,
+            "decisions": dict(self._scene_quality_stats),
+        }
         report["source_quotas"] = self._source_quotas.snapshot()
         report["domain_quotas"] = self._domain_quotas.snapshot()
         report["batch_size"] = self.batch_size

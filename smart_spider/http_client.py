@@ -6,7 +6,7 @@
 1. **UA 指纹随机化**：每次请求随机 User-Agent + 随机 Accept-Language / Sec-CH-UA 组合
 2. **请求头完整性**：模拟真实浏览器完整 Header 集合，通过 TLS 指纹校验
 3. **代理池轮换**：支持 HTTP/SOCKS5 代理列表，按策略（轮询/随机/失败摘除）分发
-4. **指数退避重试**：遭遇 429/503/连接错误时自动等待后重试，最多 max_retries 次
+4. **分级重试**：429 尊重 Retry-After；5xx / 403 指数退避+抖动；其余 4xx 不重试
 5. **请求限速**：全局令牌桶（RateLimiter），控制每秒最大并发请求数，避免触发速率封禁
 6. **Referer 伪造**：自动为每个搜索引擎注入对应的合法 Referer
 7. **Cookie 会话保持**：每个代理维护独立 Session + Cookie jar，模拟真实会话
@@ -17,8 +17,6 @@
 import random
 import threading
 import time
-from collections import Counter
-from dataclasses import dataclass, field
 from typing import Iterator, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -83,241 +81,9 @@ _CHROME_IMPERSONATES = [
     "chrome107", "chrome104", "chrome101",
 ]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 令牌桶限速器
-# ──────────────────────────────────────────────────────────────────────────────
-
-class RateLimiter:
-    """令牌桶算法：控制全局每秒最大请求数。
-
-    修复记录
-    --------
-    - 旧版 acquire() 在「睡眠后再次加锁减 token」的路径中存在 double-lock Bug：
-      睡眠期间其他线程已补充并消耗了 token，醒来后再减会导致 token 变成负数，
-      使下一个请求需要等待更长时间（误差累积）。
-    - 新版改为「持锁计算等待时间 → 释放锁 → sleep → 再持锁消耗 token」，
-      用 condition variable 替代裸 sleep，确保唤醒后 token 状态一致。
-    """
-
-    def __init__(self, rate: float):
-        """
-        Args:
-            rate: 每秒允许的最大请求数（令牌补充速率）
-        """
-        if rate <= 0:
-            raise ValueError("rate must be positive")
-        self._rate = rate
-        self._tokens = rate
-        self._last = time.monotonic()
-        self._lock = threading.Lock()
-
-    def _refill(self):
-        """在持锁状态下补充令牌（调用方负责加锁）。"""
-        now = time.monotonic()
-        elapsed = now - self._last
-        self._last = now
-        self._tokens = min(self._rate, self._tokens + elapsed * self._rate)
-
-    def acquire(self):
-        """阻塞直到获取一个令牌（精确令牌桶，无 double-lock Bug）。"""
-        while True:
-            with self._lock:
-                self._refill()
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return
-                # 计算需等待多少秒才能补充到 1 个 token
-                wait = (1.0 - self._tokens) / self._rate
-            # 在锁外 sleep，避免持锁阻塞其他线程
-            time.sleep(wait)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 代理池
-# ──────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class ProxyEntry:
-    url: str                  # e.g. "http://user:pass@1.2.3.4:8080" 或 "socks5://..."
-    fail_count: int = 0
-    last_used: float = 0.0
-    session: Optional[requests.Session] = field(default=None, repr=False)
-    # Circuit breaker 状态字段
-    cb_state: str = field(default="closed", init=False)      # closed / open / half_open
-    cb_open_since: float = field(default=0.0, init=False)    # 进入 OPEN 状态的时刻
-
-    def as_dict(self):
-        return {"http": self.url, "https": self.url}
-
-
-class ProxyPool:
-    """线程安全的代理池，集成 Circuit Breaker 熔断模式。
-
-    熔断机制
-    --------
-    - CLOSED  → 正常工作，请求自由通过
-    - OPEN    → 连续失败超过阈值，拒绝请求进入冷却期
-    - HALF_OPEN → 冷却期满，允许一个试探请求；成功则 CLOSED，失败则回到 OPEN
-
-    相比旧版的改进
-    -------------
-    旧版 fail_count 达到 max_fail 后永久排除代理（仅在全部代理失败时暴力重置），
-    导致偶发故障的代理永远无法恢复。新版加入 recovery_timeout 冷却期，
-    代理在冷却后会自动进入 HALF_OPEN 试探恢复，无需暴力重置。
-    """
-
-    def __init__(
-        self,
-        proxies: list[str],
-        max_fail: int = 3,
-        recovery_timeout: float = 30.0,
-    ):
-        self._entries = [ProxyEntry(url=p) for p in proxies]
-        self._max_fail = max_fail
-        self._recovery_timeout = recovery_timeout
-        self._idx = 0
-        self._lock = threading.Lock()
-
-    def _is_available(self, entry: ProxyEntry) -> bool:
-        """Circuit breaker 可用性检查。"""
-        if entry.cb_state == "closed":
-            return True
-        if entry.cb_state == "open":
-            if time.monotonic() - entry.cb_open_since >= self._recovery_timeout:
-                entry.cb_state = "half_open"
-                return True
-            return False
-        # half_open: 允许试探请求
-        return True
-
-    def _active(self) -> list[ProxyEntry]:
-        return [e for e in self._entries if self._is_available(e)]
-
-    def get(self, strategy: str = "round_robin") -> Optional[ProxyEntry]:
-        """获取一个可用代理，无代理时返回 None（直连）。"""
-        with self._lock:
-            active = self._active()
-            if not active:
-                # 所有代理处于 OPEN 状态 — 强制最早失败的代理进入 HALF_OPEN
-                # 防止全部代理同时熔断导致的永久死锁
-                if self._entries:
-                    earliest = min(
-                        self._entries,
-                        key=lambda e: e.cb_open_since or float("inf"),
-                    )
-                    earliest.cb_state = "half_open"
-                    active = [earliest]
-                if not active:
-                    return None
-            if strategy == "random":
-                entry = random.choice(active)
-            else:  # round_robin
-                self._idx = self._idx % len(active)
-                entry = active[self._idx]
-                self._idx = (self._idx + 1) % len(active)
-            entry.last_used = time.monotonic()
-            return entry
-
-    def report_fail(self, entry: ProxyEntry):
-        with self._lock:
-            entry.fail_count += 1
-            if entry.fail_count >= self._max_fail:
-                entry.cb_state = "open"
-                entry.cb_open_since = time.monotonic()
-            logger.warning(
-                f"Proxy {entry.url} fail_count={entry.fail_count} cb={entry.cb_state}"
-            )
-
-    def report_success(self, entry: ProxyEntry):
-        with self._lock:
-            entry.fail_count = max(0, entry.fail_count - 1)
-            entry.cb_state = "closed"
-
-    def is_empty(self) -> bool:
-        return len(self._entries) == 0
-
-    @property
-    def circuit_states(self) -> dict[str, str]:
-        """返回各代理的 Circuit Breaker 状态（监控用）。"""
-        with self._lock:
-            return {e.url: e.cb_state for e in self._entries}
-
-
-class HttpMetrics:
-    """Thread-safe request counters and latency summary for one client."""
-
-    def __init__(self, max_latency_samples: int = 2048) -> None:
-        if max_latency_samples <= 0:
-            raise ValueError("max_latency_samples must be positive")
-        self._lock = threading.Lock()
-        self._requests = 0
-        self._successes = 0
-        self._failures = 0
-        self._bytes = 0
-        self._oversized_responses = 0
-        self._dns_rebind_rejections = 0
-        self._status = Counter()
-        self._latencies_ms: list[float] = []
-        self._max_latency_samples = max_latency_samples
-        self._latency_seen = 0
-
-    def observe(
-        self,
-        *,
-        success: bool,
-        elapsed_ms: float,
-        status_code: Optional[int] = None,
-        bytes_received: int = 0,
-    ) -> None:
-        with self._lock:
-            self._requests += 1
-            self._successes += int(success)
-            self._failures += int(not success)
-            self._bytes += max(0, int(bytes_received))
-            self._latency_seen += 1
-            latency = max(0.0, float(elapsed_ms))
-            if len(self._latencies_ms) < self._max_latency_samples:
-                self._latencies_ms.append(latency)
-            else:
-                # Reservoir sampling keeps percentile memory bounded during
-                # long-running crawls without retaining every request.
-                slot = random.randrange(self._latency_seen)
-                if slot < self._max_latency_samples:
-                    self._latencies_ms[slot] = latency
-            if status_code is not None:
-                self._status[str(int(status_code))] += 1
-
-    def observe_oversized_response(self) -> None:
-        with self._lock:
-            self._oversized_responses += 1
-
-    def observe_dns_rebind_rejection(self) -> None:
-        with self._lock:
-            self._dns_rebind_rejections += 1
-
-    def snapshot(self) -> dict:
-        with self._lock:
-            latencies = sorted(self._latencies_ms)
-            if latencies:
-                p50 = latencies[(len(latencies) - 1) // 2]
-                p95 = latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))]
-            else:
-                p50 = p95 = 0.0
-            return {
-                "requests": self._requests,
-                "successes": self._successes,
-                "failures": self._failures,
-                "bytes_received": self._bytes,
-                "oversized_responses": self._oversized_responses,
-                "dns_rebind_rejections": self._dns_rebind_rejections,
-                "status_codes": dict(sorted(self._status.items())),
-                "latency_ms": {"p50": round(p50, 2), "p95": round(p95, 2)},
-            }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Session 工厂
-# ──────────────────────────────────────────────────────────────────────────────
+from .rate_limit import RateLimiter
+from .proxy_pool import ProxyEntry, ProxyPool
+from .http_metrics import HttpMetrics
 
 def _build_session(proxy_url: Optional[str] = None) -> requests.Session:
     """创建带重试适配器的 requests.Session。"""
@@ -369,11 +135,15 @@ class SmartHttpClient:
         allow_private_hosts: bool = False,
         max_redirects: int = 5,
         metrics: Optional[HttpMetrics] = None,
+        retry_after_cap: float = 60.0,
     ):
         self._ua = UserAgent()
         self._proxy_pool = ProxyPool(proxies or [])
         self._rate_limiter = RateLimiter(rate)
         self._max_retries = max_retries
+        if retry_after_cap <= 0:
+            raise ValueError("retry_after_cap must be positive")
+        self._retry_after_cap = float(retry_after_cap)
         if timeout <= 0:
             raise ValueError("timeout must be positive")
         self._connect_timeout = float(connect_timeout or timeout)
@@ -660,6 +430,49 @@ class SmartHttpClient:
         finally:
             response.close()
 
+    @staticmethod
+    def _retry_class(status_code: int) -> str:
+        """Classify HTTP statuses for graded retries.
+
+        Returns one of ``ok``, ``rate_limit``, ``anti_crawl``, ``server``,
+        or ``client`` (hard 4xx that must not be retried).
+        """
+        code = int(status_code)
+        if code == 429:
+            return "rate_limit"
+        if code == 403:
+            return "anti_crawl"
+        if 500 <= code <= 599:
+            return "server"
+        if 400 <= code <= 499:
+            return "client"
+        return "ok"
+
+    def _retry_wait_seconds(
+        self,
+        attempt: int,
+        *,
+        kind: str,
+        response: Optional[requests.Response] = None,
+    ) -> float:
+        """Compute sleep before the next attempt for a retryable failure."""
+        backoff = (2 ** attempt) + random.uniform(0, 1)
+        if kind != "rate_limit" or response is None:
+            return backoff
+        headers = getattr(response, "headers", {}) or {}
+        raw = None
+        if hasattr(headers, "get"):
+            raw = headers.get("Retry-After") or headers.get("retry-after")
+        if raw is None:
+            return min(backoff, self._retry_after_cap)
+        try:
+            wait = float(str(raw).strip())
+        except (TypeError, ValueError):
+            return min(backoff, self._retry_after_cap)
+        if wait < 0:
+            return min(backoff, self._retry_after_cap)
+        return min(wait, self._retry_after_cap)
+
     def _request(
         self,
         method: str,
@@ -693,11 +506,16 @@ class SmartHttpClient:
                 response = self._send_with_validated_redirects(
                     method, url, headers, proxy_entry, stream, **kwargs
                 )
-                if response.status_code in (429, 403, 503):
+                kind = self._retry_class(response.status_code)
+                if kind in {"rate_limit", "anti_crawl", "server"}:
+                    wait = self._retry_wait_seconds(
+                        attempt, kind=kind, response=response
+                    )
                     self._drain_and_close(response)
                     logger.warning(
-                        f"{method} anti-crawl {response.status_code} for {url[:60]}, "
-                        f"attempt {attempt + 1}/{self._max_retries + 1}"
+                        f"{method} retryable {response.status_code} ({kind}) for "
+                        f"{url[:60]}, attempt {attempt + 1}/{self._max_retries + 1}, "
+                        f"wait={wait:.2f}s"
                     )
                     if proxy_entry:
                         self._proxy_pool.report_fail(proxy_entry)
@@ -705,42 +523,43 @@ class SmartHttpClient:
                     last_exc = requests.HTTPError(response=response)
                     if attempt >= self._max_retries:
                         break
-                else:
-                    if proxy_entry:
-                        self._proxy_pool.report_success(proxy_entry)
-                    self._record_host_success(url)
-                    received_bytes = self._declared_content_length(response) or 0
-                    if not stream:
-                        # Preserve requests' ordinary ``get().content`` API,
-                        # but make it impossible to bypass the HTTP byte cap.
-                        try:
-                            content = self.read_bounded_bytes(
-                                response,
-                                max_bytes=self.max_response_bytes,
-                                close_response=False,
-                            )
-                        except Exception:
-                            response.close()
-                            raise
-                        try:
-                            response._content = content  # type: ignore[attr-defined]
-                            response._content_consumed = True  # type: ignore[attr-defined]
-                        except Exception:
-                            # Alternative response implementations may not
-                            # expose requests' private content fields.
-                            pass
-                        # Some injected response doubles expose only a
-                        # declared length and an empty iterator. Keep that
-                        # historical metric behavior while real responses use
-                        # the bytes actually consumed above.
-                        received_bytes = len(content) or received_bytes
-                    self.metrics.observe(
-                        success=True,
-                        elapsed_ms=(time.monotonic() - started) * 1000,
-                        status_code=getattr(response, "status_code", None),
-                        bytes_received=received_bytes,
-                    )
-                    return response
+                    time.sleep(wait)
+                    continue
+                if proxy_entry:
+                    self._proxy_pool.report_success(proxy_entry)
+                self._record_host_success(url)
+                received_bytes = self._declared_content_length(response) or 0
+                if not stream:
+                    # Preserve requests' ordinary ``get().content`` API,
+                    # but make it impossible to bypass the HTTP byte cap.
+                    try:
+                        content = self.read_bounded_bytes(
+                            response,
+                            max_bytes=self.max_response_bytes,
+                            close_response=False,
+                        )
+                    except Exception:
+                        response.close()
+                        raise
+                    try:
+                        response._content = content  # type: ignore[attr-defined]
+                        response._content_consumed = True  # type: ignore[attr-defined]
+                    except Exception:
+                        # Alternative response implementations may not
+                        # expose requests' private content fields.
+                        pass
+                    # Some injected response doubles expose only a
+                    # declared length and an empty iterator. Keep that
+                    # historical metric behavior while real responses use
+                    # the bytes actually consumed above.
+                    received_bytes = len(content) or received_bytes
+                self.metrics.observe(
+                    success=True,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    status_code=getattr(response, "status_code", None),
+                    bytes_received=received_bytes,
+                )
+                return response
             except (UnsafeURLError, requests.TooManyRedirects, ResponseTooLargeError) as exc:
                 self.metrics.observe(
                     success=False,
@@ -759,8 +578,9 @@ class SmartHttpClient:
                     f"{method} error for {url[:60]}: {type(exc).__name__}: {exc}, "
                     f"retry {attempt + 2}/{self._max_retries + 1}"
                 )
-            wait = (2 ** attempt) + random.uniform(0, 1)
-            time.sleep(wait)
+                wait = self._retry_wait_seconds(attempt, kind="server")
+                time.sleep(wait)
+                continue
         self.metrics.observe(
             success=False,
             elapsed_ms=(time.monotonic() - started) * 1000,
@@ -780,9 +600,9 @@ class SmartHttpClient:
     ) -> requests.Response:
         """GET with retry, manual redirect validation, and split timeouts.
 
-        Anti-crawl statuses ``(429, 403, 503)`` are drained with
-        ``resp.iter_content()`` and closed in a ``try: ... finally:`` block via
-        ``resp.close()`` by :meth:`_drain_and_close` before a retry.
+        Retryable statuses (429 with Retry-After, 403 anti-crawl, 5xx) are
+        drained via :meth:`_drain_and_close` before the next attempt. Hard 4xx
+        responses are returned without retry.
         """
         return self._request(
             "GET", url, engine, extra_headers, stream=stream, **kwargs
