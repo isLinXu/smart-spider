@@ -43,6 +43,7 @@ class DatasetStateStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=30000")
+        self._lease_recoveries_total = 0
         self._init_schema()
 
     def _init_schema(self):
@@ -694,7 +695,16 @@ class DatasetStateStore:
                 """,
                 [now, utc_now(), *args],
             )
-            return cursor.rowcount
+            recovered = int(cursor.rowcount or 0)
+            self._lease_recoveries_total += recovered
+            if recovered:
+                self._record_event_locked(
+                    job_id or "",
+                    None,
+                    "leases_recovered",
+                    {"count": recovered},
+                )
+            return recovered
 
     def add_sample(
         self,
@@ -984,7 +994,7 @@ class DatasetStateStore:
         if self.event_payload_mode == "full":
             return payload
         compact: dict[str, Any] = {}
-        for key in ("id", "file", "url", "source", "query", "modality", "state", "error", "reason"):
+        for key in ("id", "file", "url", "source", "query", "modality", "state", "error", "reason", "count"):
             value = payload.get(key)
             if value not in (None, "", [], {}):
                 compact[key] = value
@@ -1105,6 +1115,7 @@ class DatasetStateStore:
             "table_counts": table_counts,
             "candidate_states": candidate_states,
             "expired_leases": expired_leases,
+            "lease_recoveries_total": int(self._lease_recoveries_total),
             "db_bytes": db_bytes,
             "wal_bytes": wal_bytes,
             "shm_bytes": shm_bytes,

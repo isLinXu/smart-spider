@@ -15,6 +15,7 @@ from typing import Any, Iterable, Optional
 from urllib.parse import urldefrag, urlsplit, urlunsplit
 
 CONTRACT_FORMAT_VERSION = 1
+URL_NORMALIZE_VERSION = "url-normalize-v1"
 
 
 class ContractValidationError(ValueError):

@@ -141,6 +141,11 @@ class DatasetCrawlConfig:
             data["label_policy"] = self.label_policy.to_dict()
         return data
 
+    def fingerprint(self) -> str:
+        from .dataset_lineage import config_fingerprint
+
+        return config_fingerprint(self.to_dict())
+
     def crawler_kwargs(self) -> dict[str, Any]:
         """Keyword arguments accepted by ``DatasetCrawler.__init__`` (sans config)."""
         skip = {"label_mode", "labels"}

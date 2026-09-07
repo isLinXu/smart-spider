@@ -41,6 +41,7 @@ from .multimodal_pipeline import (
     StaticPageSource,
 )
 from .multimodal_scale import QualityReport, ShardedManifestWriter
+from .dataset_lineage import build_lineage, publish_dataset_artifacts
 from .scene_quality_gate import (
     JsonlSceneReviewQueue,
     SceneQualityGate,
@@ -325,6 +326,7 @@ class MultimodalDatasetOrchestrator:
         )
         self._owns_state = state_store is None
         self._owns_manifest = manifest_writer is None
+        self._lease_recoveries = int(self.state.recover_expired_leases(config.job_id))
         self.scene_quality_gate = None
         self.scene_review_queue = None
         self.scene_signal_detector = scene_signal_detector
@@ -347,6 +349,20 @@ class MultimodalDatasetOrchestrator:
 
     def close(self):
         try:
+            self._lease_recoveries += int(
+                self.state.recover_expired_leases(self.config.job_id)
+            )
+            lineage = build_lineage(
+                job_id=self.config.job_id,
+                output_dir=self.config.output_dir,
+                config_snapshot=self.config.to_dict(),
+                extra_provenance={
+                    "track": "multimodal",
+                    "lease_recoveries": self._lease_recoveries,
+                    "scene": self.config.scene,
+                },
+            )
+            publish_dataset_artifacts(self.config.output_dir, lineage)
             self.quality_report.write(self.quality_report_path)
         finally:
             if self._owns_manifest:
@@ -420,6 +436,7 @@ class MultimodalDatasetOrchestrator:
                     report.rejected += sum(1 for item in accepted if not item)
         finally:
             report.scene_decisions = dict(self.quality_report.scene_decisions)
+            report.route_counts["lease_recoveries"] = int(self._lease_recoveries)
             self.close()
         return report
 

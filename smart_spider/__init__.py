@@ -73,6 +73,17 @@ from .dataset_contracts import (
     ModalityRelation,
     QualityMetrics,
     SampleRecord,
+    CONTRACT_FORMAT_VERSION,
+    URL_NORMALIZE_VERSION,
+)
+from .dataset_lineage import (
+    DatasetLineage,
+    build_lineage,
+    config_fingerprint,
+    load_lineage,
+    publish_dataset_artifacts,
+    verify_manifest_checksum,
+    write_manifest_checksum,
 )
 from .dataset_state import DatasetStateStore
 from .dataset_repository import DatasetCommit, DatasetRepository
@@ -235,6 +246,15 @@ __all__ = [
     "ModalityRelation",
     "QualityMetrics",
     "SampleRecord",
+    "CONTRACT_FORMAT_VERSION",
+    "URL_NORMALIZE_VERSION",
+    "DatasetLineage",
+    "build_lineage",
+    "config_fingerprint",
+    "load_lineage",
+    "publish_dataset_artifacts",
+    "verify_manifest_checksum",
+    "write_manifest_checksum",
     "DatasetStateStore",
     "DatasetCommit",
     "DatasetRepository",

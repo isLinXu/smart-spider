@@ -36,6 +36,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Emit machine-readable JSON",
     )
+    parser.add_argument(
+        "--verify-manifest",
+        action="store_true",
+        help="Also verify manifest.sha256 under the dataset directory containing --db",
+    )
     args = parser.parse_args(argv)
 
     store = DatasetStateStore(args.db)
@@ -46,12 +51,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         stats = store.collect_stats()
         if checkpoint is not None:
             stats["checkpoint"] = checkpoint
+        if args.verify_manifest:
+            from pathlib import Path
+
+            from .dataset_lineage import load_lineage, verify_manifest_checksum
+
+            dataset_dir = Path(args.db).expanduser().resolve().parent
+            stats["manifest_checksum"] = verify_manifest_checksum(dataset_dir)
+            lineage = load_lineage(dataset_dir)
+            stats["lineage"] = lineage.to_dict() if lineage else None
         if args.json:
             print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
             return 0
         print(f"db: {stats['path']}")
         print(f"db_bytes={stats['db_bytes']} wal_bytes={stats['wal_bytes']} shm_bytes={stats['shm_bytes']}")
-        print(f"expired_leases={stats['expired_leases']}")
+        print(
+            f"expired_leases={stats['expired_leases']} "
+            f"lease_recoveries_total={stats.get('lease_recoveries_total', 0)}"
+        )
         print("tables:")
         for name, count in sorted(stats["table_counts"].items()):
             print(f"  {name}: {count}")
@@ -68,6 +85,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"busy={checkpoint['busy']} log={checkpoint['log']} "
                 f"checkpointed={checkpoint['checkpointed']}"
             )
+        if args.verify_manifest:
+            checksum = stats.get("manifest_checksum") or {}
+            print(f"manifest_checksum_ok={checksum.get('ok')}")
+            lineage = stats.get("lineage") or {}
+            if lineage:
+                print(
+                    f"dataset_id={lineage.get('dataset_id')} "
+                    f"version={lineage.get('version')} "
+                    f"config_fingerprint={lineage.get('config_fingerprint')}"
+                )
         return 0
     finally:
         store.close()

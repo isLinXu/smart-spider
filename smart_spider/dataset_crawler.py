@@ -106,7 +106,9 @@ from .dataset_contracts import (
     ModalityAsset,
     QualityMetrics,
     SampleRecord,
+    URL_NORMALIZE_VERSION,
 )
+from .dataset_lineage import build_lineage, publish_dataset_artifacts
 from .dataset_state import DatasetStateStore
 from .dataset_repository import DatasetRepository
 from .dataset_governance import QuotaLedger, SceneQuotaLedger, perceptual_fingerprint
@@ -501,6 +503,17 @@ class DatasetCrawler:
         self.job_id = job_id or hashlib.sha256(
             os.path.abspath(output_dir).encode("utf-8")
         ).hexdigest()[:16]
+        snapshot = dict(self.config.to_dict())
+        snapshot["job_id"] = self.job_id
+        self._config_snapshot = snapshot
+        bootstrap_lineage = build_lineage(
+            job_id=self.job_id,
+            output_dir=output_dir,
+            config_snapshot=snapshot,
+            clip_model=clip_model,
+        )
+        self._config_fingerprint = bootstrap_lineage.config_fingerprint
+        self._dataset_id = bootstrap_lineage.dataset_id
         self.label_policy = label_policy or LabelPolicy(
             mode=label_mode,
             # 没有显式 labels 时，把当前搜索词作为默认正式标签；
@@ -577,6 +590,11 @@ class DatasetCrawler:
                 self.job_id,
                 batch_size=batch_size,
             )
+            self._lease_recoveries = int(
+                self._state_store.recover_expired_leases(self.job_id)
+            )
+        else:
+            self._lease_recoveries = 0
 
         self._metadata_writer = MetadataWriter(output_dir)
         self._manifest_writer = ManifestWriter(output_dir)
@@ -1300,9 +1318,13 @@ class DatasetCrawler:
                         "source": source,
                         "query": keyword,
                         "url": url,
+                        "url_normalize_version": URL_NORMALIZE_VERSION,
+                        "clip_model": self.clip_model_name if self.use_clip else None,
                     },
                     pipeline={
                         "job_id": self.job_id,
+                        "dataset_id": getattr(self, "_dataset_id", ""),
+                        "config_fingerprint": getattr(self, "_config_fingerprint", ""),
                         "label_policy": self.label_policy.to_dict(),
                         "format_conversion": format_conversion,
                         "image_query": {
@@ -1797,6 +1819,10 @@ class DatasetCrawler:
                     self._crawl_spider_tools(pbar)
 
             # 生成报告
+            if self._state_store is not None:
+                self._lease_recoveries += int(
+                    self._state_store.recover_expired_leases(self.job_id)
+                )
             self._generate_report()
 
         finally:
@@ -1831,6 +1857,29 @@ class DatasetCrawler:
         report["http_metrics"] = self._http.metrics.snapshot()
         if self._repository is not None:
             report["repository_recovery"] = dict(self._repository.recovery_report)
+        report["lease_recoveries"] = int(self._lease_recoveries)
+        if self._state_store is not None:
+            try:
+                report["db_stats"] = self._state_store.collect_stats()
+            except Exception as exc:
+                report["db_stats_error"] = str(exc)
+
+        lineage = build_lineage(
+            job_id=self.job_id,
+            output_dir=self.output_dir,
+            config_snapshot=getattr(self, "_config_snapshot", {}),
+            clip_model=self.clip_model_name if self.use_clip else None,
+            extra_provenance={
+                "saved_count": self._dir_manager.saved_count,
+                "scene_quality_gate_enabled": self.scene_quality_gate_enabled,
+            },
+        )
+        try:
+            published = publish_dataset_artifacts(self.output_dir, lineage)
+            report["lineage"] = published["lineage"]
+            report["manifest_checksum"] = published["checksum"]
+        except Exception as exc:
+            report["lineage_error"] = str(exc)
 
         report_path = os.path.join(self.output_dir, "_dataset_report.json")
         try:
