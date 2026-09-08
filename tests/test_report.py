@@ -28,3 +28,24 @@ def test_from_dataset_report_adapter():
     assert report.track == "dataset"
     assert report.config_snapshot["keywords"] == ["cat"]
     assert report.stage_stats["saved"] == 3
+
+
+def test_from_multimodal_report_includes_routes_and_blocks():
+    report = UnifiedReport.from_multimodal_report(
+        {
+            "job_id": "mm1",
+            "tasks": 2,
+            "accepted": 1,
+            "rejected": 0,
+            "route_counts": {"static": 1, "browser": 1},
+            "route_reasons": {"insufficient_static_content": 1},
+            "block_kinds": {"forbidden": 1},
+            "compliance": {"license": "CC0"},
+        },
+        config_snapshot={"output_dir": "./out"},
+        quality_stats={"accepted": 1},
+    )
+    assert report.track == "multimodal"
+    assert report.source_stats["route_reasons"]["insufficient_static_content"] == 1
+    assert report.source_stats["block_kinds"]["forbidden"] == 1
+    assert report.extras["compliance"]["license"] == "CC0"

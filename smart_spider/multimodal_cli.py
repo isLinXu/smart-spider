@@ -110,9 +110,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="任务结束后导出当前浏览器 storage_state 到该路径",
     )
     parser.add_argument(
-        "--respect-robots",
+        "--ignore-robots",
         action="store_true",
-        help="授权浏览时遵守 robots.txt（默认关闭，避免误伤公开页）",
+        help="授权浏览时忽略 robots.txt（默认遵守）",
+    )
+    parser.add_argument(
+        "--license",
+        default="",
+        help="数据集许可声明（写入样本 provenance 与发布清单）",
+    )
+    parser.add_argument(
+        "--source-terms",
+        default="",
+        help="来源使用条款摘要（写入样本 provenance 与发布清单）",
+    )
+    parser.add_argument(
+        "--no-redact-urls",
+        action="store_true",
+        help="关闭样本 URL 敏感参数脱敏（默认开启）",
     )
     parser.add_argument(
         "--allow-private-hosts",
@@ -161,6 +176,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         scene_quality_gate_enabled=args.scene_quality_gate,
         scene=args.scene,
         scene_review_queue_path=args.scene_review_queue,
+        license=args.license or "",
+        source_terms=args.source_terms or "",
+        respect_robots=not bool(args.ignore_robots),
+        redact_urls=not bool(args.no_redact_urls),
     )
     http_client = SmartHttpClient(
         proxies=args.proxy,
@@ -228,7 +247,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "deny_hosts": _split(args.deny_hosts),
                     "storage_state_path": args.storage_state or "",
                     "session_cookies_path": args.session_cookies or "",
-                    "respect_robots": bool(args.respect_robots),
+                    "respect_robots": not bool(args.ignore_robots),
                     "allow_private_hosts": args.allow_private_hosts,
                     "action_delay_seconds": 0.3,
                     "requests_per_second": max(0.2, float(args.rate) / 5.0),

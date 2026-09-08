@@ -175,13 +175,21 @@ class QualityReport:
     task_type_counts: Counter = field(default_factory=Counter)
     label_counts: Counter = field(default_factory=Counter)
     route_counts: Counter = field(default_factory=Counter)
+    route_reasons: Counter = field(default_factory=Counter)
+    block_kinds: Counter = field(default_factory=Counter)
     scene_decisions: Counter = field(default_factory=Counter)
     rejection_reasons: Counter = field(default_factory=Counter)
     errors: list[str] = field(default_factory=list)
 
-    def observe_route(self, route: str):
+    def observe_route(self, route: str, reason: str = ""):
         if route:
             self.route_counts[str(route)] += 1
+        if reason:
+            self.route_reasons[str(reason)] += 1
+
+    def observe_block(self, kind: str):
+        if kind:
+            self.block_kinds[str(kind)] += 1
 
     def observe_materialized_image(self, count: int = 1):
         self.materialized_images += max(0, int(count))
@@ -219,6 +227,8 @@ class QualityReport:
             "task_type_counts": dict(sorted(self.task_type_counts.items())),
             "label_counts": dict(sorted(self.label_counts.items())),
             "route_counts": dict(sorted(self.route_counts.items())),
+            "route_reasons": dict(sorted(self.route_reasons.items())),
+            "block_kinds": dict(sorted(self.block_kinds.items())),
             "scene_decisions": dict(sorted(self.scene_decisions.items())),
             "rejection_reasons": dict(sorted(self.rejection_reasons.items())),
             "errors": list(self.errors),

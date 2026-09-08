@@ -61,10 +61,14 @@ def test_multimodal_cli_exposes_playbook_and_session_flags():
         "--storage-state", "./state.json",
         "--session-cookies", "./cookies.json",
         "--export-storage-state", "./out-state.json",
-        "--respect-robots",
+        "--ignore-robots",
+        "--license", "CC-BY-4.0",
+        "--source-terms", "public pages only",
     ])
     assert args.browser_playbook is True
     assert args.allow_hosts == "example.com"
     assert args.storage_state == "./state.json"
     assert args.export_storage_state == "./out-state.json"
-    assert args.respect_robots is True
+    assert args.ignore_robots is True
+    assert args.license == "CC-BY-4.0"
+    assert args.source_terms == "public pages only"

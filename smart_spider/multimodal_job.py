@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import threading
 import uuid
@@ -41,7 +42,14 @@ from .multimodal_pipeline import (
     StaticPageSource,
 )
 from .multimodal_scale import QualityReport, ShardedManifestWriter
+from .compliance import (
+    CompliancePolicy,
+    apply_compliance_to_provenance,
+    build_publish_checklist,
+    write_publish_checklist,
+)
 from .dataset_lineage import build_lineage, publish_dataset_artifacts
+from .report import UnifiedReport
 from .scene_quality_gate import (
     JsonlSceneReviewQueue,
     SceneQualityGate,
@@ -212,6 +220,10 @@ class MultimodalJobConfig:
     scene_quality_gate_enabled: bool = False
     scene: Optional[str] = None
     scene_review_queue_path: Optional[str] = None
+    license: str = ""
+    source_terms: str = ""
+    respect_robots: bool = True
+    redact_urls: bool = True
 
     def __post_init__(self):
         self.allowed_modalities = tuple(
@@ -250,7 +262,19 @@ class MultimodalJobConfig:
             "scene_quality_gate_enabled": self.scene_quality_gate_enabled,
             "scene": self.scene,
             "scene_review_queue_path": self.scene_review_queue_path,
+            "license": self.license,
+            "source_terms": self.source_terms,
+            "respect_robots": self.respect_robots,
+            "redact_urls": self.redact_urls,
         }
+
+    def compliance_policy(self) -> CompliancePolicy:
+        return CompliancePolicy(
+            license=self.license,
+            source_terms=self.source_terms,
+            respect_robots=self.respect_robots,
+            redact_urls=self.redact_urls,
+        )
 
 
 @dataclass
@@ -262,9 +286,14 @@ class MultimodalJobReport:
     rejected: int = 0
     materialized_images: int = 0
     quality_report_path: str = ""
+    unified_report_path: str = ""
+    publish_checklist_path: str = ""
     route_counts: dict[str, int] = field(default_factory=dict)
+    route_reasons: dict[str, int] = field(default_factory=dict)
+    block_kinds: dict[str, int] = field(default_factory=dict)
     scene_decisions: dict[str, int] = field(default_factory=dict)
     source_metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
+    compliance: dict[str, Any] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -360,10 +389,13 @@ class MultimodalDatasetOrchestrator:
                     "track": "multimodal",
                     "lease_recoveries": self._lease_recoveries,
                     "scene": self.config.scene,
+                    "compliance": self.config.compliance_policy().to_dict(),
                 },
             )
             publish_dataset_artifacts(self.config.output_dir, lineage)
-            self.quality_report.write(self.quality_report_path)
+            # quality_report may already be written by _finalize_reports
+            if not os.path.isfile(self.quality_report_path):
+                self.quality_report.write(self.quality_report_path)
         finally:
             if self._owns_manifest:
                 self.manifest.close()
@@ -387,8 +419,14 @@ class MultimodalDatasetOrchestrator:
                 report.tasks += 1
                 result = self.source_router.discover(task, static_source, browser_source)
                 route = result.decision.action.value
+                reason = result.decision.reason
                 report.route_counts[route] = report.route_counts.get(route, 0) + 1
-                self.quality_report.observe_route(route)
+                if reason:
+                    report.route_reasons[reason] = report.route_reasons.get(reason, 0) + 1
+                self.quality_report.observe_route(route, reason)
+                self._record_block_signal(result.static_response, report)
+                if result.browser_response is not None:
+                    self._record_block_signal(result.browser_response, report)
                 self._record_source_diagnostics(
                     result.static_response,
                     source="static",
@@ -437,8 +475,50 @@ class MultimodalDatasetOrchestrator:
         finally:
             report.scene_decisions = dict(self.quality_report.scene_decisions)
             report.route_counts["lease_recoveries"] = int(self._lease_recoveries)
+            report.route_reasons = dict(self.quality_report.route_reasons)
+            report.block_kinds = dict(self.quality_report.block_kinds)
+            report.compliance = self.config.compliance_policy().to_dict()
+            self._finalize_reports(report)
             self.close()
         return report
+
+    def _finalize_reports(self, report: MultimodalJobReport) -> None:
+        """写入 quality / unified / publish checklist（close 前调用）。"""
+        self.quality_report.write(self.quality_report_path)
+        report.quality_report_path = self.quality_report_path
+        checklist = build_publish_checklist(
+            job_id=self.config.job_id,
+            policy=self.config.compliance_policy(),
+            route_counts=report.route_counts,
+            route_reasons=report.route_reasons,
+            block_kinds=report.block_kinds,
+        )
+        report.publish_checklist_path = write_publish_checklist(
+            self.config.output_dir, checklist
+        )
+        unified = UnifiedReport.from_multimodal_report(
+            report.to_dict(),
+            job_id=self.config.job_id,
+            config_snapshot=self.config.to_dict(),
+            quality_stats=self.quality_report.to_dict(),
+        )
+        unified_path = os.path.join(self.config.output_dir, "unified_report.json")
+        with open(unified_path, "w", encoding="utf-8") as handle:
+            json.dump(unified.to_dict(), handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        report.unified_report_path = unified_path
+
+    def _record_block_signal(self, response: Any, report: MultimodalJobReport) -> None:
+        meta = getattr(response, "metadata", None) or {}
+        block = meta.get("block") if isinstance(meta, dict) else None
+        kind = ""
+        if isinstance(block, dict):
+            kind = str(block.get("kind") or "")
+        if not kind and getattr(response, "blocked", False):
+            kind = "blocked"
+        if kind:
+            report.block_kinds[kind] = report.block_kinds.get(kind, 0) + 1
+            self.quality_report.observe_block(kind)
 
     @staticmethod
     def _select_source_sample(result) -> Optional[SampleRecord]:
@@ -731,6 +811,17 @@ class MultimodalDatasetOrchestrator:
             for error in annotation.errors.values():
                 self.quality_report.observe_error(error)
             sample.pipeline["status"] = "accepted"
+            apply_compliance_to_provenance(
+                sample.provenance, self.config.compliance_policy()
+            )
+            # Also scrub materialized asset source URLs when redaction enabled.
+            if self.config.redact_urls:
+                from .compliance import redact_url
+
+                for asset in sample.modalities:
+                    source_url = asset.metadata.get("source_url")
+                    if source_url:
+                        asset.metadata["source_url"] = redact_url(str(source_url))
             accepted = self.repository.commit(
                 sample,
                 candidate_ids=[item for item in [page_id, *claimed] if item],

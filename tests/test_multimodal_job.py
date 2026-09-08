@@ -60,7 +60,12 @@ def test_orchestrator_materializes_page_assets_and_commits_manifest():
             )
 
         job = MultimodalDatasetOrchestrator(
-            MultimodalJobConfig(output_dir=tmp, max_samples=1),
+            MultimodalJobConfig(
+                output_dir=tmp,
+                max_samples=1,
+                license="CC-BY-4.0",
+                source_terms="test terms",
+            ),
             http_client=_BytesHttpClient(),
             extractor=extractor,
         )
@@ -72,12 +77,23 @@ def test_orchestrator_materializes_page_assets_and_commits_manifest():
         assert report.accepted == 1
         assert report.materialized_images == 1
         assert report.quality_report_path == os.path.join(tmp, "quality_report.json")
+        assert os.path.isfile(report.unified_report_path)
+        assert os.path.isfile(report.publish_checklist_path)
         with open(report.quality_report_path, encoding="utf-8") as handle:
             quality = json.load(handle)
         assert quality["accepted"] == 1
         assert quality["materialized_images"] == 1
+        assert "route_reasons" in quality
+        with open(report.unified_report_path, encoding="utf-8") as handle:
+            unified = json.load(handle)
+        assert unified["track"] == "multimodal"
+        assert unified["extras"]["compliance"]["license"] == "CC-BY-4.0"
+        with open(report.publish_checklist_path, encoding="utf-8") as handle:
+            checklist = json.load(handle)
+        assert checklist["ready"] is True
         with open(os.path.join(tmp, "manifest.jsonl"), encoding="utf-8") as handle:
             manifest = json.loads(handle.readline())
+        assert manifest["provenance"]["license"] == "CC-BY-4.0"
         image_asset = next(item for item in manifest["modalities"] if item["modality"] == "image")
         assert image_asset["uri"].startswith("assets/")
         assert os.path.exists(os.path.join(tmp, image_asset["uri"]))

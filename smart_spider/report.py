@@ -95,6 +95,47 @@ class UnifiedReport:
         )
 
     @classmethod
+    def from_multimodal_report(
+        cls,
+        raw: dict[str, Any],
+        *,
+        job_id: str = "",
+        config_snapshot: Optional[dict[str, Any]] = None,
+        quality_stats: Optional[dict[str, Any]] = None,
+    ) -> "UnifiedReport":
+        """Map multimodal job report (+ optional quality dict) into UnifiedReport."""
+        return cls(
+            job_id=str(job_id or raw.get("job_id") or "unknown"),
+            track="multimodal",
+            config_snapshot=dict(config_snapshot or {}),
+            stage_stats={
+                "tasks": raw.get("tasks"),
+                "discovered": raw.get("discovered"),
+                "accepted": raw.get("accepted"),
+                "rejected": raw.get("rejected"),
+                "materialized_images": raw.get("materialized_images"),
+            },
+            source_stats={
+                "route_counts": dict(raw.get("route_counts") or {}),
+                "route_reasons": dict(raw.get("route_reasons") or {}),
+                "block_kinds": dict(raw.get("block_kinds") or {}),
+                "source_metrics": dict(raw.get("source_metrics") or {}),
+            },
+            quality_stats=dict(quality_stats or {}),
+            recovery={
+                "lease_recoveries": (raw.get("route_counts") or {}).get("lease_recoveries"),
+            },
+            errors=list(raw.get("errors") or []),
+            extras={
+                "quality_report_path": raw.get("quality_report_path"),
+                "unified_report_path": raw.get("unified_report_path"),
+                "publish_checklist_path": raw.get("publish_checklist_path"),
+                "compliance": dict(raw.get("compliance") or {}),
+                "scene_decisions": dict(raw.get("scene_decisions") or {}),
+            },
+        )
+
+    @classmethod
     def from_crawl_stats(
         cls,
         stats: dict[str, Any],
