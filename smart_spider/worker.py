@@ -149,8 +149,11 @@ def run_worker(
             continue
         try:
             handle_task(task, queue=queue)
-            queue.complete(task.task_id)
+            done = queue.complete(task.task_id)
             processed += 1
+            from .metrics import observe_task_outcome
+
+            observe_task_outcome(task.kind, done.status)
             logger.info("worker completed task={}", task.task_id)
         except BrowseBlockError as exc:
             done = queue.complete(
@@ -159,6 +162,9 @@ def run_worker(
                 terminal=not exc.signal.retryable,
             )
             processed += 1
+            from .metrics import observe_task_outcome
+
+            observe_task_outcome(task.kind, done.status)
             logger.info(
                 "worker task={} block={} status={} attempts={}/{}",
                 task.task_id,
@@ -177,6 +183,9 @@ def run_worker(
             )
             done = queue.complete(task.task_id, error=detail)
             processed += 1
+            from .metrics import observe_task_outcome
+
+            observe_task_outcome(task.kind, done.status)
             logger.info(
                 "worker task={} now status={} attempts={}/{}",
                 task.task_id,

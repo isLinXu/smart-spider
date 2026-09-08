@@ -109,6 +109,8 @@ from .dataset_contracts import (
     URL_NORMALIZE_VERSION,
 )
 from .dataset_lineage import build_lineage, publish_dataset_artifacts
+from .compliance import apply_compliance_to_provenance, build_publish_checklist, write_publish_checklist
+from .report import UnifiedReport
 from .dataset_state import DatasetStateStore
 from .dataset_repository import DatasetRepository
 from .dataset_governance import QuotaLedger, SceneQuotaLedger, perceptual_fingerprint
@@ -1314,13 +1316,16 @@ class DatasetCrawler:
                     file=relative_path,
                     labels=label_resolution.labels,
                     quality=quality,
-                    provenance={
-                        "source": source,
-                        "query": keyword,
-                        "url": url,
-                        "url_normalize_version": URL_NORMALIZE_VERSION,
-                        "clip_model": self.clip_model_name if self.use_clip else None,
-                    },
+                    provenance=apply_compliance_to_provenance(
+                        {
+                            "source": source,
+                            "query": keyword,
+                            "url": url,
+                            "url_normalize_version": URL_NORMALIZE_VERSION,
+                            "clip_model": self.clip_model_name if self.use_clip else None,
+                        },
+                        self.config.compliance_policy(),
+                    ),
                     pipeline={
                         "job_id": self.job_id,
                         "dataset_id": getattr(self, "_dataset_id", ""),
@@ -1872,6 +1877,7 @@ class DatasetCrawler:
             extra_provenance={
                 "saved_count": self._dir_manager.saved_count,
                 "scene_quality_gate_enabled": self.scene_quality_gate_enabled,
+                "compliance": self.config.compliance_policy().to_dict(),
             },
         )
         try:
@@ -1880,6 +1886,33 @@ class DatasetCrawler:
             report["manifest_checksum"] = published["checksum"]
         except Exception as exc:
             report["lineage_error"] = str(exc)
+
+        policy = self.config.compliance_policy()
+        report["compliance"] = policy.to_dict()
+        try:
+            checklist = build_publish_checklist(
+                job_id=self.job_id,
+                policy=policy,
+                route_counts={},
+                block_kinds={},
+            )
+            report["publish_checklist_path"] = write_publish_checklist(
+                self.output_dir, checklist
+            )
+            unified = UnifiedReport.from_dataset_report(
+                report,
+                job_id=self.job_id,
+                config_snapshot=getattr(self, "_config_snapshot", {}),
+            )
+            unified.extras["compliance"] = policy.to_dict()
+            unified.extras["publish_checklist_path"] = report.get("publish_checklist_path")
+            unified_path = os.path.join(self.output_dir, "unified_report.json")
+            with open(unified_path, "w", encoding="utf-8") as handle:
+                json.dump(unified.to_dict(), handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            report["unified_report_path"] = unified_path
+        except Exception as exc:
+            report["compliance_report_error"] = str(exc)
 
         report_path = os.path.join(self.output_dir, "_dataset_report.json")
         try:

@@ -227,6 +227,21 @@ def main(argv: Optional[list[str]] = None):
         "--allow-private-hosts", action="store_true",
         help="允许访问内网/私有地址（仅限受控环境，默认拒绝以防 SSRF）",
     )
+    parser.add_argument(
+        "--license",
+        default="",
+        help="数据集许可声明（写入样本 provenance 与发布清单）",
+    )
+    parser.add_argument(
+        "--source-terms",
+        default="",
+        help="来源使用条款摘要",
+    )
+    parser.add_argument(
+        "--no-redact-urls",
+        action="store_true",
+        help="关闭样本 URL 敏感参数脱敏（默认开启）",
+    )
 
     # 断点续传
     parser.add_argument(
@@ -326,6 +341,12 @@ def main(argv: Optional[list[str]] = None):
         cli_overrides["use_curl_cffi"] = False
     if args.allow_private_hosts:
         cli_overrides["allow_private_hosts"] = True
+    if args.license:
+        cli_overrides["license"] = args.license
+    if args.source_terms:
+        cli_overrides["source_terms"] = args.source_terms
+    if args.no_redact_urls:
+        cli_overrides["redact_urls"] = False
     if args.resume:
         cli_overrides["resume"] = True
     if args.no_state_db:

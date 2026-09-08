@@ -68,6 +68,10 @@ class DatasetCrawlConfig:
     max_domain_share: float = 1.0
     scene_quality_gate_enabled: bool = False
     scene_review_queue_path: Optional[str] = None
+    license: str = ""
+    source_terms: str = ""
+    respect_robots: bool = True
+    redact_urls: bool = True
 
     def __post_init__(self) -> None:
         if not self.keywords:
@@ -135,6 +139,16 @@ class DatasetCrawlConfig:
         if self.query_image and not self.use_clip:
             raise ValueError("query_image requires use_clip=True")
 
+    def compliance_policy(self):
+        from .compliance import CompliancePolicy
+
+        return CompliancePolicy(
+            license=self.license,
+            source_terms=self.source_terms,
+            respect_robots=self.respect_robots,
+            redact_urls=self.redact_urls,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         if self.label_policy is not None:
@@ -148,20 +162,24 @@ class DatasetCrawlConfig:
 
     def crawler_kwargs(self) -> dict[str, Any]:
         """Keyword arguments accepted by ``DatasetCrawler.__init__`` (sans config)."""
-        skip = {"label_mode", "labels"}
+        skip = {
+            "label_mode",
+            "labels",
+            "license",
+            "source_terms",
+            "respect_robots",
+            "redact_urls",
+        }
         kwargs: dict[str, Any] = {}
         for item in fields(self):
-            if item.name in skip and self.label_policy is not None:
+            if item.name in skip:
                 continue
             kwargs[item.name] = getattr(self, item.name)
         if self.label_policy is None:
             kwargs["label_mode"] = self.label_mode
             kwargs["labels"] = self.labels
         else:
-            kwargs.pop("label_mode", None)
-            kwargs.pop("labels", None)
             kwargs["label_policy"] = self.label_policy
-        # DatasetCrawler uses clip_model kw name
         return kwargs
 
     @classmethod

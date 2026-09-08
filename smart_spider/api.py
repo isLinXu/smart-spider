@@ -75,6 +75,18 @@ def create_app(
     def health() -> Dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/metrics")
+    def metrics():
+        """Prometheus text exposition for queue depth and worker counters."""
+        from fastapi.responses import PlainTextResponse
+
+        from .metrics import render_metrics_text
+
+        return PlainTextResponse(
+            render_metrics_text(queue=queue),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
     @app.post("/v1/jobs/dataset")
     def submit_dataset_job(payload: Dict[str, Any]) -> Dict[str, Any]:
         raw = payload.get("config", payload)

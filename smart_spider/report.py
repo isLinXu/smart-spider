@@ -83,15 +83,43 @@ class UnifiedReport:
             quality_stats={
                 "filtered": raw.get("filtered"),
                 "scene_quality": raw.get("scene_quality"),
+                "scene_quality_gate": raw.get("scene_quality_gate"),
             },
-            resource_stats=dict(raw.get("resource_metrics") or {}),
-            recovery=dict(raw.get("recovery") or {}),
+            resource_stats=dict(raw.get("resource_metrics") or raw.get("http_metrics") or {}),
+            recovery={
+                **dict(raw.get("recovery") or {}),
+                "lease_recoveries": raw.get("lease_recoveries"),
+                "repository_recovery": raw.get("repository_recovery"),
+            },
             errors=list(raw.get("errors") or []),
-            extras={k: v for k, v in raw.items() if k not in {
-                "job_id", "config", "saved", "total_target", "elapsed_seconds",
-                "source_metrics", "sources", "filtered", "scene_quality",
-                "resource_metrics", "recovery", "errors",
-            }},
+            extras={
+                **{
+                    k: v
+                    for k, v in raw.items()
+                    if k
+                    not in {
+                        "job_id",
+                        "config",
+                        "saved",
+                        "total_target",
+                        "elapsed_seconds",
+                        "source_metrics",
+                        "sources",
+                        "filtered",
+                        "scene_quality",
+                        "scene_quality_gate",
+                        "resource_metrics",
+                        "http_metrics",
+                        "recovery",
+                        "errors",
+                        "lease_recoveries",
+                        "repository_recovery",
+                    }
+                },
+                "compliance": dict(raw.get("compliance") or {}),
+                "unified_report_path": raw.get("unified_report_path"),
+                "publish_checklist_path": raw.get("publish_checklist_path"),
+            },
         )
 
     @classmethod

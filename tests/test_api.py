@@ -113,3 +113,14 @@ def test_api_submit_browse_job(tmp_path):
     body = ok.json()
     assert body["kind"] == "authorized_browse"
     assert body["payload"]["url"] == "https://example.com/start"
+
+
+def test_api_metrics_endpoint(tmp_path):
+    queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"))
+    store = LocalFilesystemObjectStore(str(tmp_path / "objects"))
+    client = TestClient(create_app(queue=queue, store=store))
+    queue.enqueue("dataset_crawl", {"config": {"keywords": ["x"], "total_count": 1}})
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    assert "smart_spider_queue_tasks" in response.text
+    assert 'status="pending"' in response.text
