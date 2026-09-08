@@ -15,6 +15,7 @@ from smart_spider.multimodal_pipeline import (
     BrowserPageSource,
     DiscoveryTask,
     PageSampleExtractor,
+    PlaybookBrowserSource,
     RouteAction,
     SourceResponse,
     StaticPageSource,
@@ -112,6 +113,62 @@ def test_adaptive_router_keeps_static_when_quality_is_sufficient():
     )
     assert result.decision.action == RouteAction.STATIC
     assert browser_called == []
+
+
+def test_adaptive_router_falls_back_on_blocked_static_with_playbook_source():
+    from smart_spider.browser_playbook import AuthorizedBrowsePlaybook
+    from smart_spider.site_policy import RobotsGate, SiteCrawlPolicy
+
+    class FakeController:
+        current_url = "https://example.com/"
+
+        def navigate(self, url):
+            self.current_url = url
+            return (
+                "<html><body><article><h1>ok</h1>"
+                "<p>这是一段足够长的正文用于页面抽取测试内容。</p>"
+                '<img src="/cat.jpg" alt="cat">'
+                '<a href="/next">next</a></body></html>'
+            )
+
+        def scroll(self):
+            return True, self.navigate(self.current_url)
+
+    def static_source(task):
+        return SourceResponse(
+            status_code=403,
+            blocked=True,
+            html_length=10,
+            metadata={"block": {"kind": "forbidden"}},
+        )
+
+    policy = SiteCrawlPolicy(
+        allow_hosts=("example.com",),
+        action_delay_seconds=0,
+        scroll_passes=1,
+        respect_robots=False,
+        requests_per_second=1000,
+    )
+    playbook = AuthorizedBrowsePlaybook(
+        FakeController(),
+        policy,
+        robots=RobotsGate(enabled=False),
+    )
+    browser = PlaybookBrowserSource(playbook, PageSampleExtractor(min_text_chars=10))
+    result = AdaptiveSourceRouter().discover(
+        DiscoveryTask(
+            start_url="https://example.com/",
+            min_candidates=1,
+            modalities=(Modality.TEXT, Modality.IMAGE, Modality.WEBPAGE),
+        ),
+        static_source,
+        browser,
+    )
+    assert result.decision.action == RouteAction.BROWSER
+    assert "blocked" in result.decision.reason
+    assert result.browser_response is not None
+    assert result.browser_response.dynamic is True
+    assert len(result.candidates) >= 1
 
 
 @dataclass

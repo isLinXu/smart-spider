@@ -35,7 +35,7 @@ import tempfile
 import time
 from typing import Optional
 
-from loguru import logger
+from .url_policy import URLPolicy
 
 
 class BrowserController:
@@ -52,7 +52,10 @@ class BrowserController:
         headless: bool = True,
         proxy: Optional[str] = None,
         cookies: Optional[list[dict]] = None,
+        storage_state: Optional[object] = None,
         page_timeout: int = 30_000,
+        url_policy: Optional[URLPolicy] = None,
+        allow_private_hosts: bool = False,
     ):
         """初始化控制器。
 
@@ -61,10 +64,14 @@ class BrowserController:
             headless: 是否使用无头浏览器（仅自动创建会话时生效）
             proxy: 代理地址
             cookies: Cookie 列表
+            storage_state: Playwright storage_state（dict 或文件路径）
             page_timeout: 页面超时毫秒数
         """
         self._renderer = dynamic_renderer
         self._session = None
+        self.url_policy = url_policy or getattr(dynamic_renderer, "url_policy", None) or URLPolicy(
+            allow_private_hosts=allow_private_hosts
+        )
         self.current_html = ""
         self.current_url = ""
 
@@ -79,6 +86,9 @@ class BrowserController:
                 headless=headless,
                 page_timeout=page_timeout,
                 cookies=cookies,
+                storage_state=storage_state,
+                url_policy=url_policy,
+                allow_private_hosts=allow_private_hosts,
             )
             self._mode = "session"
 
@@ -93,6 +103,7 @@ class BrowserController:
         Returns:
             页面 HTML 内容
         """
+        url = self.url_policy.validate(url)
         if self._mode == "session":
             html = self._session.navigate(url)
         else:
@@ -189,6 +200,12 @@ class BrowserController:
                 self.current_html = html
             return html
         return self.current_html
+
+    def export_storage_state(self, path: str = "") -> dict:
+        """导出会话 storage_state（仅 session 模式）。"""
+        if self._mode != "session" or self._session is None:
+            raise RuntimeError("export_storage_state requires PersistentBrowserSession mode")
+        return self._session.export_storage_state(path)
 
     # ── 生命周期 ──────────────────────────────────────────────────
 

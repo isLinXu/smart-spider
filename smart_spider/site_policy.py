@@ -8,7 +8,6 @@
 """
 from __future__ import annotations
 
-import json
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -17,6 +16,7 @@ from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 from .rate_limit import RateLimiter
+from .session_state import load_storage_state, resolve_session_inputs
 from .url_policy import URLPolicy, UnsafeURLError
 
 
@@ -53,6 +53,7 @@ class SiteCrawlPolicy:
     respect_robots: bool = True
     robots_user_agent: str = "smart-spider"
     session_cookies_path: str = ""
+    storage_state_path: str = ""
     max_depth: int = 2
     max_links_per_page: int = 50
     scroll_passes: int = 1
@@ -99,6 +100,9 @@ class SiteCrawlPolicy:
             respect_robots=bool(data.get("respect_robots", True)),
             robots_user_agent=str(data.get("robots_user_agent") or "smart-spider"),
             session_cookies_path=str(data.get("session_cookies_path") or ""),
+            storage_state_path=str(
+                data.get("storage_state_path") or data.get("storage_state") or ""
+            ),
             max_depth=int(data.get("max_depth") if data.get("max_depth") is not None else 2),
             max_links_per_page=int(
                 data.get("max_links_per_page")
@@ -113,15 +117,25 @@ class SiteCrawlPolicy:
 
     def load_cookies(self) -> list[dict[str, Any]]:
         path = (self.session_cookies_path or "").strip()
-        if not path:
+        if not path and not (self.storage_state_path or "").strip():
             return []
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        if isinstance(payload, dict) and "cookies" in payload:
-            payload = payload["cookies"]
-        if not isinstance(payload, list):
-            raise ValueError("session cookies file must be a list or {cookies: [...]}")
-        return [dict(item) for item in payload]
+        _state, cookies = resolve_session_inputs(
+            storage_state_path=(self.storage_state_path or "").strip(),
+            cookies_path=path,
+        )
+        return cookies
+
+    def load_storage_state(self) -> Optional[dict[str, Any]]:
+        path = (self.storage_state_path or "").strip()
+        if not path:
+            return None
+        return load_storage_state(path)
+
+    def resolve_session(self) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
+        return resolve_session_inputs(
+            storage_state_path=(self.storage_state_path or "").strip(),
+            cookies_path=(self.session_cookies_path or "").strip(),
+        )
 
     def allows_host(self, host: str) -> bool:
         host = _normalize_host(host)

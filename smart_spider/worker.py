@@ -58,10 +58,11 @@ def _handle_authorized_browse(task, queue: Optional[TaskQueue]) -> dict:
         raise ValueError("authorized_browse payload requires url")
     policy = SiteCrawlPolicy.from_mapping(task.payload.get("policy") or {})
     depth = int(task.payload.get("depth") or 0)
-    cookies = policy.load_cookies()
+    storage_state, cookies = policy.resolve_session()
     controller = BrowserController(
         headless=bool(task.payload.get("headless", True)),
         cookies=cookies or None,
+        storage_state=storage_state,
         allow_private_hosts=policy.allow_private_hosts,
     )
     try:
