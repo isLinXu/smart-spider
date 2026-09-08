@@ -73,8 +73,13 @@ class TaskQueue(Protocol):
     ) -> Optional[TaskRecord]:
         """领取一条 pending 任务并标记为 running（带租约）。"""
 
-    def complete(self, task_id: str, *, error: str = "") -> TaskRecord:
-        """标记成功；失败时按 attempts/max_attempts 重试或进入 dead。"""
+    def complete(
+        self, task_id: str, *, error: str = "", terminal: bool = False
+    ) -> TaskRecord:
+        """标记成功；失败时按 attempts/max_attempts 重试或进入 dead。
+
+        ``terminal=True`` 表示不可恢复错误（如挑战页/策略拒绝），直接死信。
+        """
 
     def get(self, task_id: str) -> Optional[TaskRecord]:
         """按 id 查询。"""

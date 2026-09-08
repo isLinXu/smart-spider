@@ -90,6 +90,35 @@ def create_app(
         )
         return _to_response(record)
 
+    @app.post("/v1/jobs/browse")
+    def submit_browse_job(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """提交授权浏览任务（域策略 + 浏览器剧本，非对抗绕过）。"""
+        from .site_policy import SiteCrawlPolicy
+
+        url = str(payload.get("url") or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="url is required")
+        try:
+            policy = SiteCrawlPolicy.from_mapping(payload.get("policy") or {})
+            if not policy.allows_url(url):
+                raise ValueError("url denied by site policy or URL safety checks")
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        max_attempts = int(payload.get("max_attempts") or 3)
+        record = queue.enqueue(
+            "authorized_browse",
+            {
+                "url": url,
+                "depth": int(payload.get("depth") or 0),
+                "policy": policy.to_dict(),
+                "enqueue_links": bool(payload.get("enqueue_links", True)),
+                "headless": bool(payload.get("headless", True)),
+                "max_attempts": max_attempts,
+            },
+            max_attempts=max_attempts,
+        )
+        return _to_response(record)
+
     @app.get("/v1/jobs")
     def list_jobs(
         status: Optional[str] = None,
@@ -152,9 +181,11 @@ def create_app(
         return {"recovered": int(recovered)}
 
     @app.post("/v1/jobs/{task_id}/complete")
-    def complete_job(task_id: str, error: str = "") -> Dict[str, Any]:
+    def complete_job(
+        task_id: str, error: str = "", terminal: bool = False
+    ) -> Dict[str, Any]:
         try:
-            record = queue.complete(task_id, error=error)
+            record = queue.complete(task_id, error=error, terminal=terminal)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="task not found") from exc
         return _to_response(record)

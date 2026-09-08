@@ -81,3 +81,35 @@ def test_api_health_and_dataset_job(tmp_path):
     done = client.post(f"/v1/jobs/{task_id}/complete")
     assert done.json()["status"] == "succeeded"
     assert claimed3.json()["task_id"] == task_id
+
+
+def test_api_submit_browse_job(tmp_path):
+    queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"))
+    store = LocalFilesystemObjectStore(str(tmp_path / "objects"))
+    client = TestClient(create_app(queue=queue, store=store))
+
+    denied = client.post(
+        "/v1/jobs/browse",
+        json={
+            "url": "https://evil.com/",
+            "policy": {"allow_hosts": ["example.com"]},
+        },
+    )
+    assert denied.status_code == 400
+
+    ok = client.post(
+        "/v1/jobs/browse",
+        json={
+            "url": "https://example.com/start",
+            "policy": {
+                "allow_hosts": ["example.com"],
+                "respect_robots": False,
+                "max_depth": 1,
+            },
+            "enqueue_links": True,
+        },
+    )
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["kind"] == "authorized_browse"
+    assert body["payload"]["url"] == "https://example.com/start"

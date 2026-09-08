@@ -186,7 +186,9 @@ class LocalSqliteTaskQueue:
             ).fetchone()
             return self._row_to_record(updated)
 
-    def complete(self, task_id: str, *, error: str = "") -> TaskRecord:
+    def complete(
+        self, task_id: str, *, error: str = "", terminal: bool = False
+    ) -> TaskRecord:
         now = time.time()
         with self._lock, self._connect() as conn:
             row = conn.execute(
@@ -196,7 +198,7 @@ class LocalSqliteTaskQueue:
                 raise KeyError(task_id)
             record = self._row_to_record(row)
             if error:
-                if record.attempts >= record.max_attempts:
+                if terminal or record.attempts >= record.max_attempts:
                     status = "dead"
                 else:
                     status = "pending"

@@ -166,7 +166,9 @@ class RedisTaskQueue:
             return record
         return None
 
-    def complete(self, task_id: str, *, error: str = "") -> TaskRecord:
+    def complete(
+        self, task_id: str, *, error: str = "", terminal: bool = False
+    ) -> TaskRecord:
         record = self._load(task_id)
         if record is None:
             raise KeyError(task_id)
@@ -177,7 +179,7 @@ class RedisTaskQueue:
         self._client.zrem(self._key("running"), task_id)
         if error:
             record.error = error
-            if record.attempts >= record.max_attempts:
+            if terminal or record.attempts >= record.max_attempts:
                 record.status = "dead"
             else:
                 record.status = "pending"

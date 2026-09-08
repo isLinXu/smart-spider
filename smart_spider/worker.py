@@ -27,7 +27,7 @@ from .pipeline import get_task_queue
 from .pipeline.protocols import TaskQueue
 
 
-def handle_task(task) -> None:
+def handle_task(task, queue: Optional[TaskQueue] = None) -> None:
     """执行单条已 claim 的任务。"""
     if task.kind == "dataset_crawl":
         raw = task.payload.get("config") or task.payload
@@ -40,7 +40,69 @@ def handle_task(task) -> None:
         )
         DatasetCrawler.from_config(config).crawl()
         return
+    if task.kind == "authorized_browse":
+        _handle_authorized_browse(task, queue)
+        return
     raise ValueError(f"unsupported task kind: {task.kind}")
+
+
+def _handle_authorized_browse(task, queue: Optional[TaskQueue]) -> dict:
+    """授权浏览剧本：导航/滚动/抽链，可选入队后续链接。"""
+    from .block_signals import BlockKind
+    from .browser_controller import BrowserController
+    from .browser_playbook import AuthorizedBrowsePlaybook, enqueue_discovered_links
+    from .site_policy import SiteCrawlPolicy
+
+    url = str(task.payload.get("url") or "").strip()
+    if not url:
+        raise ValueError("authorized_browse payload requires url")
+    policy = SiteCrawlPolicy.from_mapping(task.payload.get("policy") or {})
+    depth = int(task.payload.get("depth") or 0)
+    cookies = policy.load_cookies()
+    controller = BrowserController(
+        headless=bool(task.payload.get("headless", True)),
+        cookies=cookies or None,
+        allow_private_hosts=policy.allow_private_hosts,
+    )
+    try:
+        playbook = AuthorizedBrowsePlaybook(controller, policy)
+        result = playbook.run(url, depth=depth)
+    finally:
+        controller.close()
+
+    signal = result.block
+    if signal is not None and signal.kind != BlockKind.OK:
+        # Propagate as exception; run_worker applies terminal for non-retryable.
+        raise BrowseBlockError(signal)
+
+    follow_ids: list[str] = []
+    enqueue_links = bool(task.payload.get("enqueue_links", True))
+    if enqueue_links and queue is not None and depth < policy.max_depth:
+        follow_ids = enqueue_discovered_links(
+            queue,
+            result.links,
+            policy=policy,
+            max_attempts=int(task.payload.get("max_attempts") or task.max_attempts or 3),
+        )
+    logger.info(
+        "authorized_browse task={} url={} links={} enqueued={}",
+        task.task_id,
+        url,
+        len(result.links),
+        len(follow_ids),
+    )
+    return {
+        "result": result.to_dict(),
+        "enqueued_task_ids": follow_ids,
+    }
+
+
+class BrowseBlockError(RuntimeError):
+    """携带 BlockSignal，供 worker 决定 retry/dead。"""
+
+    def __init__(self, signal):
+        super().__init__(signal.queue_error)
+        self.signal = signal
 
 
 def run_worker(
@@ -85,10 +147,25 @@ def run_worker(
             time.sleep(max(0.1, poll_interval))
             continue
         try:
-            handle_task(task)
+            handle_task(task, queue=queue)
             queue.complete(task.task_id)
             processed += 1
             logger.info("worker completed task={}", task.task_id)
+        except BrowseBlockError as exc:
+            done = queue.complete(
+                task.task_id,
+                error=str(exc),
+                terminal=not exc.signal.retryable,
+            )
+            processed += 1
+            logger.info(
+                "worker task={} block={} status={} attempts={}/{}",
+                task.task_id,
+                exc.signal.kind.value,
+                done.status,
+                done.attempts,
+                done.max_attempts,
+            )
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"
             logger.error(

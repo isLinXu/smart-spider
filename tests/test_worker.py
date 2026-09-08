@@ -115,3 +115,95 @@ def test_worker_recovers_expired_claims_before_poll(tmp_path, monkeypatch):
 def test_handle_task_rejects_unknown_kind():
     with pytest.raises(ValueError):
         handle_task(TaskRecord(task_id="1", kind="other", payload={}))
+
+
+def test_worker_authorized_browse_enqueues_links(tmp_path, monkeypatch):
+    queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"))
+    policy = {
+        "allow_hosts": ["example.com"],
+        "action_delay_seconds": 0,
+        "scroll_passes": 1,
+        "respect_robots": False,
+        "max_depth": 1,
+        "requests_per_second": 1000,
+    }
+    enqueued = queue.enqueue(
+        "authorized_browse",
+        {
+            "url": "https://example.com/",
+            "depth": 0,
+            "policy": policy,
+            "enqueue_links": True,
+        },
+    )
+
+    class FakeController:
+        current_url = "https://example.com/"
+
+        def __init__(self, **kwargs):
+            pass
+
+        def navigate(self, url):
+            self.current_url = url
+            return (
+                '<html><body>'
+                '<a href="/a">A</a>'
+                '<a href="https://evil.com/x">X</a>'
+                "</body></html>"
+            )
+
+        def scroll(self):
+            return True, self.navigate(self.current_url)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "smart_spider.browser_controller.BrowserController", FakeController
+    )
+    processed = run_worker(queue, kind="authorized_browse", once=True)
+    assert processed == 1
+    assert queue.get(enqueued.task_id).status == "succeeded"
+    pending = queue.list_tasks(status="pending", kind="authorized_browse")
+    assert len(pending) == 1
+    assert pending[0].payload["url"].endswith("/a")
+
+
+def test_worker_authorized_browse_challenge_goes_dead(tmp_path, monkeypatch):
+    queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"), default_max_attempts=3)
+    enqueued = queue.enqueue(
+        "authorized_browse",
+        {
+            "url": "https://example.com/",
+            "policy": {
+                "allow_hosts": ["example.com"],
+                "action_delay_seconds": 0,
+                "scroll_passes": 0,
+                "respect_robots": False,
+                "requests_per_second": 1000,
+            },
+        },
+    )
+
+    class FakeController:
+        current_url = "https://example.com/"
+
+        def __init__(self, **kwargs):
+            pass
+
+        def navigate(self, url):
+            return "<html>verify you are human</html>"
+
+        def scroll(self):
+            return True, ""
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "smart_spider.browser_controller.BrowserController", FakeController
+    )
+    assert run_worker(queue, kind="authorized_browse", once=True) == 1
+    done = queue.get(enqueued.task_id)
+    assert done.status == "dead"
+    assert "challenge" in done.error
