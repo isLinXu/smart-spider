@@ -82,7 +82,10 @@ class SiteCrawlPolicy:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["allow_hosts"] = list(self.allow_hosts)
+        data["deny_hosts"] = list(self.deny_hosts)
+        return data
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "SiteCrawlPolicy":

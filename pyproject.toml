@@ -104,6 +104,7 @@ smart-spider-filter = "smart_spider.dataset_filter_cli:main"
 smart-spider-api = "smart_spider.api:main"
 smart-spider-worker = "smart_spider.worker:main"
 smart-spider-db-stats = "smart_spider.db_stats_cli:main"
+smart-spider-browse = "smart_spider.browse_cli:main"
 
 [tool.setuptools]
 py-modules = ["spider", "crawl_dataset", "crawl_multimodal"]
