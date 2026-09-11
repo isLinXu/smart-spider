@@ -66,6 +66,7 @@ _ENGINE_REFERERS = {
     "sogou":      "https://www.sogou.com/",
     "360":        "https://www.so.com/",
     "bilibili":   "https://www.bilibili.com/",
+    "douyin":     "https://www.douyin.com/",
     "bing_video": "https://www.bing.com/",
     "baidu_text": "https://www.baidu.com/",
     "bing_text":  "https://www.bing.com/",

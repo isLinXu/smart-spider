@@ -49,7 +49,7 @@ def main():
     g_engine = parser.add_argument_group("引擎参数")
     g_engine.add_argument("--search_engines", nargs="*", default=None,
                           help="手动指定引擎列表（默认自动按模态选取）。"
-                               "可选: baidu bing sogou 360 bilibili bing_video "
+                               "可选: baidu bing sogou 360 bilibili bing_video douyin "
                                "baidu_text bing_text weixin xiaohongshu")
 
     # CLIP 参数（图片模态）

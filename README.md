@@ -7,7 +7,7 @@
 | 能力 | 说明 |
 |------|------|
 | 🖼️ **图片采集** | 百度/Bing/搜狗/360 + CLIP 语义过滤，自动识别文件格式 |
-| 🎬 **视频采集** | B 站、Bing 视频 + yt-dlp 下载（支持 1000+ 平台） |
+| 🎬 **视频采集** | 抖音搜索/主页/分享链接、B 站、Bing 视频，支持 MP4 直链与 yt-dlp 下载 |
 | 📄 **文本采集** | 百度/Bing 网页搜索 + trafilatura 正文提取，输出 JSON |
 | 🔎 **远程以图搜图** | 本地图片上传到百度识图、Bing Visual Search、Google Lens，并返回网页结果 |
 | 🌐 **动态渲染** | Playwright 无头浏览器（处理 JS 加密、SPA、无限滚动） |
@@ -187,6 +187,7 @@ python -m smart_spider.dataset_cli \
 | `sogou` | image | static |
 | `360` | image | static |
 | `bilibili` | video | static（API） |
+| `douyin` | video | **dynamic**（显式选择，支持连续滚动） |
 | `bing_video` | video | static |
 | `baidu_text` | text | static |
 | `bing_text` | text | static |
@@ -428,3 +429,78 @@ python -m smart_spider.dataset_cli --config job.yaml --total 100
 ## License
 
 见 [LICENSE](./LICENSE)
+
+## 抖音视频采集
+
+支持关键词搜索、单视频（含分享短链接和分享文案）、用户主页作品列表。
+参考 [XiaoFeng2233/douyin-spider](https://github.com/XiaoFeng2233/douyin-spider)
+的单视频/主页入口设计，以 Python 独立实现。通过 Playwright 读取页面和视频接口响应，
+在同一页面滚动加载并按视频 ID 去重；图集和直播不作为视频采集。
+
+```bash
+pip install -e ".[browser,video]"
+playwright install chromium
+
+# 在原有 SmartSpider 命令中使用抖音搜索
+python spider.py --keywords 猫咪 --media_types video \
+  --search_engines douyin --max_items 20 --cookies_file ./cookies.txt
+
+# 专用命令：搜索视频
+python -m smart_spider.douyin_cli --keyword 猫咪 --max-items 20 \
+  --cookies-file ./cookies.txt --output ./output_douyin
+
+# 视频链接或分享文案（替换成实际链接）
+python -m smart_spider.douyin_cli --url 'https://v.douyin.com/你的分享码/' \
+  --cookies-file ./cookies.txt
+
+# 用户主页批量下载（替换成实际主页）
+python -m smart_spider.douyin_cli --url 'https://www.douyin.com/user/用户标识' \
+  --max-items 100 --cookies-file ./cookies.txt
+
+# 显示浏览器，并留出两分钟手动登录或完成验证
+python -m smart_spider.douyin_cli --keyword 猫咪 --max-items 5 \
+  --no-headless --login-wait 120
+
+# 已安装 Chrome 时可直接使用，无需下载 Playwright 完整浏览器
+python -m smart_spider.douyin_cli --keyword 三角洲行动 --max-items 10 \
+  --browser-channel chrome --no-headless --login-wait 180
+```
+
+`--browser-channel chrome` 使用独立的临时浏览器会话，不读取日常 Chrome 的个人资料，
+手动登录或验证仅对本次会话有效。没有 Cookie 时，可在等待时间内自行完成页面验证。
+
+安装后也可使用 `smart-spider-douyin`。`--cookies-file` 使用 Netscape cookies.txt 格式，
+同时用于浏览器和 yt-dlp；仅抖音相关且未过期的 Cookie 会导入浏览器。省略此参数可尝试
+匿名访问，遇到登录/验证或空结果时会报告原因。不会自动绕过验证码或获取私密作品。
+
+专用命令支持 `--metadata-only`（只发现和导出元数据）、`--max-scrolls 50`（滚动次数上限）、
+`--timeout 30`（页面和网络超时）、`--proxy`（浏览器和下载共用代理）、
+`--max-size 500m`（单视频大小上限）。`--max-items` 是最多发现/尝试下载的数量，
+作品不足、平台限制或下载失败时可能达不到该数量。只有发现成功且没有下载失败才返回退出码 0；
+空结果或部分下载失败返回 1。
+
+输出按 `output_douyin/{视频ID}/` 组织，包含视频和同 ID 的 JSON 元数据；
+`douyin_results.json` 记录本次发现数、下载成功数和每条结果状态。
+视频优先使用页面实际返回的 MP4 地址，以有界流式下载校验大小和完整性；
+没有直链时交给 yt-dlp，可能需要有效的 cookies.txt。直链下载保留平台返回的版本，
+不保证去水印，也不执行格式转码；原有 `--video_format` 仅适用于 yt-dlp 路径。
+不在结果清单中保存临时签名直链或 Cookie。图集、直播和评论采集不在此入口的范围内。
+
+抖音不会自动加入默认搜索引擎列表，需要显式选择 `douyin`。
+本节已接入的入口为 `spider.py` / `SmartSpider` 和专用 `douyin_cli`。
+真实可用性受登录态、网络和平台页面变化影响，单元测试不代表线上始终可用。
+
+抖音发现阶段失败时，输出目录中的 `douyin_diagnostics.json` 会记录页面标题、
+搜索/作品接口路径、HTTP 状态码和解析到的视频数，便于区分验证拦截与解析问题。
+诊断文件不包含 Cookie、接口查询参数和响应原文。
+
+人工验证推荐使用确认模式，浏览器会持续等待，直到你看到搜索结果后在终端按回车，
+不会因固定等待时间结束而丢失临时会话：
+
+```bash
+python -m smart_spider.douyin_cli --keyword 三角洲行动 --max-items 10 \
+  --browser-channel chrome --wait-for-login
+```
+
+该模式自动显示浏览器；验证期间继续处理页面事件，关闭浏览器或终端输入结束会报错，
+不会被当作已经完成验证。

@@ -347,6 +347,28 @@ class BilibiliVideoEngine(SearchEngine):
         return items
 
 
+class DouyinVideoEngine(SearchEngine):
+    """抖音搜索；连续滚动由 DouyinCrawler 完成，不伪造 offset 分页。"""
+    name = "douyin"
+    media_type = MediaType.VIDEO
+    render_mode = RenderMode.DYNAMIC
+    explicit_only = True
+
+    def build_search_url(self, keyword, page):
+        from .douyin import normalize_input
+        return normalize_input(keyword, keyword=True)
+
+    def extract_items(self, html):
+        from .douyin import parse_page
+        try:
+            data = json.loads(html)
+            if isinstance(data, dict) and "douyin_items" in data:
+                return data["douyin_items"]
+        except (ValueError, TypeError):
+            pass
+        return parse_page(html)
+
+
 class BingVideoEngine(SearchEngine):
     """Bing 视频搜索引擎（静态 API）。"""
     name = "bing_video"
@@ -607,6 +629,7 @@ ENGINE_REGISTRY: dict[str, SearchEngine] = {
     "weibo":        WeiboPicEngine(),
     # 视频
     "bilibili":     BilibiliVideoEngine(),
+    "douyin":       DouyinVideoEngine(),
     "bing_video":   BingVideoEngine(),
     # 文本
     "baidu_text":   BaiduTextEngine(),

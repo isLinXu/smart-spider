@@ -117,7 +117,8 @@ class SearchDiscoverySource:
             return SourceResponse(error="missing_query")
         names = self.engines or task.metadata.get("engines")
         if not names:
-            names = list(ENGINE_REGISTRY)
+            names = [name for name, engine in ENGINE_REGISTRY.items()
+                     if not getattr(engine, "explicit_only", False)]
         pages = max(1, int(task.metadata.get("pages", 1)))
         max_candidates = max(1, int(task.metadata.get("max_candidates", 1000)))
         candidates: list[CandidateResource] = []

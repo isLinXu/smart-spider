@@ -290,6 +290,7 @@ class SmartSpider:
             self.search_engines = [
                 name for name, eng in ENGINE_REGISTRY.items()
                 if eng.media_type.value in self.media_types
+                and not getattr(eng, "explicit_only", False)
             ]
         logger.info(f"Active engines: {self.search_engines}")
 
@@ -323,6 +324,9 @@ class SmartSpider:
         # 动态渲染器（懒加载）
         self._renderer: Optional[DynamicRenderer] = None
         self._renderer_cookies = cookies or []
+        self._douyin_cookies_file = cookies_file
+        self._douyin_timeout = timeout
+        self._douyin_proxy = browser_proxy or (proxies[0] if proxies else None)
         self._browser_proxy = browser_proxy
         self._headless = headless
         if use_browser:
@@ -436,6 +440,19 @@ class SmartSpider:
     # ──────────────────────────────────────────────────────────────
 
     def _fetch_page(self, engine_name: str, url: str) -> str:
+        if engine_name == "douyin":
+            from urllib.parse import unquote, urlsplit
+            from .douyin import DouyinCrawler
+            crawler = DouyinCrawler(
+                cookies_file=getattr(self, "_douyin_cookies_file", None),
+                cookies=self._renderer_cookies, headless=self._headless,
+                proxy=getattr(self, "_douyin_proxy", self._browser_proxy),
+                timeout=getattr(self, "_douyin_timeout", 30),
+                url_policy=getattr(getattr(self, "_http", None), "url_policy", None),
+            )
+            keyword = unquote(urlsplit(url).path.removeprefix("/search/"))
+            items = crawler.discover(keyword, keyword=True, limit=self.max_items)
+            return json.dumps({"douyin_items": items}, ensure_ascii=False)
         eng = get_engine(engine_name)
         if eng.render_mode == RenderMode.DYNAMIC:
             if self._renderer is None:
@@ -772,7 +789,14 @@ class SmartSpider:
             url, keyword, meta = item
             title = meta.get("title", "")
             logger.info(f"视频: {title[:40]}  {url[:55]}")
-            success = self._video_dl.download(url, save_dir)
+            if meta.get("aweme_id"):
+                from .douyin import download_item
+                success = download_item(
+                    {"url": url, "meta": meta}, save_dir,
+                    downloader=self._video_dl, http_client=self._http,
+                )
+            else:
+                success = self._video_dl.download(url, save_dir)
             with lock:
                 if not success:
                     self.stats.inc_failed("video")
@@ -892,6 +916,9 @@ class SmartSpider:
           - Dynamic engines skip probing (too costly), use estimated page count
         """
         eng = get_engine(engine_name)
+
+        if engine_name == "douyin":
+            return 1  # One browser session performs continuous scrolling.
 
         # dynamic engines are too expensive to probe; use estimated page count
         if eng.render_mode == RenderMode.DYNAMIC:
