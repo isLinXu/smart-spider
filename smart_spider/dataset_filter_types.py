@@ -137,6 +137,10 @@ class VisualSignals:
     ocr_text: str = ""
     promotion_hits: tuple[str, ...] = ()
     contact_hits: int = 0
+    # Explicit disclosure terms such as "AI generated" or "AI生成" are
+    # stronger evidence than a generic OCR/text-density hit.  They are kept
+    # separate so downstream policy can audit why an item was held.
+    synthetic_watermark_hits: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -207,6 +211,9 @@ class FilterDecision:
         payload = asdict(self)
         payload["reasons"] = list(self.reasons)
         payload["signals"]["promotion_hits"] = list(self.signals.promotion_hits)
+        payload["signals"]["synthetic_watermark_hits"] = list(
+            self.signals.synthetic_watermark_hits
+        )
         return payload
 
     @classmethod
@@ -235,6 +242,9 @@ class FilterDecision:
             ocr_text=str(raw_signals.get("ocr_text") or ""),
             promotion_hits=tuple(str(item) for item in promotion),
             contact_hits=int(raw_signals.get("contact_hits") or 0),
+            synthetic_watermark_hits=tuple(
+                str(item) for item in (raw_signals.get("synthetic_watermark_hits") or ())
+            ),
         )
         return cls(
             record_position=int(payload.get("record_position") or 0),
@@ -261,5 +271,3 @@ class SignalAnalyzer(Protocol):
         scores: Optional[SemanticScores] = None,
     ) -> VisualSignals:
         ...
-
-

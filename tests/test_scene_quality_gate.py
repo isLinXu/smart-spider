@@ -78,3 +78,62 @@ def test_review_queue_is_durable_and_contains_provenance(tmp_path):
                 "safety_helmet": 0.0,
             },
         ))
+
+
+def test_generic_scene_profiles_require_detector_evidence():
+    pedestrian = get_scene_quality_profile("行人")
+    accepted = SceneQualityGate(pedestrian).evaluate(
+        0.3,
+        signals={
+            "person_detector": 0.88,
+            "scene_context": 0.9,
+            "synthetic_image": 0.02,
+            "non_photographic": 0.02,
+        },
+        model_versions={"yolo_model": "fixture.pt"},
+    )
+    uncertain = SceneQualityGate(pedestrian).evaluate(
+        0.3,
+        signals={
+            "person_detector": 0.0,
+            "scene_context": 0.9,
+            "synthetic_image": 0.02,
+            "non_photographic": 0.02,
+        },
+    )
+
+    assert accepted.action == "accept"
+    assert uncertain.action == "review"
+    assert "signal_below_minimum:person_detector" in uncertain.reasons
+
+
+def test_generic_scene_profile_routes_synthetic_image_to_review():
+    profile = get_scene_quality_profile("车辆")
+    decision = SceneQualityGate(profile).evaluate(
+        0.3,
+        signals={
+            "road_vehicle_detector": 0.9,
+            "scene_context": 0.9,
+            "synthetic_image": 0.999,
+            "non_photographic": 0.02,
+        },
+    )
+
+    assert decision.action == "review"
+    assert "signal_above_maximum:synthetic_image" in decision.reasons
+
+
+def test_generic_scene_profile_routes_non_photographic_style_to_review():
+    profile = get_scene_quality_profile("车辆")
+    decision = SceneQualityGate(profile).evaluate(
+        0.3,
+        signals={
+            "road_vehicle_detector": 0.9,
+            "scene_context": 0.9,
+            "synthetic_image": 0.01,
+            "non_photographic": 0.95,
+        },
+    )
+
+    assert decision.action == "review"
+    assert "signal_above_maximum:non_photographic" in decision.reasons

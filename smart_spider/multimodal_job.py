@@ -360,10 +360,29 @@ class MultimodalDatasetOrchestrator:
         self.scene_review_queue = None
         self.scene_signal_detector = scene_signal_detector
         if config.scene_quality_gate_enabled:
+            profile = get_scene_quality_profile(config.scene or "")
             if self.scene_signal_detector is None:
-                self.scene_signal_detector = default_scene_signal_detector()
+                generic = profile.name in {"pedestrian", "road_vehicle"}
+                self.scene_signal_detector = default_scene_signal_detector(
+                    prefer_yolo=generic,
+                    yolo_model=os.environ.get("SMART_SPIDER_YOLO_MODEL", "yolo11n.pt"),
+                    include_synthetic=generic,
+                    include_style=generic,
+                    synthetic_model=(
+                        os.environ.get("SMART_SPIDER_SYNTHETIC_MODEL") or None
+                    ),
+                    synthetic_config=(
+                        os.environ.get("SMART_SPIDER_SYNTHETIC_CONFIG") or None
+                    ),
+                    synthetic_cache_dir=(
+                        os.environ.get("SMART_SPIDER_SYNTHETIC_CACHE_DIR") or None
+                    ),
+                    style_cache_dir=(
+                        os.environ.get("SMART_SPIDER_STYLE_CACHE_DIR") or ".filter_cache"
+                    ),
+                )
             self.scene_quality_gate = SceneQualityGate(
-                get_scene_quality_profile(config.scene or ""),
+                profile,
                 detector=self.scene_signal_detector,
             )
             queue_path = config.scene_review_queue_path or os.path.join(

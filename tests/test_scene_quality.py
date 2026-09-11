@@ -25,6 +25,11 @@ def test_builtin_profiles_cover_six_requested_scenes():
     } <= names
     assert get_scene_quality_profile("未穿反光衣").name == "no_reflective_vest"
     assert get_scene_quality_profile("叉车司机未戴安全帽").prompts.scene_evidence
+    assert get_scene_quality_profile("行人").name == "pedestrian"
+    assert get_scene_quality_profile("斑马线行人").name == "pedestrian"
+    assert get_scene_quality_profile("车辆").name == "road_vehicle"
+    assert get_scene_quality_profile("停车场车辆").name == "road_vehicle"
+    assert {"pedestrian", "road_vehicle"} <= names
 
 
 def test_custom_json_profile_is_strict(tmp_path):

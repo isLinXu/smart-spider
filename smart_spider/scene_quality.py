@@ -308,6 +308,77 @@ _BUILTIN_PROFILES: dict[str, SceneQualityProfile] = {
         acceptance_score=0.28,
         review_score=0.23,
     ),
+    "pedestrian": _profile(
+        "pedestrian",
+        "Real-world photograph containing at least one visible pedestrian.",
+        (
+            "a real-world photograph of a pedestrian walking or standing in a street, crossing, sidewalk, station, or public place",
+            "a surveillance or street-view photograph with one or more clearly visible people",
+            "people walking naturally in an outdoor or public environment",
+        ),
+        (
+            "a book cover, vocabulary card, poster, infographic, screenshot, or image dominated by text",
+            "a cartoon, anime image, comic, vector illustration, icon, sketch, painting, or children's drawing",
+            "a 3D render, toy, mannequin, miniature model, or abstract human symbol",
+            "an empty road, empty sidewalk, landscape, building, or room with no visible person",
+            "a cropped face, selfie, studio portrait, or fashion product photograph with no pedestrian scene",
+        ),
+        (
+            "a natural camera photograph with at least one clearly visible person in a real environment",
+            "a pedestrian visible from enough of the body to confirm a real person in a real-world scene",
+        ),
+        thresholds=_thresholds(
+            min_relevance=0.215,
+            mismatch_margin=0.03,
+            text_area_ratio=0.08,
+            minimum_scene_evidence=0.19,
+            scene_evidence_margin=0.04,
+        ),
+        signals=(
+            SignalRequirement("person_detector", minimum=0.2),
+            SignalRequirement("scene_context", minimum=0.15),
+            SignalRequirement("synthetic_image", maximum=0.98),
+            SignalRequirement("non_photographic", maximum=0.92),
+        ),
+        acceptance_score=0.23,
+        review_score=0.2,
+    ),
+    "road_vehicle": _profile(
+        "road_vehicle",
+        "Real-world photograph containing at least one complete road vehicle.",
+        (
+            "a real-world traffic photograph containing a car, bus, truck, van, motorcycle, or bicycle",
+            "a natural road, parking, or work-zone photograph with a clearly visible road vehicle",
+            "a complete road vehicle photographed in a real outdoor or operational environment",
+        ),
+        (
+            "a book cover, vocabulary card, poster, infographic, screenshot, or image dominated by text",
+            "a cartoon, anime image, comic, vector illustration, icon, sketch, painting, or children's drawing",
+            "a 3D render, concept rendering, miniature model, toy vehicle, or video game screenshot",
+            "a vehicle advertisement, catalog listing, studio product cutout, or promotional image",
+            "a tire, engine, badge, dashboard, vehicle part, or charging equipment with no complete road vehicle",
+            "an aircraft, train, ship, industrial machine, or empty road with no visible road vehicle",
+        ),
+        (
+            "a natural camera photograph with a complete car, bus, truck, van, motorcycle, or bicycle in a real environment",
+            "a clearly visible road vehicle with realistic lighting, texture, wheels, and surrounding scene",
+        ),
+        thresholds=_thresholds(
+            min_relevance=0.215,
+            mismatch_margin=0.03,
+            text_area_ratio=0.08,
+            minimum_scene_evidence=0.19,
+            scene_evidence_margin=0.04,
+        ),
+        signals=(
+            SignalRequirement("road_vehicle_detector", minimum=0.2),
+            SignalRequirement("scene_context", minimum=0.15),
+            SignalRequirement("synthetic_image", maximum=0.98),
+            SignalRequirement("non_photographic", maximum=0.92),
+        ),
+        acceptance_score=0.23,
+        review_score=0.2,
+    ),
 }
 
 _ALIASES = {
@@ -322,6 +393,15 @@ _ALIASES = {
     "叉车未戴安全帽": "forklift_driver_no_helmet",
     "物品滞留": "material_stagnation",
     "滞留": "material_stagnation",
+    "行人": "pedestrian",
+    "城市道路行人": "pedestrian",
+    "斑马线行人": "pedestrian",
+    "pedestrians": "pedestrian",
+    "车辆": "road_vehicle",
+    "道路交通车辆": "road_vehicle",
+    "停车场车辆": "road_vehicle",
+    "vehicle": "road_vehicle",
+    "vehicles": "road_vehicle",
 }
 
 

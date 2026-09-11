@@ -149,6 +149,12 @@ from .scene_signal_detector import (
     YoloSceneSignalDetector,
     default_scene_signal_detector,
 )
+from .synthetic_image_detector import (
+    CLIPPhotographicStyleDetector,
+    CompositeSceneSignalDetector,
+    OnnxSyntheticImageDetector,
+    download_synthetic_image_detector,
+)
 from .dataset_governance import (
     LeakageSafeSplitter,
     PerceptualFingerprint,
@@ -320,6 +326,10 @@ __all__ = [
     "HeuristicSceneSignalDetector",
     "YoloSceneSignalDetector",
     "default_scene_signal_detector",
+    "CompositeSceneSignalDetector",
+    "CLIPPhotographicStyleDetector",
+    "OnnxSyntheticImageDetector",
+    "download_synthetic_image_detector",
     "LeakageSafeSplitter",
     "PerceptualFingerprint",
     "QuotaLedger",

@@ -8,9 +8,9 @@ that gap with:
 * :class:`YoloSceneSignalDetector` — optional ultralytics YOLO backend
 * :func:`default_scene_signal_detector` — prefer YOLO when importable
 
-Heuristic scores are intentionally conservative and fail-closed: they emit a
-complete named signal vector so the gate can evaluate requirements, but they
-are not a substitute for a calibrated detector in production.
+Heuristic scores are intentionally conservative and fail-closed.  They omit
+forensic and style signals they cannot measure, so profiles that require those
+signals route the sample to review instead of inventing a zero-risk score.
 """
 from __future__ import annotations
 
@@ -32,6 +32,15 @@ _DEFAULT_SIGNAL_NAMES: tuple[str, ...] = (
     "safety_helmet",
     "forklift",
     "forklift_operator",
+    # Generic gates require actual object-detector evidence rather than the
+    # color/geometry heuristics used as conservative priors for safety scenes.
+    "person_detector",
+    "road_vehicle_detector",
+    "scene_context",
+    # Omitted rather than fabricated by heuristic/YOLO backends.  Generic
+    # profiles route the missing forensic evidence to review until an
+    # explicit synthetic-image detector is composed in.
+    "synthetic_image",
 )
 
 
@@ -49,7 +58,11 @@ class HeuristicSceneSignalDetector:
         rgb = self._as_rgb_array(image)
         height, width = rgb.shape[:2]
         if height < 8 or width < 8:
-            return {name: 0.0 for name in _DEFAULT_SIGNAL_NAMES}
+            return {
+                name: 0.0
+                for name in _DEFAULT_SIGNAL_NAMES
+                if name != "synthetic_image"
+            }
 
         # Downsample for cheap stats.
         step_y = max(1, height // 128)
@@ -60,7 +73,8 @@ class HeuristicSceneSignalDetector:
         b = sample[:, :, 2].astype(np.float32)
         mx = np.maximum(np.maximum(r, g), b)
         mn = np.minimum(np.minimum(r, g), b)
-        sat = np.where(mx > 1e-3, (mx - mn) / mx, 0.0)
+        sat = np.zeros_like(mx, dtype=np.float32)
+        np.divide(mx - mn, mx, out=sat, where=mx > 1e-3)
         val = mx / 255.0
 
         # Skin-like tones → weak person / upper_body / head proxies.
@@ -116,7 +130,21 @@ class HeuristicSceneSignalDetector:
         forklift = _clamp(yellow_ratio * 3.0 + operational * 0.35)
         forklift_operator = _clamp(min(forklift, person) * 1.1)
 
-        return {
+        # Product cutouts and icons often occupy a uniformly black or white
+        # canvas.  Border occupancy is a conservative cue that a real scene
+        # background is present; uncertain cases are routed to review.
+        border_width = max(1, min(sample.shape[:2]) // 16)
+        border = np.concatenate((
+            sample[:border_width].reshape(-1, 3),
+            sample[-border_width:].reshape(-1, 3),
+            sample[border_width:-border_width, :border_width].reshape(-1, 3),
+            sample[border_width:-border_width, -border_width:].reshape(-1, 3),
+        ))
+        near_black = float(np.mean(np.max(border, axis=1) < 18))
+        near_white = float(np.mean(np.min(border, axis=1) > 237))
+        scene_context = _clamp(1.0 - max(near_black, near_white))
+
+        signals = {
             "person": person,
             "upper_body": upper_body,
             "head": head,
@@ -127,7 +155,15 @@ class HeuristicSceneSignalDetector:
             "safety_helmet": helmet,
             "forklift": forklift,
             "forklift_operator": forklift_operator,
+            # Strong generic-object evidence is intentionally unavailable in
+            # this heuristic backend.  Keeping explicit zeroes makes that
+            # limitation auditable and causes the generic gates to fail closed.
+            "person_detector": 0.0,
+            "road_vehicle_detector": 0.0,
+            "scene_context": scene_context,
         }
+        signals.pop("synthetic_image", None)
+        return signals
 
     @staticmethod
     def _as_rgb_array(image: Any) -> np.ndarray:
@@ -153,8 +189,10 @@ class YoloSceneSignalDetector:
         "person": "person",
         "cell phone": "mobile_phone",
         "mobile phone": "mobile_phone",
-        "truck": "forklift",
         "forklift": "forklift",
+    }
+    _ROAD_VEHICLE_CLASSES = {
+        "bicycle", "car", "motorcycle", "motorbike", "bus", "truck",
     }
 
     def __init__(
@@ -206,10 +244,18 @@ class YoloSceneSignalDetector:
             return signals
         for conf, cls_id in zip(confs.tolist(), clss.tolist()):
             label = str(names.get(int(cls_id), "")).casefold()
+            score = _clamp(float(conf))
+            if label == "person":
+                signals["person_detector"] = max(
+                    signals.get("person_detector", 0.0), score
+                )
+            if label in self._ROAD_VEHICLE_CLASSES:
+                signals["road_vehicle_detector"] = max(
+                    signals.get("road_vehicle_detector", 0.0), score
+                )
             signal = self._CLASS_TO_SIGNAL.get(label)
             if signal is None:
                 continue
-            score = _clamp(float(conf))
             signals[signal] = max(signals.get(signal, 0.0), score)
             if signal == "person":
                 signals["upper_body"] = max(signals.get("upper_body", 0.0), score * 0.9)
@@ -225,7 +271,14 @@ def default_scene_signal_detector(
     *,
     prefer_yolo: bool = False,
     yolo_model: str = "yolov8n.pt",
-) -> HeuristicSceneSignalDetector | YoloSceneSignalDetector:
+    include_synthetic: bool = False,
+    include_style: bool = False,
+    synthetic_model: Optional[str] = None,
+    synthetic_config: Optional[str] = None,
+    synthetic_cache_dir: Optional[str] = None,
+    style_device: str = "auto",
+    style_cache_dir: Optional[str] = None,
+) -> Any:
     """Return a runnable default detector.
 
     Heuristics are the default so enabling the scene gate never downloads
@@ -236,12 +289,51 @@ def default_scene_signal_detector(
 
     env_pref = os.environ.get("SMART_SPIDER_SCENE_DETECTOR", "").strip().casefold()
     use_yolo = prefer_yolo or env_pref == "yolo"
+    detector: Any = HeuristicSceneSignalDetector()
     if use_yolo:
         try:
-            return YoloSceneSignalDetector(model_name=yolo_model)
+            detector = YoloSceneSignalDetector(model_name=yolo_model)
         except Exception:
             pass
-    return HeuristicSceneSignalDetector()
+    detectors = [detector]
+    if include_synthetic:
+        try:
+            from .synthetic_image_detector import (
+                OnnxSyntheticImageDetector,
+                download_synthetic_image_detector,
+            )
+
+            if synthetic_model:
+                model_path = synthetic_model
+                config_path = synthetic_config
+            else:
+                model_path, config_path = download_synthetic_image_detector(
+                    cache_dir=synthetic_cache_dir,
+                )
+            detectors.append(
+                OnnxSyntheticImageDetector(model_path, config_path=config_path)
+            )
+        except Exception:
+            # The profile still requires synthetic_image, so returning the
+            # object detector alone fails closed to review instead of turning
+            # a transient model/download problem into a crawler outage.
+            pass
+    if include_style:
+        try:
+            from .synthetic_image_detector import CLIPPhotographicStyleDetector
+
+            detectors.append(CLIPPhotographicStyleDetector(
+                device=style_device,
+                cache_dir=style_cache_dir,
+            ))
+        except Exception:
+            # Missing style evidence is handled by the profile requirement.
+            pass
+    if len(detectors) > 1:
+        from .synthetic_image_detector import CompositeSceneSignalDetector
+
+        return CompositeSceneSignalDetector(*detectors)
+    return detector
 
 
 def _clamp(value: float) -> float:

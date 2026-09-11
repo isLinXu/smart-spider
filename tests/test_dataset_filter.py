@@ -118,6 +118,102 @@ def test_decision_policy_distinguishes_advertisement_mismatch_and_keep():
     assert keep.action == "keep"
 
 
+def test_decision_policy_excludes_text_supported_document_or_illustration():
+    decision = DecisionPolicy(
+        FilterThresholds(text_area_ratio=0.08)
+    ).decide(
+        record_position=0,
+        path="illustrated-book.jpg",
+        scores=SemanticScores(
+            relevance=0.27,
+            advertisement=0.19,
+            mismatch=0.24,
+            mismatch_prompt="a cartoon or illustrated book cover",
+            scene_evidence=0.28,
+        ),
+        signals=VisualSignals(text_area_ratio=0.15),
+    )
+
+    assert decision.action == "quarantine"
+    assert decision.category == "semantic_mismatch"
+    assert decision.reasons == ("document_or_illustration_with_text",)
+
+
+def test_decision_policy_excludes_text_overlaid_3d_render():
+    decision = DecisionPolicy(
+        FilterThresholds(text_area_ratio=0.08)
+    ).decide(
+        record_position=0,
+        path="render-with-labels.jpg",
+        scores=SemanticScores(
+            relevance=0.28,
+            advertisement=0.16,
+            mismatch=0.24,
+            mismatch_prompt="a 3D render or concept rendering of a vehicle",
+            scene_evidence=0.29,
+        ),
+        signals=VisualSignals(text_area_ratio=0.10),
+    )
+
+    assert decision.action == "quarantine"
+    assert decision.category == "semantic_mismatch"
+    assert decision.reasons == ("document_or_illustration_with_text",)
+
+
+def test_decision_policy_excludes_explicit_synthetic_watermark():
+    decision = DecisionPolicy().decide(
+        record_position=0,
+        path="generated.jpg",
+        scores=SemanticScores(0.31, 0.10, 0.10),
+        signals=VisualSignals(synthetic_watermark_hits=("AI生成",)),
+    )
+
+    assert decision.action == "quarantine"
+    assert decision.category == "synthetic_image"
+    assert decision.reasons == ("synthetic_watermark",)
+    assert decision.to_dict()["signals"]["synthetic_watermark_hits"] == ["AI生成"]
+
+
+def test_visual_signal_analyzer_prefers_local_chinese_ocr_language(monkeypatch):
+    class OCR:
+        @staticmethod
+        def get_languages(config=""):
+            return ["eng", "chi_sim", "osd"]
+
+    monkeypatch.delenv("SMART_SPIDER_OCR_LANG", raising=False)
+    assert VisualSignalAnalyzer._select_ocr_language(OCR()) == "eng+chi_sim"
+    monkeypatch.setenv("SMART_SPIDER_OCR_LANG", "chi_sim")
+    assert VisualSignalAnalyzer._select_ocr_language(OCR()) == "chi_sim"
+
+
+def test_visual_signal_analyzer_detects_ocr_confusable_ai_disclosure(monkeypatch):
+    analyzer = VisualSignalAnalyzer(enable_ocr=False, ocr_all=True)
+    monkeypatch.setattr(
+        analyzer,
+        "_run_ocr",
+        lambda image: ("@拾 Al 生成", 0.02, 2),
+    )
+
+    signals = analyzer.analyze(Image.new("RGB", (64, 64), "white"))
+
+    assert signals.synthetic_watermark_hits == ("al生成",)
+
+
+def test_visual_signal_analyzer_does_not_treat_ambiguous_model_names_as_disclosure(
+    monkeypatch,
+):
+    analyzer = VisualSignalAnalyzer(enable_ocr=False, ocr_all=True)
+    monkeypatch.setattr(
+        analyzer,
+        "_run_ocr",
+        lambda image: ("Sora Flux", 0.02, 2),
+    )
+
+    signals = analyzer.analyze(Image.new("RGB", (64, 64), "white"))
+
+    assert signals.synthetic_watermark_hits == ()
+
+
 def test_dry_run_is_non_mutating_and_samples_evenly(tmp_path):
     _write_dataset(tmp_path)
     report = _filter(tmp_path).run(limit=2, run_id="dry")

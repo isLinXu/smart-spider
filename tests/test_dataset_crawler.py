@@ -205,6 +205,46 @@ def test_scene_quality_gate_queues_missing_detector_evidence(tmp_path):
         crawler.close()
 
 
+def test_generic_scene_gate_enables_forensic_and_style_signals_by_default(
+    tmp_path, monkeypatch
+):
+    captured = {}
+
+    class Detector:
+        model_versions = {
+            "scene_signal_detector": "fixture",
+            "yolo_model": "fixture.pt",
+        }
+
+        def detect(self, image):
+            return {}
+
+    def build_detector(**kwargs):
+        captured.update(kwargs)
+        return Detector()
+
+    monkeypatch.setattr(
+        "smart_spider.dataset_crawler.default_scene_signal_detector",
+        build_detector,
+    )
+    crawler = DatasetCrawler(
+        ["车辆"],
+        total_count=1,
+        output_dir=str(tmp_path),
+        use_clip=False,
+        state_db="",
+        scene_targets={"车辆": 1},
+        scene_quality_gate_enabled=True,
+    )
+    try:
+        assert captured["prefer_yolo"] is True
+        assert captured["include_synthetic"] is True
+        assert captured["include_style"] is True
+        assert captured["style_device"] == "auto"
+    finally:
+        crawler.close()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # ProgressManager 测试
 # ──────────────────────────────────────────────────────────────────────────────
@@ -357,7 +397,7 @@ class TestDatasetCrawlerInit:
         tmp = tempfile.mkdtemp()
         query = os.path.join(tmp, "query.jpg")
         Image.new("RGB", (32, 32), (255, 0, 0)).save(query)
-        with pytest.raises(RuntimeError, match="query_image requires CLIP"):
+        with pytest.raises(ValueError, match="query_image requires use_clip=True"):
             DatasetCrawler(
                 keywords=["test"],
                 total_count=1,

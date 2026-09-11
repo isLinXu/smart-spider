@@ -53,6 +53,9 @@ filter = [
     "opencv-python-headless>=4.8.0",
     "pytesseract>=0.3.10",
     "transformers>=4.40.0",
+    "huggingface-hub>=0.24.0",
+    "onnxruntime>=1.18.0",
+    "ultralytics>=8.3.0",
 ]
 # 开发工具
 dev = [
@@ -76,6 +79,9 @@ all = [
     "opencv-python-headless>=4.8.0",
     "pytesseract>=0.3.10",
     "transformers>=4.40.0",
+    "huggingface-hub>=0.24.0",
+    "onnxruntime>=1.18.0",
+    "ultralytics>=8.3.0",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.27.0",
     "redis>=5.0.0",
@@ -101,6 +107,7 @@ smart-spider-multimodal = "smart_spider.multimodal_cli:main"
 smart-spider-image-search = "smart_spider.image_search_cli:main"
 smart-spider-reverse-image-search = "smart_spider.reverse_image_search_cli:main"
 smart-spider-filter = "smart_spider.dataset_filter_cli:main"
+smart-spider-quality-validate = "smart_spider.quality_validation_cli:main"
 smart-spider-api = "smart_spider.api:main"
 smart-spider-worker = "smart_spider.worker:main"
 smart-spider-db-stats = "smart_spider.db_stats_cli:main"

@@ -415,7 +415,36 @@ class DatasetCrawler:
                     + ", ".join(sorted(unknown_scenes))
                 )
             if self.scene_signal_detector is None:
-                self.scene_signal_detector = default_scene_signal_detector()
+                detector_only_profiles = {"pedestrian", "road_vehicle"}
+                prefer_yolo = bool(scene_names & detector_only_profiles)
+                self.scene_signal_detector = default_scene_signal_detector(
+                    prefer_yolo=prefer_yolo,
+                    yolo_model=os.environ.get(
+                        "SMART_SPIDER_YOLO_MODEL", "yolo11n.pt"
+                    ),
+                    include_synthetic=prefer_yolo,
+                    include_style=prefer_yolo,
+                    synthetic_model=(
+                        os.environ.get("SMART_SPIDER_SYNTHETIC_MODEL") or None
+                    ),
+                    synthetic_config=(
+                        os.environ.get("SMART_SPIDER_SYNTHETIC_CONFIG") or None
+                    ),
+                    synthetic_cache_dir=(
+                        os.environ.get("SMART_SPIDER_SYNTHETIC_CACHE_DIR") or None
+                    ),
+                    style_device="auto",
+                    style_cache_dir=(
+                        os.environ.get("SMART_SPIDER_STYLE_CACHE_DIR") or ".filter_cache"
+                    ),
+                )
+                if prefer_yolo:
+                    versions = self.scene_signal_detector.model_versions
+                    if "yolo_model" not in versions:
+                        raise RuntimeError(
+                            "pedestrian/road_vehicle scene gates require a runnable "
+                            "YOLO detector; install ultralytics and provide local weights"
+                        )
         self.scene_review_queue: Optional[JsonlSceneReviewQueue] = None
         self._scene_quality_stats = {"accept": 0, "review": 0, "reject": 0}
         if self.scene_quality_gate_enabled:

@@ -107,6 +107,20 @@
       "semantic_score": 0.10,
       "signals": {"materials": 0.7, "passage_or_exit": 0.65, "obstruction": 0.6},
       "expected_action": "reject"
+    },
+    {
+      "id": "pedestrian_accept_real_photo",
+      "profile": "pedestrian",
+      "semantic_score": 0.30,
+      "signals": {"person_detector": 0.9, "scene_context": 0.9, "synthetic_image": 0.02, "non_photographic": 0.02},
+      "expected_action": "accept"
+    },
+    {
+      "id": "road_vehicle_review_synthetic",
+      "profile": "road_vehicle",
+      "semantic_score": 0.30,
+      "signals": {"road_vehicle_detector": 0.9, "scene_context": 0.9, "synthetic_image": 0.999, "non_photographic": 0.02},
+      "expected_action": "review"
     }
   ]
 }

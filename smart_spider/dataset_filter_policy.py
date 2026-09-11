@@ -36,6 +36,21 @@ class DecisionPolicy:
         if signals.contact_hits:
             reasons.append("contact_information")
             ad_evidence += min(signals.contact_hits, 2)
+        if signals.synthetic_watermark_hits:
+            reasons.append("synthetic_watermark")
+            # An explicit generator disclosure is sufficient to keep the
+            # image out of the accepted set, but remains auditable as a
+            # content quarantine rather than an opaque model rejection.
+            return FilterDecision(
+                record_position=record_position,
+                path=path,
+                action="quarantine",
+                category="synthetic_image",
+                reasons=tuple(reasons),
+                scores=scores,
+                signals=signals,
+                confidence="high",
+            )
         if signals.text_area_ratio >= thresholds.text_area_ratio:
             reasons.append("text_heavy")
             ad_evidence += 1
@@ -70,6 +85,46 @@ class DecisionPolicy:
                 scores=scores,
                 signals=signals,
                 confidence=confidence,
+            )
+
+        # CLIP can still favor a depicted person/vehicle on book covers and
+        # cartoons.  Require two independent cues (a document/illustration
+        # negative prompt plus measurable text) before excluding it.
+        mismatch_prompt = scores.mismatch_prompt.casefold()
+        document_or_illustration = any(marker in mismatch_prompt for marker in (
+            "book cover",
+            "vocabulary card",
+            "poster",
+            "infographic",
+            "screenshot",
+            "cartoon",
+            "anime",
+            "comic",
+            "illustration",
+            "children's drawing",
+            "3d render",
+            "concept rendering",
+            "miniature model",
+            "toy vehicle",
+            "video game screenshot",
+            "vector illustration",
+            "digital illustration",
+            "traffic diagram",
+        ))
+        if (
+            document_or_illustration
+            and signals.text_area_ratio >= thresholds.text_area_ratio
+            and scores.mismatch >= max(0.22, thresholds.min_relevance)
+        ):
+            return FilterDecision(
+                record_position=record_position,
+                path=path,
+                action="quarantine",
+                category="semantic_mismatch",
+                reasons=("document_or_illustration_with_text",),
+                scores=scores,
+                signals=signals,
+                confidence="medium",
             )
 
         mismatch_reasons: list[str] = []
@@ -125,4 +180,3 @@ class DecisionPolicy:
             signals=signals,
             confidence=confidence,
         )
-

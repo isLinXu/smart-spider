@@ -1,49 +1,7 @@
-# smart-spider 依赖清单（v2）
-# 安装：pip install -r requirements.txt
-# CLIP：pip install git+https://github.com/openai/CLIP.git
+# Runtime installation is defined in pyproject.toml.
+# Keep this compatibility file aligned with package metadata:
+-e .[all]
 
-# ── 深度学习核心 ──────────────────────────────────────────────────
-torch>=1.13.0
-torchvision>=0.14.0
-# openai-clip 通过 GitHub 安装：
+# CLIP is an optional upstream package installed from its official repository:
 # pip install git+https://github.com/openai/CLIP.git
-
-# ── 图像处理 ──────────────────────────────────────────────────────
-Pillow>=9.0.0
-numpy>=1.21.0
-
-# ── 网络请求（核心） ──────────────────────────────────────────────
-requests>=2.28.0
-urllib3>=1.26.0
-fake-useragent>=1.4.0
-
-# ── 日志 & 进度条 ────────────────────────────────────────────────
-loguru>=0.6.0
-tqdm>=4.64.0
-
-# ── 动态渲染（反爬）────────────────────────────────────────────────
-# 安装后需执行：playwright install chromium
-playwright>=1.40.0
-# Stealth 补丁（抹去 headless 特征）
-playwright-stealth>=1.0.6
-
-# ── 视频下载 ─────────────────────────────────────────────────────
-yt-dlp>=2023.11.16
-
-# ── 文本提取 ─────────────────────────────────────────────────────
-trafilatura>=1.6.0
-
-# ── TLS 指纹伪造（可选，绕过 Cloudflare Bot 管理）─────────────────
-# curl_cffi>=0.6.0   # 安装后自动启用 Chrome TLS 握手伪装
-
-# ── URL 去重（可选，BloomFilter 内存效率更高）──────────────────────
-# pybloom-live>=3.0.0   # 安装后自动替代 in-memory set
-
-# ── 测试工具 ─────────────────────────────────────────────────────
-# pytest>=7.4.0
-# pytest-cov>=4.1.0
-# pytest-mock>=3.11.0
-
-# ── 可视化（examples/ 可选）────────────────────────────────────────
-# matplotlib>=3.5.0
-
+# Dynamic rendering also needs: playwright install chromium

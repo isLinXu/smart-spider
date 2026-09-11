@@ -177,6 +177,8 @@ artifacts/
 dinox_*/
 dinox_relabel_*/
 .filter_cache/
+quarantine_*/
+*_report.json
 .session_tmps/
 runs/
 
