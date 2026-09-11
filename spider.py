@@ -79,6 +79,8 @@ def main():
                            help="显示浏览器窗口（调试用，需配合 --use_browser）")
     g_browser.add_argument("--browser_proxy", type=str, default=None,
                            help="浏览器专用代理（默认同 --proxies 第一个）")
+    g_browser.add_argument("--allow-private-hosts", action="store_true",
+                           help="允许访问受控内网地址（默认拒绝，以防 SSRF）")
 
     # 视频参数
     g_video = parser.add_argument_group("视频参数（video 模态）")
@@ -201,6 +203,7 @@ def main():
         use_browser=args.use_browser,
         headless=not args.no_headless,
         browser_proxy=args.browser_proxy,
+        allow_private_hosts=args.allow_private_hosts,
         video_format=args.video_format,
         video_max_size=args.video_max_size,
         cookies_file=args.cookies_file,

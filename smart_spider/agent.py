@@ -24,24 +24,23 @@
 >>> agent.close()
 """
 import os
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
 from .browser_controller import BrowserController
-from .perception import PagePerception, PageState
+from .perception import PagePerception
 from .decision import (
     ReActAgent,
     LLMBackend,
     OpenAIBackend,
     QwenBackend,
-    ToolRegistry,
-    Action,
-    StepRecord,
     AgentResult,
 )
-from .http_client import SmartHttpClient, ProxyPool
-from .tools import register_tool, get_tool, list_tools
+from .http_client import SmartHttpClient
+
+if TYPE_CHECKING:
+    from .smart_spider import SmartSpider
 
 
 class BrowserUseAgent:
@@ -90,6 +89,8 @@ class BrowserUseAgent:
         stats: Optional[Any] = None,  # CrawlStats
         callbacks: Optional[list] = None,  # list[CallbackFn]
         proxies: Optional[list[str]] = None,
+        url_policy: Optional[Any] = None,
+        allow_private_hosts: bool = False,
     ):
         """初始化 Agent。
 
@@ -117,6 +118,8 @@ class BrowserUseAgent:
             headless=headless,
             proxy=proxy,
             cookies=cookies,
+            url_policy=url_policy,
+            allow_private_hosts=allow_private_hosts,
         )
 
         # 2. 感知器
@@ -211,6 +214,7 @@ class BrowserUseAgent:
             stats=spider.stats,
             callbacks=spider._callbacks,
             proxies=[],  # 已通过 http_client 共享
+            allow_private_hosts=getattr(spider, "allow_private_hosts", False),
         )
 
         # 如果 spider 已加载 CLIP 模型，直接注入到 perception

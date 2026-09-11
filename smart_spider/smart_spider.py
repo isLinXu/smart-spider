@@ -47,16 +47,13 @@ import hashlib
 import json
 import os
 import queue
-import re
 import shutil
 import signal
-import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
 from io import BytesIO
-from typing import Any, Callable, Optional
+from typing import Optional
 
 import numpy as np
 from loguru import logger
@@ -244,6 +241,7 @@ class SmartSpider:
         video_format: str = "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
         video_max_size: str = "500m",
         cookies_file: Optional[str] = None,
+        allow_private_hosts: bool = False,
         # 断点续采
         resume: bool = False,
         # v2.1 新增参数
@@ -268,6 +266,7 @@ class SmartSpider:
         self._callbacks = callbacks or []
         self._disk_guard_mb = disk_guard_mb
         self._video_concurrency = video_concurrency
+        self.allow_private_hosts = bool(allow_private_hosts)
 
         # 优雅关停：监听 SIGINT/SIGTERM
         self._shutdown_requested = threading.Event()
@@ -318,6 +317,7 @@ class SmartSpider:
             rate=rate,
             max_retries=max_retries,
             timeout=timeout,
+            allow_private_hosts=self.allow_private_hosts,
         )
 
         # 动态渲染器（懒加载）
@@ -330,6 +330,7 @@ class SmartSpider:
                 proxy=browser_proxy,
                 headless=headless,
                 cookies=cookies or [],
+                allow_private_hosts=self.allow_private_hosts,
             )
 
         # CLIP 模型（图片模态专用）
@@ -443,6 +444,7 @@ class SmartSpider:
                     proxy=self._browser_proxy,
                     headless=self._headless,
                     cookies=self._renderer_cookies,
+                    allow_private_hosts=self.allow_private_hosts,
                 )
             return self._renderer.render(url, scroll_to_bottom=True)
         else:

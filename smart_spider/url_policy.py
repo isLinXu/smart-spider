@@ -55,6 +55,7 @@ class URLPolicy:
             or parsed_address.is_multicast
             or parsed_address.is_unspecified
             or parsed_address.is_reserved
+            or not parsed_address.is_global
         )
 
     def resolve_public_addresses(self, url: str) -> frozenset[str]:
