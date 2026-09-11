@@ -7,7 +7,7 @@
 | 能力 | 说明 |
 |------|------|
 | 🖼️ **图片采集** | 百度/Bing/搜狗/360 + CLIP 语义过滤，自动识别文件格式 |
-| 🎬 **视频采集** | B 站、Bing 视频 + yt-dlp 下载（支持 1000+ 平台） |
+| 🎬 **视频采集** | 抖音搜索/主页/分享链接、B 站、Bing 视频，支持 MP4 直链与 yt-dlp 下载 |
 | 📄 **文本采集** | 百度/Bing 网页搜索 + trafilatura 正文提取，输出 JSON |
 | 🔎 **远程以图搜图** | 本地图片上传到百度识图、Bing Visual Search、Google Lens，并返回网页结果 |
 | 🌐 **动态渲染** | Playwright 无头浏览器（处理 JS 加密、SPA、无限滚动） |
@@ -23,7 +23,7 @@
 git clone <repo-url>
 cd smart-spider-v260518
 
-# 基础依赖
+# 基础依赖（requirements.txt 是 pyproject.toml 的兼容入口）
 pip install -r requirements.txt
 
 # CLIP（必须从 GitHub 安装）
@@ -124,6 +124,43 @@ python -m smart_spider.dataset_cli \
 
 可通过 `--jpeg-quality 1-100` 调整 JPG 质量。
 
+### 六类安全场景批量采集
+
+六类场景可以分别设置目标数量。`--scene-targets` 使用 `场景=数量` 格式，
+`--total` 至少应为所有场景目标之和；任务报告会保存每个场景、发现来源和图片域名的实际配额。
+下载默认关闭自动重定向并逐跳校验目标地址，连接与读取超时分离，响应和图片解码均有硬性大小/像素上限。
+
+```bash
+python -m smart_spider.dataset_cli \
+  --keywords "打电话,使用手机,吸烟,未穿反光衣,叉车司机未戴安全帽,物品滞留" \
+  --scene-targets "打电话=20000,使用手机=20000,吸烟=20000,未穿反光衣=20000,叉车司机未戴安全帽=20000,物品滞留=20000" \
+  --total 120000 \
+  --output ./dataset_safety_scenes \
+  --connect-timeout 5 --read-timeout 20 \
+  --max-inflight-pages 8 --max-inflight-downloads 20 \
+  --max-pending-candidates 200 --per-domain-concurrency 2 \
+  --memory-budget-mb 512 --max-image-pixels 50000000 \
+  --max-source-share 0.25 --max-domain-share 0.15 \
+  --resume
+```
+
+场景质量门禁会记录模型、提示词、校准集和阈值指纹；反光衣、安全帽等专用信号缺失的样本不会被自动放行，
+而是进入人工复核队列。采集完成后可使用 `smart_spider.dataset_filter` 的 `--dedupe-near` 检查 pHash/dHash
+近重复；训练集切分应通过 `smart_spider.dataset_governance.LeakageSafeSplitter` 按域名、页面、日期和图片簇分组。
+
+启用主流程质量门禁时必须显式声明场景目标。缺少专用检测器信号的样本会写入
+`scene_review_queue.jsonl`，不会进入数据集：
+
+```bash
+python -m smart_spider.dataset_cli \
+  --keywords "未穿反光衣" --scene-targets "未穿反光衣=100" \
+  --scene-quality-gate --total 100 --output ./dataset_safety
+```
+
+多模态任务同样支持 `--scene <profile> --scene-quality-gate`。浏览器与 HTTP
+路径默认拒绝 localhost、私网和保留地址；只有在明确受控的内网任务中才使用
+`--allow-private-hosts`。
+
 ## 参数说明
 
 ### 基础参数
@@ -150,6 +187,7 @@ python -m smart_spider.dataset_cli \
 | `sogou` | image | static |
 | `360` | image | static |
 | `bilibili` | video | static（API） |
+| `douyin` | video | **dynamic**（显式选择，支持连续滚动） |
 | `bing_video` | video | static |
 | `baidu_text` | text | static |
 | `bing_text` | text | static |
@@ -179,7 +217,15 @@ python -m smart_spider.dataset_cli \
 | `--rate` | `8.0` | 每秒最大请求数（令牌桶） |
 | `--max_retries` | `3` | 遭遇 429/503/超时时的最大重试次数 |
 | `--timeout` | `10` | 单次请求超时秒数 |
+| `--connect-timeout` / `--read-timeout` | 同 `--timeout` | 分离连接建立与响应读取超时 |
 | `--max_workers` | `20` | 下载线程池大小 |
+| `--max-inflight-pages` / `--max-inflight-downloads` | 自动 | 有界分页与下载窗口 |
+| `--max-pending-candidates` | 自动 | 候选处理队列上限 |
+| `--per-domain-concurrency` | `2` | 单图片域名并发上限 |
+| `--memory-budget-mb` | `512` | 下载响应内存预算，自动收紧下载并发 |
+| `--max-image-pixels` | `50000000` | Pillow 解码像素上限，防止解压炸弹 |
+| `--scene-targets` | 无 | 独立场景目标，如 `打电话=20000,吸烟=20000` |
+| `--max-source-share` / `--max-domain-share` | `1.0` | 单一来源/域名最大占比 |
 
 ### Playwright 参数
 
@@ -301,7 +347,7 @@ python -m smart_spider.dataset_filter_cli \
   --export-output ./dataset_optimized
 ```
 
-感知近重复检查结合 dHash、宽高比和平均颜色，默认仅生成报告；确认后加入
+感知近重复检查结合 pHash、dHash、宽高比和平均颜色，默认仅生成报告；确认后加入
 `--apply` 才会隔离命中项：
 
 ```bash
@@ -362,6 +408,99 @@ SmartSpider
 └── TextExtractor          trafilatura 正文提取
 ```
 
+数据集双轨（ADR-0009 Facade 收敛）：
+
+```
+CLI / API
+  ├─ DatasetCrawlConfig → DatasetCrawler（图片兼容门面）
+  └─ MultimodalJobConfig → MultimodalDatasetOrchestrator
+              └─ shared: pipeline.ObjectStore / TaskQueue（本地 FS + SQLite 默认）
+```
+
+运行产物请放在 `dataset_*` / `output_*` / `.artifacts/` 等目录（已 gitignore）。轻量任务 API：`pip install -e ".[api]" && smart-spider-api`；worker：`smart-spider-worker`（与 API 共用 SQLite 队列）。可选插件：`pip install -e ".[redis]"` / `".[s3]"` / `".[config]"`（YAML）。
+
+配置文件示例：
+
+```bash
+python -m smart_spider.dataset_cli --config job.yaml --dump-config resolved.json
+python -m smart_spider.dataset_cli --config job.yaml --total 100
+```
+
 ## License
 
 见 [LICENSE](./LICENSE)
+
+## 抖音视频采集
+
+支持关键词搜索、单视频（含分享短链接和分享文案）、用户主页作品列表。
+参考 [XiaoFeng2233/douyin-spider](https://github.com/XiaoFeng2233/douyin-spider)
+的单视频/主页入口设计，以 Python 独立实现。通过 Playwright 读取页面和视频接口响应，
+在同一页面滚动加载并按视频 ID 去重；图集和直播不作为视频采集。
+
+```bash
+pip install -e ".[browser,video]"
+playwright install chromium
+
+# 在原有 SmartSpider 命令中使用抖音搜索
+python spider.py --keywords 猫咪 --media_types video \
+  --search_engines douyin --max_items 20 --cookies_file ./cookies.txt
+
+# 专用命令：搜索视频
+python -m smart_spider.douyin_cli --keyword 猫咪 --max-items 20 \
+  --cookies-file ./cookies.txt --output ./output_douyin
+
+# 视频链接或分享文案（替换成实际链接）
+python -m smart_spider.douyin_cli --url 'https://v.douyin.com/你的分享码/' \
+  --cookies-file ./cookies.txt
+
+# 用户主页批量下载（替换成实际主页）
+python -m smart_spider.douyin_cli --url 'https://www.douyin.com/user/用户标识' \
+  --max-items 100 --cookies-file ./cookies.txt
+
+# 显示浏览器，并留出两分钟手动登录或完成验证
+python -m smart_spider.douyin_cli --keyword 猫咪 --max-items 5 \
+  --no-headless --login-wait 120
+
+# 已安装 Chrome 时可直接使用，无需下载 Playwright 完整浏览器
+python -m smart_spider.douyin_cli --keyword 三角洲行动 --max-items 10 \
+  --browser-channel chrome --no-headless --login-wait 180
+```
+
+`--browser-channel chrome` 使用独立的临时浏览器会话，不读取日常 Chrome 的个人资料，
+手动登录或验证仅对本次会话有效。没有 Cookie 时，可在等待时间内自行完成页面验证。
+
+安装后也可使用 `smart-spider-douyin`。`--cookies-file` 使用 Netscape cookies.txt 格式，
+同时用于浏览器和 yt-dlp；仅抖音相关且未过期的 Cookie 会导入浏览器。省略此参数可尝试
+匿名访问，遇到登录/验证或空结果时会报告原因。不会自动绕过验证码或获取私密作品。
+
+专用命令支持 `--metadata-only`（只发现和导出元数据）、`--max-scrolls 50`（滚动次数上限）、
+`--timeout 30`（页面和网络超时）、`--proxy`（浏览器和下载共用代理）、
+`--max-size 500m`（单视频大小上限）。`--max-items` 是最多发现/尝试下载的数量，
+作品不足、平台限制或下载失败时可能达不到该数量。只有发现成功且没有下载失败才返回退出码 0；
+空结果或部分下载失败返回 1。
+
+输出按 `output_douyin/{视频ID}/` 组织，包含视频和同 ID 的 JSON 元数据；
+`douyin_results.json` 记录本次发现数、下载成功数和每条结果状态。
+视频优先使用页面实际返回的 MP4 地址，以有界流式下载校验大小和完整性；
+没有直链时交给 yt-dlp，可能需要有效的 cookies.txt。直链下载保留平台返回的版本，
+不保证去水印，也不执行格式转码；原有 `--video_format` 仅适用于 yt-dlp 路径。
+不在结果清单中保存临时签名直链或 Cookie。图集、直播和评论采集不在此入口的范围内。
+
+抖音不会自动加入默认搜索引擎列表，需要显式选择 `douyin`。
+本节已接入的入口为 `spider.py` / `SmartSpider` 和专用 `douyin_cli`。
+真实可用性受登录态、网络和平台页面变化影响，单元测试不代表线上始终可用。
+
+抖音发现阶段失败时，输出目录中的 `douyin_diagnostics.json` 会记录页面标题、
+搜索/作品接口路径、HTTP 状态码和解析到的视频数，便于区分验证拦截与解析问题。
+诊断文件不包含 Cookie、接口查询参数和响应原文。
+
+人工验证推荐使用确认模式，浏览器会持续等待，直到你看到搜索结果后在终端按回车，
+不会因固定等待时间结束而丢失临时会话：
+
+```bash
+python -m smart_spider.douyin_cli --keyword 三角洲行动 --max-items 10 \
+  --browser-channel chrome --wait-for-login
+```
+
+该模式自动显示浏览器；验证期间继续处理页面事件，关闭浏览器或终端输入结束会报错，
+不会被当作已经完成验证。

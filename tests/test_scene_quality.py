@@ -25,6 +25,11 @@ def test_builtin_profiles_cover_six_requested_scenes():
     } <= names
     assert get_scene_quality_profile("未穿反光衣").name == "no_reflective_vest"
     assert get_scene_quality_profile("叉车司机未戴安全帽").prompts.scene_evidence
+    assert get_scene_quality_profile("行人").name == "pedestrian"
+    assert get_scene_quality_profile("斑马线行人").name == "pedestrian"
+    assert get_scene_quality_profile("车辆").name == "road_vehicle"
+    assert get_scene_quality_profile("停车场车辆").name == "road_vehicle"
+    assert {"pedestrian", "road_vehicle"} <= names
 
 
 def test_custom_json_profile_is_strict(tmp_path):
@@ -42,7 +47,19 @@ def test_custom_json_profile_is_strict(tmp_path):
     profile = load_scene_quality_profile(path)
     assert profile.name == "custom"
     assert profile.thresholds.min_relevance == 0.3
+    assert profile.calibration.dataset_id == "custom/custom"
+    assert len(profile.fingerprint) == 16
     assert resolve_scene_quality_profile(config_path=path).name == "custom"
+
+
+def test_builtin_profiles_have_independent_calibration_and_signal_requirements():
+    phone = get_scene_quality_profile("phone_call")
+    no_vest = get_scene_quality_profile("no_reflective_vest")
+    assert phone.thresholds != no_vest.thresholds
+    assert phone.calibration.dataset_id != no_vest.calibration.dataset_id
+    assert {item.name for item in no_vest.signal_requirements} >= {
+        "person", "reflective_vest",
+    }
 
 
 def test_custom_json_profile_rejects_unknown_threshold(tmp_path):

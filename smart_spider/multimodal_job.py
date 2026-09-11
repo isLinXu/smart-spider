@@ -7,16 +7,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
-import tempfile
 import threading
+import uuid
 from dataclasses import asdict, dataclass, field
-from io import BytesIO
 from typing import Any, Iterable, Optional
 
 from loguru import logger
-from PIL import Image
-
 from .dataset_contracts import (
     CandidateResource,
     LabelPolicy,
@@ -28,6 +26,13 @@ from .dataset_contracts import (
 )
 from .dataset_state import DatasetStateStore
 from .http_client import SmartHttpClient
+from .image_safety import (
+    UnsafeImageError,
+    assert_header_within_budget,
+    decode_image_bytes,
+    write_bytes_with_sha256,
+)
+from .multimodal_repository import MultimodalRepository
 from .multimodal_pipeline import (
     AdaptiveSourceRouter,
     AnnotationRouter,
@@ -37,32 +42,78 @@ from .multimodal_pipeline import (
     StaticPageSource,
 )
 from .multimodal_scale import QualityReport, ShardedManifestWriter
+from .compliance import (
+    CompliancePolicy,
+    apply_compliance_to_provenance,
+    build_publish_checklist,
+    write_publish_checklist,
+)
+from .dataset_lineage import build_lineage, publish_dataset_artifacts
+from .report import UnifiedReport
+from .scene_quality_gate import (
+    JsonlSceneReviewQueue,
+    SceneQualityGate,
+    SceneSignalDetector,
+)
+from .scene_quality import get_scene_quality_profile
+from .scene_signal_detector import default_scene_signal_detector
 
 
 class AssetMaterializationError(RuntimeError):
     """媒体资产下载、验证或原子保存失败。"""
 
 
+@dataclass(frozen=True)
+class StagedAsset:
+    """A same-volume, fsynced asset which is safe to publish atomically."""
+
+    relative_path: str
+    staging_path: str
+    mime_type: str
+    digest: str
+
+
 class AssetStore:
     """将远程图片保存为内容哈希路径，避免重复下载和文件名冲突。"""
 
-    def __init__(self, output_dir: str, max_image_bytes: int = 25 * 1024 * 1024):
+    def __init__(
+        self,
+        output_dir: str,
+        max_image_bytes: int = 25 * 1024 * 1024,
+        max_image_pixels: int = 50_000_000,
+    ):
         self.root = os.path.join(output_dir, "assets")
         self.max_image_bytes = max_image_bytes
+        self.max_image_pixels = max_image_pixels
         self._lock = threading.Lock()
         os.makedirs(self.root, exist_ok=True)
+        os.makedirs(os.path.join(self.root, ".staging"), exist_ok=True)
 
-    def save_image(self, content: bytes) -> tuple[str, str, str]:
+    @staticmethod
+    def _fsync_directory(path: str) -> None:
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
+
+    def stage_image(self, content: bytes) -> StagedAsset:
+        """Write and fsync an image before it becomes metadata-visible."""
         if not isinstance(content, (bytes, bytearray, memoryview)):
             raise AssetMaterializationError("image content must be bytes-like")
         content = bytes(content)
         if len(content) > self.max_image_bytes:
             raise AssetMaterializationError("image exceeds max_image_bytes")
         try:
-            image = Image.open(BytesIO(content))
-            image.verify()
+            assert_header_within_budget(content, max_pixels=self.max_image_pixels)
+            image = decode_image_bytes(content, max_pixels=self.max_image_pixels)
             image_format = (image.format or "JPEG").lower()
-        except Exception as exc:
+        except UnsafeImageError as exc:
             raise AssetMaterializationError(f"invalid image: {exc}") from exc
 
         extension = {
@@ -73,35 +124,72 @@ class AssetStore:
             "gif": ".gif",
             "avif": ".avif",
         }.get(image_format, ".bin")
-        digest = hashlib.sha256(content).hexdigest()
-        relative = os.path.join("assets", digest[:2], digest + extension)
-        absolute = os.path.join(os.path.dirname(self.root), relative)
-        os.makedirs(os.path.dirname(absolute), exist_ok=True)
-
-        with self._lock:
-            if not os.path.exists(absolute):
-                temporary = None
+        staging_dir = os.path.join(os.path.dirname(self.root), "assets", ".staging")
+        os.makedirs(staging_dir, exist_ok=True)
+        tmp_name = f"stage-{uuid.uuid4().hex}.tmp"
+        staging_tmp = os.path.join(staging_dir, tmp_name)
+        try:
+            digest = write_bytes_with_sha256(staging_tmp, content, fsync=True)
+            staging_relative = os.path.join(
+                "assets", ".staging", f"{digest}-{uuid.uuid4().hex}.tmp"
+            )
+            staging_path = os.path.join(os.path.dirname(self.root), staging_relative)
+            os.replace(staging_tmp, staging_path)
+            self._fsync_directory(os.path.dirname(staging_path))
+        except Exception as exc:
+            for path in (staging_tmp,):
                 try:
-                    with tempfile.NamedTemporaryFile(
-                        mode="wb",
-                        dir=os.path.dirname(absolute),
-                        prefix=".asset-",
-                        suffix=".tmp",
-                        delete=False,
-                    ) as handle:
-                        temporary = handle.name
-                        handle.write(content)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    os.replace(temporary, absolute)
-                except Exception:
-                    if temporary:
-                        try:
-                            os.unlink(temporary)
-                        except OSError:
-                            pass
-                    raise
-        return relative, f"image/{'jpeg' if image_format == 'jpg' else image_format}", digest
+                    os.unlink(path)
+                except OSError:
+                    pass
+            raise AssetMaterializationError(f"cannot stage image: {exc}") from exc
+        relative = os.path.join("assets", digest[:2], digest + extension)
+        return StagedAsset(
+            relative_path=relative,
+            staging_path=staging_relative,
+            mime_type=f"image/{'jpeg' if image_format == 'jpg' else image_format}",
+            digest=digest,
+        )
+
+    def staged_payload(self, asset: StagedAsset) -> dict[str, str]:
+        return {
+            "relative_path": asset.relative_path,
+            "staging_path": asset.staging_path,
+            "mime_type": asset.mime_type,
+            "digest": asset.digest,
+        }
+
+    def publish(self, asset: StagedAsset) -> None:
+        self._publish_paths(asset.relative_path, asset.staging_path)
+
+    def recover_staged(self, asset: dict[str, Any]) -> None:
+        self._publish_paths(str(asset["relative_path"]), str(asset["staging_path"]))
+
+    def _publish_paths(self, relative_path: str, staging_relative: str) -> None:
+        destination = os.path.join(os.path.dirname(self.root), relative_path)
+        staging = os.path.join(os.path.dirname(self.root), staging_relative)
+        with self._lock:
+            if os.path.exists(destination):
+                if os.path.exists(staging):
+                    os.unlink(staging)
+                return
+            if not os.path.exists(staging):
+                raise FileNotFoundError(staging)
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            os.replace(staging, destination)
+            self._fsync_directory(os.path.dirname(destination))
+
+    def save_image(self, content: bytes) -> tuple[str, str, str]:
+        staged = self.stage_image(content)
+        self.publish(staged)
+        return staged.relative_path, staged.mime_type, staged.digest
+
+    def discard(self, asset: StagedAsset) -> None:
+        path = os.path.join(os.path.dirname(self.root), asset.staging_path)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
 
 class MultimodalManifestWriter(ShardedManifestWriter):
@@ -119,6 +207,7 @@ class MultimodalJobConfig:
     state_db: Optional[str] = None
     materialize_images: bool = True
     max_image_bytes: int = 25 * 1024 * 1024
+    max_image_pixels: int = 50_000_000
     manifest_shard_size: int = 0
     annotation_batch_size: int = 32
     quality_report_path: Optional[str] = None
@@ -128,6 +217,13 @@ class MultimodalJobConfig:
         Modality.WEBPAGE,
     )
     label_policy: LabelPolicy = field(default_factory=LabelPolicy)
+    scene_quality_gate_enabled: bool = False
+    scene: Optional[str] = None
+    scene_review_queue_path: Optional[str] = None
+    license: str = ""
+    source_terms: str = ""
+    respect_robots: bool = True
+    redact_urls: bool = True
 
     def __post_init__(self):
         self.allowed_modalities = tuple(
@@ -140,6 +236,12 @@ class MultimodalJobConfig:
             raise ValueError("manifest_shard_size must be non-negative")
         if self.annotation_batch_size <= 0:
             raise ValueError("annotation_batch_size must be positive")
+        if self.max_image_bytes <= 0 or self.max_image_pixels <= 0:
+            raise ValueError("image size limits must be positive")
+        if self.scene_quality_gate_enabled and not self.scene:
+            raise ValueError("scene is required when scene quality gate is enabled")
+        if self.scene_review_queue_path is not None and not str(self.scene_review_queue_path).strip():
+            raise ValueError("scene_review_queue_path cannot be empty")
         if not self.job_id:
             self.job_id = hashlib.sha256(
                 os.path.abspath(self.output_dir).encode("utf-8")
@@ -152,11 +254,27 @@ class MultimodalJobConfig:
             "max_samples": self.max_samples,
             "materialize_images": self.materialize_images,
             "max_image_bytes": self.max_image_bytes,
+            "max_image_pixels": self.max_image_pixels,
             "manifest_shard_size": self.manifest_shard_size,
             "annotation_batch_size": self.annotation_batch_size,
             "allowed_modalities": [item.value for item in self.allowed_modalities],
             "label_policy": self.label_policy.to_dict(),
+            "scene_quality_gate_enabled": self.scene_quality_gate_enabled,
+            "scene": self.scene,
+            "scene_review_queue_path": self.scene_review_queue_path,
+            "license": self.license,
+            "source_terms": self.source_terms,
+            "respect_robots": self.respect_robots,
+            "redact_urls": self.redact_urls,
         }
+
+    def compliance_policy(self) -> CompliancePolicy:
+        return CompliancePolicy(
+            license=self.license,
+            source_terms=self.source_terms,
+            respect_robots=self.respect_robots,
+            redact_urls=self.redact_urls,
+        )
 
 
 @dataclass
@@ -168,8 +286,14 @@ class MultimodalJobReport:
     rejected: int = 0
     materialized_images: int = 0
     quality_report_path: str = ""
+    unified_report_path: str = ""
+    publish_checklist_path: str = ""
     route_counts: dict[str, int] = field(default_factory=dict)
+    route_reasons: dict[str, int] = field(default_factory=dict)
+    block_kinds: dict[str, int] = field(default_factory=dict)
+    scene_decisions: dict[str, int] = field(default_factory=dict)
     source_metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
+    compliance: dict[str, Any] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -189,6 +313,7 @@ class MultimodalDatasetOrchestrator:
         state_store: Optional[DatasetStateStore] = None,
         manifest_writer: Optional[MultimodalManifestWriter] = None,
         image_fetcher: Optional[Any] = None,
+        scene_signal_detector: Optional[SceneSignalDetector] = None,
     ):
         self.config = config
         os.makedirs(config.output_dir, exist_ok=True)
@@ -200,11 +325,29 @@ class MultimodalDatasetOrchestrator:
             config.state_db or os.path.join(config.output_dir, ".dataset_state.sqlite3")
         )
         self.state.create_job(config.job_id, config.to_dict())
+        # 共享存储插件挂点（默认本地 FS）；编排仍走 AssetStore 兼容路径。
+        from .pipeline import LocalFilesystemObjectStore
+
+        self.object_store = LocalFilesystemObjectStore(
+            os.path.join(config.output_dir, "objects")
+        )
         self.manifest = manifest_writer or MultimodalManifestWriter(
             config.output_dir,
             shard_size=config.manifest_shard_size,
         )
-        self.asset_store = AssetStore(config.output_dir, config.max_image_bytes)
+        self.asset_store = AssetStore(
+            config.output_dir,
+            config.max_image_bytes,
+            config.max_image_pixels,
+        )
+        self.repository = MultimodalRepository(
+            config.output_dir,
+            self.state,
+            config.job_id,
+            self.manifest,
+            self.asset_store,
+        )
+        self.repository.recover()
         self.quality_report = QualityReport()
         self.quality_report_path = self._resolve_quality_report_path(config.quality_report_path)
         self.image_fetcher = image_fetcher or (
@@ -212,6 +355,40 @@ class MultimodalDatasetOrchestrator:
         )
         self._owns_state = state_store is None
         self._owns_manifest = manifest_writer is None
+        self._lease_recoveries = int(self.state.recover_expired_leases(config.job_id))
+        self.scene_quality_gate = None
+        self.scene_review_queue = None
+        self.scene_signal_detector = scene_signal_detector
+        if config.scene_quality_gate_enabled:
+            profile = get_scene_quality_profile(config.scene or "")
+            if self.scene_signal_detector is None:
+                generic = profile.name in {"pedestrian", "road_vehicle"}
+                self.scene_signal_detector = default_scene_signal_detector(
+                    prefer_yolo=generic,
+                    yolo_model=os.environ.get("SMART_SPIDER_YOLO_MODEL", "yolo11n.pt"),
+                    include_synthetic=generic,
+                    include_style=generic,
+                    synthetic_model=(
+                        os.environ.get("SMART_SPIDER_SYNTHETIC_MODEL") or None
+                    ),
+                    synthetic_config=(
+                        os.environ.get("SMART_SPIDER_SYNTHETIC_CONFIG") or None
+                    ),
+                    synthetic_cache_dir=(
+                        os.environ.get("SMART_SPIDER_SYNTHETIC_CACHE_DIR") or None
+                    ),
+                    style_cache_dir=(
+                        os.environ.get("SMART_SPIDER_STYLE_CACHE_DIR") or ".filter_cache"
+                    ),
+                )
+            self.scene_quality_gate = SceneQualityGate(
+                profile,
+                detector=self.scene_signal_detector,
+            )
+            queue_path = config.scene_review_queue_path or os.path.join(
+                config.output_dir, "scene_review_queue.jsonl"
+            )
+            self.scene_review_queue = JsonlSceneReviewQueue(queue_path)
 
     def _resolve_quality_report_path(self, path: Optional[str]) -> str:
         if not path:
@@ -220,7 +397,24 @@ class MultimodalDatasetOrchestrator:
 
     def close(self):
         try:
-            self.quality_report.write(self.quality_report_path)
+            self._lease_recoveries += int(
+                self.state.recover_expired_leases(self.config.job_id)
+            )
+            lineage = build_lineage(
+                job_id=self.config.job_id,
+                output_dir=self.config.output_dir,
+                config_snapshot=self.config.to_dict(),
+                extra_provenance={
+                    "track": "multimodal",
+                    "lease_recoveries": self._lease_recoveries,
+                    "scene": self.config.scene,
+                    "compliance": self.config.compliance_policy().to_dict(),
+                },
+            )
+            publish_dataset_artifacts(self.config.output_dir, lineage)
+            # quality_report may already be written by _finalize_reports
+            if not os.path.isfile(self.quality_report_path):
+                self.quality_report.write(self.quality_report_path)
         finally:
             if self._owns_manifest:
                 self.manifest.close()
@@ -244,8 +438,14 @@ class MultimodalDatasetOrchestrator:
                 report.tasks += 1
                 result = self.source_router.discover(task, static_source, browser_source)
                 route = result.decision.action.value
+                reason = result.decision.reason
                 report.route_counts[route] = report.route_counts.get(route, 0) + 1
-                self.quality_report.observe_route(route)
+                if reason:
+                    report.route_reasons[reason] = report.route_reasons.get(reason, 0) + 1
+                self.quality_report.observe_route(route, reason)
+                self._record_block_signal(result.static_response, report)
+                if result.browser_response is not None:
+                    self._record_block_signal(result.browser_response, report)
                 self._record_source_diagnostics(
                     result.static_response,
                     source="static",
@@ -292,8 +492,52 @@ class MultimodalDatasetOrchestrator:
                     report.accepted += sum(1 for item in accepted if item)
                     report.rejected += sum(1 for item in accepted if not item)
         finally:
+            report.scene_decisions = dict(self.quality_report.scene_decisions)
+            report.route_counts["lease_recoveries"] = int(self._lease_recoveries)
+            report.route_reasons = dict(self.quality_report.route_reasons)
+            report.block_kinds = dict(self.quality_report.block_kinds)
+            report.compliance = self.config.compliance_policy().to_dict()
+            self._finalize_reports(report)
             self.close()
         return report
+
+    def _finalize_reports(self, report: MultimodalJobReport) -> None:
+        """写入 quality / unified / publish checklist（close 前调用）。"""
+        self.quality_report.write(self.quality_report_path)
+        report.quality_report_path = self.quality_report_path
+        checklist = build_publish_checklist(
+            job_id=self.config.job_id,
+            policy=self.config.compliance_policy(),
+            route_counts=report.route_counts,
+            route_reasons=report.route_reasons,
+            block_kinds=report.block_kinds,
+        )
+        report.publish_checklist_path = write_publish_checklist(
+            self.config.output_dir, checklist
+        )
+        unified = UnifiedReport.from_multimodal_report(
+            report.to_dict(),
+            job_id=self.config.job_id,
+            config_snapshot=self.config.to_dict(),
+            quality_stats=self.quality_report.to_dict(),
+        )
+        unified_path = os.path.join(self.config.output_dir, "unified_report.json")
+        with open(unified_path, "w", encoding="utf-8") as handle:
+            json.dump(unified.to_dict(), handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        report.unified_report_path = unified_path
+
+    def _record_block_signal(self, response: Any, report: MultimodalJobReport) -> None:
+        meta = getattr(response, "metadata", None) or {}
+        block = meta.get("block") if isinstance(meta, dict) else None
+        kind = ""
+        if isinstance(block, dict):
+            kind = str(block.get("kind") or "")
+        if not kind and getattr(response, "blocked", False):
+            kind = "blocked"
+        if kind:
+            report.block_kinds[kind] = report.block_kinds.get(kind, 0) + 1
+            self.quality_report.observe_block(kind)
 
     @staticmethod
     def _select_source_sample(result) -> Optional[SampleRecord]:
@@ -428,11 +672,11 @@ class MultimodalDatasetOrchestrator:
     ) -> list[bool]:
         """先完成媒体准备，再以 batch 方式调用标注后端并提交样本。"""
         statuses = [False] * len(entries)
-        prepared: list[tuple[int, SampleRecord, list[str], Optional[str]]] = []
+        prepared: list[tuple[int, SampleRecord, list[str], Optional[str], list[StagedAsset]]] = []
         for index, (sample, candidate_ids, page_id) in enumerate(entries):
             try:
-                claimed = self._prepare_sample(sample, candidate_ids, report)
-                prepared.append((index, sample, claimed, page_id))
+                claimed, staged_assets = self._prepare_sample(sample, candidate_ids, report)
+                prepared.append((index, sample, claimed, page_id, staged_assets))
             except Exception as exc:
                 self._reject_sample(sample, [], page_id, str(exc), report)
 
@@ -441,12 +685,14 @@ class MultimodalDatasetOrchestrator:
                 [item[1] for item in prepared]
             )
         except Exception as exc:
-            for _, sample, claimed, page_id in prepared:
+            for _, sample, claimed, page_id, staged_assets in prepared:
+                self._discard_staged_assets(staged_assets)
                 self._reject_sample(sample, claimed, page_id, str(exc), report)
             return statuses
-        for index, sample, claimed, page_id in prepared:
+        for index, sample, claimed, page_id, staged_assets in prepared:
             annotation = annotations.get(sample.sample_id)
             if annotation is None:
+                self._discard_staged_assets(staged_assets)
                 self._reject_sample(
                     sample,
                     claimed,
@@ -461,6 +707,7 @@ class MultimodalDatasetOrchestrator:
                 page_id,
                 annotation,
                 report,
+                staged_assets,
             )
         return statuses
 
@@ -469,47 +716,51 @@ class MultimodalDatasetOrchestrator:
         sample: SampleRecord,
         candidate_ids: dict[str, str],
         report: MultimodalJobReport,
-    ) -> list[str]:
+    ) -> tuple[list[str], list[StagedAsset]]:
         claimed: list[str] = []
-        for asset in sample.modalities:
-            if asset.modality != Modality.IMAGE or not asset.uri.startswith(("http://", "https://")):
-                continue
-            candidate_id = candidate_ids.get(
-                hashlib.sha256(normalize_url(asset.uri).encode("utf-8")).hexdigest()
-            )
-            if candidate_id is None:
-                nested_candidate = CandidateResource(
-                    url=asset.uri,
-                    source=sample.provenance.get("source", "page"),
-                    modality=Modality.IMAGE,
-                    query=sample.provenance.get("query", ""),
-                    alt=str(asset.metadata.get("alt", "")),
-                    source_meta={"sample_id": sample.sample_id, "role": asset.role},
+        staged_assets: list[StagedAsset] = []
+        try:
+            for asset in sample.modalities:
+                if asset.modality != Modality.IMAGE or not asset.uri.startswith(("http://", "https://")):
+                    continue
+                candidate_id = candidate_ids.get(
+                    hashlib.sha256(normalize_url(asset.uri).encode("utf-8")).hexdigest()
                 )
-                candidate_id = self.state.add_candidate(
-                    self.config.job_id, nested_candidate
-                )
-                candidate_ids[nested_candidate.candidate_id] = candidate_id
-            if candidate_id and self.state.claim_candidate(candidate_id):
-                claimed.append(candidate_id)
-            if not self.config.materialize_images:
-                continue
-            if self.image_fetcher is None:
-                raise AssetMaterializationError("image_fetcher is not configured")
-            content = self.image_fetcher(asset.uri)
-            relative, mime_type, digest = self.asset_store.save_image(content)
-            original_url = asset.uri
-            asset.uri = relative
-            asset.mime_type = mime_type
-            asset.metadata["source_url"] = original_url
-            asset.metadata["content_hash"] = digest
-            if sample.file == original_url:
-                sample.file = relative
-            report.materialized_images += 1
-            self.quality_report.observe_materialized_image()
-            if candidate_id:
-                self.state.complete_candidate(candidate_id)
-        return claimed
+                if candidate_id is None:
+                    nested_candidate = CandidateResource(
+                        url=asset.uri,
+                        source=sample.provenance.get("source", "page"),
+                        modality=Modality.IMAGE,
+                        query=sample.provenance.get("query", ""),
+                        alt=str(asset.metadata.get("alt", "")),
+                        source_meta={"sample_id": sample.sample_id, "role": asset.role},
+                    )
+                    candidate_id = self.state.add_candidate(
+                        self.config.job_id, nested_candidate
+                    )
+                    candidate_ids[nested_candidate.candidate_id] = candidate_id
+                if candidate_id and self.state.claim_candidate(candidate_id):
+                    claimed.append(candidate_id)
+                if not self.config.materialize_images:
+                    continue
+                if self.image_fetcher is None:
+                    raise AssetMaterializationError("image_fetcher is not configured")
+                content = self.image_fetcher(asset.uri)
+                staged = self.asset_store.stage_image(content)
+                staged_assets.append(staged)
+                original_url = asset.uri
+                asset.uri = staged.relative_path
+                asset.mime_type = staged.mime_type
+                asset.metadata["source_url"] = original_url
+                asset.metadata["content_hash"] = staged.digest
+                if sample.file == original_url:
+                    sample.file = staged.relative_path
+                report.materialized_images += 1
+                self.quality_report.observe_materialized_image()
+            return claimed, staged_assets
+        except Exception:
+            self._discard_staged_assets(staged_assets)
+            raise
 
     def _annotate_samples(self, samples: list[SampleRecord]):
         if not samples:
@@ -529,8 +780,47 @@ class MultimodalDatasetOrchestrator:
         page_id: Optional[str],
         annotation: Any,
         report: MultimodalJobReport,
+        staged_assets: list[StagedAsset],
     ) -> bool:
         try:
+            if self.scene_quality_gate is not None:
+                semantic_score = self._sample_semantic_score(sample)
+                signals = sample.pipeline.get("scene_signals")
+                if not isinstance(signals, dict):
+                    signals = sample.quality.attributes.get("scene_signals", {})
+                if not isinstance(signals, dict):
+                    signals = {}
+                if self.scene_signal_detector is not None and sample.modalities:
+                    image = self._load_local_scene_image(sample)
+                    if image is not None:
+                        decision = self.scene_quality_gate.evaluate_image(
+                            image, semantic_score
+                        )
+                    else:
+                        decision = self.scene_quality_gate.evaluate(
+                            semantic_score, signals=signals
+                        )
+                else:
+                    decision = self.scene_quality_gate.evaluate(
+                        semantic_score, signals=signals
+                    )
+                sample.pipeline["scene_quality_gate"] = decision.to_dict()
+                if decision.signals:
+                    sample.quality.attributes["scene_signals"] = dict(decision.signals)
+                    sample.pipeline["scene_signals"] = dict(decision.signals)
+                if decision.action == "review":
+                    self.scene_review_queue.append(sample.sample_id, decision)
+                self.quality_report.observe_scene_decision(decision.action)
+                if decision.action != "accept":
+                    self._discard_staged_assets(staged_assets)
+                    self._reject_sample(
+                        sample,
+                        claimed,
+                        page_id,
+                        "scene_quality_review" if decision.action == "review" else "scene_quality_reject",
+                        report,
+                    )
+                    return False
             sample.labels = annotation.resolution.labels
             sample.pipeline["annotation"] = {
                 "used_backends": annotation.used_backends,
@@ -540,34 +830,68 @@ class MultimodalDatasetOrchestrator:
             for error in annotation.errors.values():
                 self.quality_report.observe_error(error)
             sample.pipeline["status"] = "accepted"
-            primary_candidate = page_id or (claimed[0] if claimed else None)
-            accepted = self.state.add_sample(
-                self.config.job_id,
+            apply_compliance_to_provenance(
+                sample.provenance, self.config.compliance_policy()
+            )
+            # Also scrub materialized asset source URLs when redaction enabled.
+            if self.config.redact_urls:
+                from .compliance import redact_url
+
+                for asset in sample.modalities:
+                    source_url = asset.metadata.get("source_url")
+                    if source_url:
+                        asset.metadata["source_url"] = redact_url(str(source_url))
+            accepted = self.repository.commit(
                 sample,
-                candidate_id=primary_candidate,
-                content_hash=sample.sample_id,
+                candidate_ids=[item for item in [page_id, *claimed] if item],
+                staged_assets=staged_assets,
             )
             if not accepted:
-                self._reject_sample(
-                    sample,
-                    claimed,
-                    page_id,
-                    "duplicate_or_existing_sample",
-                    report,
-                )
+                # The existing commit is authoritative.  In particular, do
+                # not transition its already accepted candidates back to a
+                # retry state merely because a duplicate was rediscovered.
                 return False
-            self.manifest.write(sample)
-            for candidate_id in claimed:
-                if candidate_id != primary_candidate:
-                    try:
-                        self.state.complete_candidate(candidate_id)
-                    except Exception:
-                        pass
             self.quality_report.observe_sample(sample)
             return True
         except Exception as exc:
             self._reject_sample(sample, claimed, page_id, str(exc), report)
             return False
+
+    @staticmethod
+    def _sample_semantic_score(sample: SampleRecord) -> float:
+        """Read an optional upstream score, defaulting to review-safe zero."""
+        raw = sample.pipeline.get("semantic_score", sample.quality.attributes.get("semantic_score"))
+        try:
+            score = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(-1.0, min(1.0, score))
+
+    def _load_local_scene_image(self, sample: SampleRecord) -> Optional[Any]:
+        """Load a materialized image for an injected detector, if available."""
+        from PIL import Image
+
+        for asset in sample.modalities:
+            if asset.modality != Modality.IMAGE or not asset.uri:
+                continue
+            path = asset.uri
+            if not os.path.isabs(path):
+                path = os.path.join(self.config.output_dir, path)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with Image.open(path) as image:
+                    return image.convert("RGB")
+            except (OSError, ValueError):
+                return None
+        return None
+
+    def _discard_staged_assets(self, staged_assets: Iterable[StagedAsset]):
+        for asset in staged_assets:
+            try:
+                self.asset_store.discard(asset)
+            except OSError:
+                pass
 
     def _reject_sample(
         self,

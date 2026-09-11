@@ -16,648 +16,32 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional, Protocol, Sequence
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
 
 from .image_retrieval import IMAGE_SUFFIXES
+from .dataset_governance import cluster_embeddings, perceptual_fingerprint
 
 
-PROMOTION_TERMS = (
-    "促销", "优惠", "特价", "厂家直销", "招商", "加盟", "批发", "报价",
-    "咨询", "联系", "扫码", "微信", "电话", "广告", "限时", "sale",
-    "discount", "promotion", "wholesale", "contact", "call now", "official",
+from .dataset_filter_types import (  # noqa: F401
+    CONTACT_PATTERNS,
+    PROMOTION_TERMS,
+    FilterDecision,
+    FilterThresholds,
+    PromptScorer,
+    PromptSet,
+    SemanticScores,
+    SignalAnalyzer,
+    VisualSignals,
 )
-CONTACT_PATTERNS = (
-    re.compile(r"(?:https?://|www\.)", re.IGNORECASE),
-    re.compile(r"\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b", re.IGNORECASE),
-    re.compile(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)"),
-    re.compile(r"(?<!\d)(?:400|800)[- ]?\d{3}[- ]?\d{4}(?!\d)"),
-)
 
 
-@dataclass(frozen=True)
-class PromptSet:
-    positive: tuple[str, ...]
-    advertisement: tuple[str, ...]
-    mismatch: tuple[str, ...]
-    scene_evidence: tuple[str, ...] = ()
-
-    @classmethod
-    def truck_loading(cls, query: str = "货车装卸区 开关门") -> "PromptSet":
-        query = query.strip()
-        custom_prompts = (query,) if query and query.isascii() else ()
-        return cls(
-            positive=custom_prompts + (
-                "a cargo truck backed into a warehouse loading dock",
-                "workers opening or closing the rear doors of a cargo truck at a loading area",
-                "workers loading or unloading goods through the open rear doors of a truck",
-                "a box truck with rear cargo doors open at a warehouse",
-                "a loading bay occupied by a truck or trailer",
-                "a delivery truck parked at a loading dock",
-                "inside the cargo area of a truck with its rear doors open",
-                "a freight trailer being loaded at a warehouse",
-            ),
-            advertisement=(
-                "a commercial advertisement poster with sales text and phone numbers",
-                "a company promotional banner or product brochure",
-                "an e-commerce product listing with price and marketing text",
-                "an industrial product sales poster with specifications",
-                "a promotional image with QR code, phone number, or watermark",
-                "a collage of product photos with labels",
-                "a product cutout on a white background with marketing text",
-                "a company logo graphic or website screenshot",
-            ),
-            mismatch=(
-                "an empty warehouse loading dock with no truck",
-                "a loading dock leveler, ramp, lift table, or platform shown as a product",
-                "a forklift or construction vehicle with no cargo truck",
-                "a close-up of a car door handle, hinge, latch, remote control, switch, or spare part",
-                "a passenger car, SUV, pickup truck, bus, motorcycle, or vehicle interior",
-                "an ambulance, fire truck, emergency vehicle, or rescue scene",
-                "a cargo truck driving or parked on a road with no warehouse loading area",
-                "a closed cargo truck photographed by itself in a parking lot or vehicle yard",
-                "a front, side, or rear exterior view of a truck with its cargo doors closed",
-                "a truck accident, breakdown, repair, roadside inspection, or towing scene",
-                "a passenger van, car trunk, tailgate, or side door open",
-                "a shipping port, container yard, crane, train, or ship with no loading dock",
-                "an aerial photograph of a warehouse, port, or industrial park",
-                "a warehouse interior with pallets or conveyor belts but no truck",
-                "people carrying or sorting packages indoors with no cargo truck visible",
-                "a warehouse rolling shutter or loading bay door with no truck present",
-                "a close-up of a truck engine, wheel, chassis, suspension, or mechanical part",
-                "workers repairing, washing, painting, inspecting, or changing the tire of a truck",
-                "a person opening a truck cab door, hood, engine bay, or maintenance panel",
-                "a dump truck, garbage truck, crane truck, tanker, or construction truck",
-                "a crane lifting a container, machine, or cargo with no warehouse loading dock",
-                "cargo being loaded onto or unloaded from an airplane, train, rail wagon, or ship",
-                "an airport ground handling or air freight loading scene",
-                "people loading construction debris, soil, logs, pipes, or scrap into a dump truck or flatbed",
-                "a flatbed truck transporting cargo or machinery away from a warehouse dock",
-                "cargo tied down on an open flatbed truck or trailer",
-                "a truck carrying cargo on a road or in a vehicle yard",
-                "people moving furniture through a house, building doorway, or moving van",
-                "a shipping container being inspected, repaired, or handled away from a warehouse dock",
-                "a truck tail lift or hydraulic loading platform demonstrated as equipment",
-                "a close-up inside a passenger cab or non-cargo compartment",
-                "a miniature model, toy, or 3D rendering of a truck loading mechanism",
-                "a technical drawing, diagram, floor plan, infographic, or screenshot",
-                "a product photograph on a plain white background",
-                "a vehicle advertisement or product showcase photographed in a studio",
-                "a portrait or fashion photograph",
-                "an animal, flower, plant, food, landscape, tourist attraction, or artwork",
-                "a computer, household object, tool, machinery part, or unrelated product",
-                "a logo or QR code on a plain background",
-            ),
-            scene_evidence=(
-                "workers loading or unloading boxes through open rear cargo doors at a warehouse",
-                "a worker opening or closing the rear cargo doors of a truck",
-                "a truck with its rear cargo doors visibly open at a loading area",
-                "a forklift moving goods through open rear cargo doors at a warehouse loading dock",
-                "goods being moved through the open rear doorway of a truck",
-                "an open truck cargo compartment visibly framed by its rear doors",
-            ),
-        )
-
-
-@dataclass(frozen=True)
-class SemanticScores:
-    relevance: float
-    advertisement: float
-    mismatch: float
-    relevance_prompt: str = ""
-    advertisement_prompt: str = ""
-    mismatch_prompt: str = ""
-    scene_evidence: float = 0.0
-    scene_evidence_prompt: str = ""
-
-    @property
-    def ad_margin(self) -> float:
-        return self.advertisement - self.relevance
-
-    @property
-    def mismatch_margin(self) -> float:
-        return self.mismatch - self.relevance
-
-    @property
-    def scene_evidence_margin(self) -> float:
-        return self.mismatch - self.scene_evidence
-
-
-@dataclass(frozen=True)
-class VisualSignals:
-    text_area_ratio: float = 0.0
-    text_box_count: int = 0
-    qr_detected: bool = False
-    ocr_text: str = ""
-    promotion_hits: tuple[str, ...] = ()
-    contact_hits: int = 0
-
-
-@dataclass(frozen=True)
-class FilterThresholds:
-    min_relevance: float = 0.225
-    mismatch_margin: float = 0.015
-    advertisement_score: float = 0.235
-    advertisement_margin: float = 0.005
-    advertisement_support_score: float = 0.215
-    advertisement_support_margin: float = -0.04
-    text_area_ratio: float = 0.14
-    minimum_scene_evidence: Optional[float] = None
-    scene_evidence_margin: Optional[float] = None
-
-    @classmethod
-    def from_profile(cls, profile: str) -> "FilterThresholds":
-        profiles = {
-            "conservative": cls(
-                min_relevance=0.205,
-                mismatch_margin=0.025,
-                advertisement_score=0.245,
-                advertisement_margin=0.01,
-                advertisement_support_score=0.225,
-                advertisement_support_margin=-0.025,
-                text_area_ratio=0.18,
-            ),
-            "balanced": cls(),
-            "strict": cls(
-                min_relevance=0.225,
-                mismatch_margin=0.0,
-                advertisement_score=0.23,
-                advertisement_margin=0.0,
-                advertisement_support_score=0.21,
-                advertisement_support_margin=-0.05,
-                text_area_ratio=0.12,
-            ),
-            "precision": cls(
-                min_relevance=0.225,
-                mismatch_margin=0.015,
-                advertisement_score=0.23,
-                advertisement_margin=0.0,
-                advertisement_support_score=0.21,
-                advertisement_support_margin=-0.05,
-                text_area_ratio=0.12,
-                minimum_scene_evidence=0.225,
-                scene_evidence_margin=0.005,
-            ),
-        }
-        try:
-            return profiles[profile]
-        except KeyError as exc:
-            raise ValueError(f"unknown filter profile: {profile}") from exc
-
-
-@dataclass(frozen=True)
-class FilterDecision:
-    record_position: int
-    path: str
-    action: str
-    category: str
-    reasons: tuple[str, ...]
-    scores: Optional[SemanticScores] = None
-    signals: VisualSignals = field(default_factory=VisualSignals)
-    confidence: str = ""
-    error: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        payload["reasons"] = list(self.reasons)
-        payload["signals"]["promotion_hits"] = list(self.signals.promotion_hits)
-        return payload
-
-
-class PromptScorer(Protocol):
-    def score_images(self, images: Sequence[Image.Image]) -> list[SemanticScores]:
-        ...
-
-
-class SignalAnalyzer(Protocol):
-    def analyze(
-        self,
-        image: Image.Image,
-        scores: Optional[SemanticScores] = None,
-    ) -> VisualSignals:
-        ...
-
-
-class CLIPPromptScorer:
-    """Batch CLIP scorer using max prompt similarity per semantic group."""
-
-    def __init__(
-        self,
-        prompts: PromptSet,
-        *,
-        model_name: str = "ViT-B/32",
-        device: str = "auto",
-        cache_dir: Optional[str | os.PathLike[str]] = None,
-    ) -> None:
-        import torch
-
-        from .perception.clip_inference import CLIPInference
-
-        if device == "auto":
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
-        self.device = device
-        self.model_name = model_name
-        self.prompts = prompts
-        self.encoder = CLIPInference(model_name=model_name, device=device)
-        self.cache_dir = None
-        if cache_dir:
-            model_key = hashlib.sha256(model_name.encode("utf-8")).hexdigest()[:16]
-            self.cache_dir = Path(cache_dir).expanduser().resolve() / model_key
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.cache_hits = 0
-        self.cache_misses = 0
-        self._group_sizes = (
-            len(prompts.positive),
-            len(prompts.advertisement),
-            len(prompts.mismatch),
-            len(prompts.scene_evidence),
-        )
-        all_prompts = (
-            prompts.positive
-            + prompts.advertisement
-            + prompts.mismatch
-            + prompts.scene_evidence
-        )
-        self._text_features = torch.cat(
-            [self.encoder.encode_text(prompt) for prompt in all_prompts], dim=0
-        )
-
-    @staticmethod
-    def _image_cache_key(image: Image.Image) -> str:
-        digest = hashlib.sha256()
-        rgb = image.convert("RGB")
-        digest.update(str(rgb.size).encode("ascii"))
-        digest.update(rgb.tobytes())
-        return digest.hexdigest()
-
-    def _load_cached_feature(self, image: Image.Image):
-        if self.cache_dir is None:
-            return None
-        path = self.cache_dir / f"{self._image_cache_key(image)}.npy"
-        try:
-            array = np.load(path, allow_pickle=False)
-            if (
-                array.ndim != 2
-                or array.shape[0] != 1
-                or array.shape[1] != self._text_features.shape[1]
-            ):
-                raise ValueError("invalid cached feature shape")
-            self.cache_hits += 1
-            import torch
-
-            return torch.from_numpy(np.asarray(array, dtype=np.float32)).to(
-                device=self.device,
-                dtype=self._text_features.dtype,
-            )
-        except (FileNotFoundError, OSError, ValueError):
-            if path.exists():
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-            self.cache_misses += 1
-            return None
-
-    def _store_cached_feature(self, image: Image.Image, feature) -> None:
-        if self.cache_dir is None:
-            return
-        path = self.cache_dir / f"{self._image_cache_key(image)}.npy"
-        if path.exists():
-            return
-        temporary: Optional[str] = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb", dir=self.cache_dir, prefix=f".{path.stem}.", suffix=".tmp", delete=False
-            ) as handle:
-                temporary = handle.name
-                np.save(handle, feature.detach().cpu().numpy().astype(np.float32), allow_pickle=False)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-        except OSError:
-            if temporary:
-                try:
-                    os.unlink(temporary)
-                except OSError:
-                    pass
-
-    def score_images(self, images: Sequence[Image.Image]) -> list[SemanticScores]:
-        if not images:
-            return []
-        import torch
-
-        features: list[Optional[torch.Tensor]] = [
-            self._load_cached_feature(image) for image in images
-        ]
-        missing_positions = [index for index, feature in enumerate(features) if feature is None]
-        if missing_positions:
-            missing_images = [images[index] for index in missing_positions]
-            encoded = self.encoder.encode_images(list(missing_images))
-            for encoded_index, image_index in enumerate(missing_positions):
-                feature = encoded[encoded_index:encoded_index + 1]
-                features[image_index] = feature
-                self._store_cached_feature(images[image_index], feature)
-        image_features = torch.cat([feature for feature in features if feature is not None], dim=0)
-        raw = (image_features @ self._text_features.T).detach().cpu().numpy()
-        positive_size, ad_size, mismatch_size, scene_size = self._group_sizes
-        positive_end = positive_size
-        ad_end = positive_end + ad_size
-        mismatch_end = ad_end + mismatch_size
-        scene_end = mismatch_end + scene_size
-        results: list[SemanticScores] = []
-        for row in raw:
-            positive = row[:positive_end]
-            advertisement = row[positive_end:ad_end]
-            mismatch = row[ad_end:mismatch_end]
-            positive_index = int(np.argmax(positive))
-            advertisement_index = int(np.argmax(advertisement))
-            mismatch_index = int(np.argmax(mismatch))
-            if scene_size:
-                scene = row[mismatch_end:scene_end]
-                scene_index = int(np.argmax(scene))
-                scene_score = float(scene[scene_index])
-                scene_prompt = self.prompts.scene_evidence[scene_index]
-            else:
-                scene_score = float(positive[positive_index])
-                scene_prompt = self.prompts.positive[positive_index]
-            results.append(SemanticScores(
-                relevance=float(positive[positive_index]),
-                advertisement=float(advertisement[advertisement_index]),
-                mismatch=float(mismatch[mismatch_index]),
-                scene_evidence=scene_score,
-                relevance_prompt=self.prompts.positive[positive_index],
-                advertisement_prompt=self.prompts.advertisement[advertisement_index],
-                mismatch_prompt=self.prompts.mismatch[mismatch_index],
-                scene_evidence_prompt=scene_prompt,
-            ))
-        return results
-
-
-class VisualSignalAnalyzer:
-    """Detect QR codes and text-heavy advertising signals with optional OCR."""
-
-    def __init__(
-        self,
-        *,
-        enable_ocr: bool = False,
-        ocr_all: bool = False,
-        ocr_candidate_text_ratio: float = 0.015,
-    ) -> None:
-        self.enable_ocr = enable_ocr
-        self.ocr_all = ocr_all
-        self.ocr_candidate_text_ratio = ocr_candidate_text_ratio
-        try:
-            import cv2
-
-            self.cv2 = cv2
-            self._qr_detector = cv2.QRCodeDetector()
-        except ImportError:
-            self.cv2 = None
-            self._qr_detector = None
-        self.pytesseract = None
-        if enable_ocr:
-            try:
-                import pytesseract
-
-                pytesseract.get_tesseract_version()
-                self.pytesseract = pytesseract
-            except (ImportError, OSError):
-                pass
-
-    def _estimate_text_area(self, image: Image.Image) -> tuple[float, int]:
-        if self.cv2 is None:
-            return 0.0, 0
-        cv2 = self.cv2
-        rgb = np.asarray(image.convert("RGB"))
-        height, width = rgb.shape[:2]
-        scale = min(1.0, 1000.0 / max(height, width))
-        if scale < 1.0:
-            rgb = cv2.resize(rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        gradient = cv2.Sobel(gray, cv2.CV_8U, 1, 0, ksize=3)
-        _, binary = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        kernel_width = max(5, int(binary.shape[1] * 0.012))
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 3))
-        connected = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        mask = np.zeros_like(gray)
-        box_count = 0
-        image_area = float(gray.shape[0] * gray.shape[1])
-        for contour in contours:
-            x, y, box_width, box_height = cv2.boundingRect(contour)
-            box_area = box_width * box_height
-            if box_width < 12 or box_height < 4:
-                continue
-            if box_height > gray.shape[0] * 0.18 or box_area > image_area * 0.12:
-                continue
-            aspect = box_width / max(box_height, 1)
-            if not 1.2 <= aspect <= 30.0:
-                continue
-            cv2.rectangle(mask, (x, y), (x + box_width, y + box_height), 255, -1)
-            box_count += 1
-        ratio = float(np.count_nonzero(mask) / image_area) if image_area else 0.0
-        return min(ratio, 1.0), box_count
-
-    def _detect_qr(self, image: Image.Image) -> bool:
-        if self._qr_detector is None:
-            return False
-        try:
-            rgb = np.asarray(image.convert("RGB"))
-            height, width = rgb.shape[:2]
-            scale = min(1.0, 1400.0 / max(height, width))
-            if scale < 1.0:
-                rgb = self.cv2.resize(
-                    rgb, None, fx=scale, fy=scale, interpolation=self.cv2.INTER_AREA
-                )
-            decoded, _, _ = self._qr_detector.detectAndDecode(
-                rgb
-            )
-            return bool(str(decoded).strip())
-        except Exception:
-            return False
-
-    def _run_ocr(self, image: Image.Image) -> tuple[str, float, int]:
-        if not self.enable_ocr or self.pytesseract is None:
-            return "", 0.0, 0
-        resized = image.convert("RGB")
-        if max(resized.size) > 1600:
-            resized.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
-        try:
-            output = self.pytesseract.image_to_data(
-                resized,
-                lang="eng",
-                config="--psm 11",
-                output_type=self.pytesseract.Output.DICT,
-            )
-        except Exception:
-            return "", 0.0, 0
-        texts: list[str] = []
-        area = 0
-        count = 0
-        for index, text in enumerate(output.get("text", [])):
-            text = str(text or "").strip()
-            try:
-                confidence = float(output["conf"][index])
-            except (KeyError, IndexError, TypeError, ValueError):
-                confidence = -1.0
-            if not text or confidence < 35:
-                continue
-            texts.append(text)
-            width = int(output["width"][index])
-            height = int(output["height"][index])
-            area += max(width, 0) * max(height, 0)
-            count += 1
-        total_area = float(resized.width * resized.height)
-        return " ".join(texts), min(area / total_area, 1.0) if total_area else 0.0, count
-
-    def analyze(
-        self,
-        image: Image.Image,
-        scores: Optional[SemanticScores] = None,
-    ) -> VisualSignals:
-        estimated_ratio, estimated_boxes = self._estimate_text_area(image)
-        qr_detected = self._detect_qr(image)
-        should_ocr = self.ocr_all or qr_detected or estimated_ratio >= self.ocr_candidate_text_ratio
-        if scores is not None and scores.ad_margin >= -0.035:
-            should_ocr = True
-        ocr_text, ocr_ratio, ocr_boxes = (
-            self._run_ocr(image) if should_ocr else ("", 0.0, 0)
-        )
-        lowered = ocr_text.casefold()
-        promotion_hits = tuple(term for term in PROMOTION_TERMS if term.casefold() in lowered)
-        contact_hits = sum(len(pattern.findall(ocr_text)) for pattern in CONTACT_PATTERNS)
-        return VisualSignals(
-            text_area_ratio=max(estimated_ratio, ocr_ratio),
-            text_box_count=max(estimated_boxes, ocr_boxes),
-            qr_detected=qr_detected,
-            ocr_text=ocr_text[:1000],
-            promotion_hits=promotion_hits,
-            contact_hits=contact_hits,
-        )
-
-
-class DecisionPolicy:
-    def __init__(self, thresholds: Optional[FilterThresholds] = None) -> None:
-        self.thresholds = thresholds or FilterThresholds()
-
-    def decide(
-        self,
-        *,
-        record_position: int,
-        path: str,
-        scores: SemanticScores,
-        signals: VisualSignals,
-    ) -> FilterDecision:
-        thresholds = self.thresholds
-        reasons: list[str] = []
-        ad_evidence = 0
-        if signals.qr_detected:
-            reasons.append("qr_code")
-            ad_evidence += 4
-        if signals.promotion_hits:
-            reasons.append("promotion_terms")
-            ad_evidence += 2
-        if signals.contact_hits:
-            reasons.append("contact_information")
-            ad_evidence += min(signals.contact_hits, 2)
-        if signals.text_area_ratio >= thresholds.text_area_ratio:
-            reasons.append("text_heavy")
-            ad_evidence += 1
-        semantic_ad = (
-            scores.advertisement >= thresholds.advertisement_score
-            and scores.ad_margin >= thresholds.advertisement_margin
-        )
-        if semantic_ad:
-            reasons.append("clip_advertisement")
-            ad_evidence += 3
-        supported_ad = (
-            signals.text_area_ratio >= thresholds.text_area_ratio
-            and scores.advertisement >= thresholds.advertisement_support_score
-            and scores.ad_margin >= thresholds.advertisement_support_margin
-        )
-        if supported_ad and not semantic_ad:
-            reasons.append("text_supported_advertisement")
-            ad_evidence += 2
-        if ad_evidence >= 3:
-            confidence = "high" if (
-                signals.qr_detected
-                or bool(signals.promotion_hits)
-                or signals.contact_hits > 0
-                or scores.ad_margin >= 0.02
-            ) else "medium"
-            return FilterDecision(
-                record_position=record_position,
-                path=path,
-                action="quarantine",
-                category="advertisement",
-                reasons=tuple(reasons),
-                scores=scores,
-                signals=signals,
-                confidence=confidence,
-            )
-
-        mismatch_reasons: list[str] = []
-        if scores.relevance < thresholds.min_relevance:
-            mismatch_reasons.append("low_relevance")
-        if scores.mismatch_margin >= thresholds.mismatch_margin:
-            mismatch_reasons.append("negative_prompt_wins")
-        if (
-            thresholds.minimum_scene_evidence is not None
-            and scores.scene_evidence < thresholds.minimum_scene_evidence
-        ):
-            mismatch_reasons.append("low_scene_evidence")
-        if (
-            thresholds.scene_evidence_margin is not None
-            and scores.scene_evidence_margin >= thresholds.scene_evidence_margin
-        ):
-            mismatch_reasons.append("scene_negative_prompt_wins")
-        if mismatch_reasons:
-            confidence = "high" if (
-                scores.relevance < thresholds.min_relevance - 0.03
-                or scores.mismatch_margin >= thresholds.mismatch_margin + 0.03
-                or (
-                    thresholds.minimum_scene_evidence is not None
-                    and scores.scene_evidence < thresholds.minimum_scene_evidence - 0.03
-                )
-                or (
-                    thresholds.scene_evidence_margin is not None
-                    and scores.scene_evidence_margin >= thresholds.scene_evidence_margin + 0.03
-                )
-            ) else "medium"
-            return FilterDecision(
-                record_position=record_position,
-                path=path,
-                action="quarantine",
-                category="semantic_mismatch",
-                reasons=tuple(mismatch_reasons),
-                scores=scores,
-                signals=signals,
-                confidence=confidence,
-            )
-        confidence = "high" if (
-            scores.relevance >= thresholds.min_relevance + 0.045
-            and scores.ad_margin <= -0.02
-            and scores.mismatch_margin <= -0.02
-        ) else "medium"
-        return FilterDecision(
-            record_position=record_position,
-            path=path,
-            action="keep",
-            category="relevant",
-            reasons=(),
-            scores=scores,
-            signals=signals,
-            confidence=confidence,
-        )
-
+from .dataset_filter_scorers import CLIPPromptScorer
+from .dataset_filter_signals import VisualSignalAnalyzer
+from .dataset_filter_policy import DecisionPolicy
 
 def _atomic_write_jsonl(path: Path, records: Sequence[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -747,6 +131,7 @@ class DatasetImageFilter:
 
     ACTIVE_RUN_FILE = ".active_filter_run.json"
     RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    INCREMENTAL_STATE_FILE = "_filter_cache/incremental_state.json"
 
     @classmethod
     def _read_active_runs(cls, dataset: Path) -> list[dict[str, Any]]:
@@ -838,50 +223,125 @@ class DatasetImageFilter:
             return [0]
         return [round(index * (total - 1) / (limit - 1)) for index in range(limit)]
 
-    def evaluate(self, *, limit: Optional[int] = None) -> tuple[list[FilterDecision], int]:
+    def evaluate(
+        self,
+        *,
+        limit: Optional[int] = None,
+        incremental: bool = False,
+    ) -> tuple[list[FilterDecision], int]:
         records = self._load_records()
         positions = self._select_positions(len(records), limit)
         decisions: list[FilterDecision] = []
+        reused = 0
+        state = self._load_incremental_state() if incremental else {"entries": {}}
+        entries: dict[str, Any] = dict(state.get("entries") or {})
         progress = tqdm(total=len(positions), desc="DatasetFilter")
         try:
-            for offset in range(0, len(positions), self.batch_size):
-                batch_positions = positions[offset:offset + self.batch_size]
-                valid: list[tuple[int, str, Image.Image]] = []
-                for position in batch_positions:
-                    raw_path = _record_path(records[position])
-                    try:
-                        absolute, relative = self._resolve_path(raw_path)
-                        with Image.open(absolute) as opened:
-                            image = opened.convert("RGB")
-                        valid.append((position, relative, image))
-                    except (FileNotFoundError, UnidentifiedImageError, OSError, ValueError) as exc:
-                        decisions.append(FilterDecision(
+            pending: list[tuple[int, str, Image.Image, dict[str, Any]]] = []
+            for position in positions:
+                raw_path = _record_path(records[position])
+                try:
+                    absolute, relative = self._resolve_path(raw_path)
+                    fingerprint = self._file_fingerprint(absolute)
+                    cached = entries.get(relative) if incremental else None
+                    if (
+                        incremental
+                        and isinstance(cached, dict)
+                        and cached.get("mtime_ns") == fingerprint["mtime_ns"]
+                        and cached.get("size") == fingerprint["size"]
+                        and isinstance(cached.get("decision"), dict)
+                    ):
+                        decision = FilterDecision.from_dict(cached["decision"])
+                        # Positions can shift when metadata is rewritten; keep path identity.
+                        decision = FilterDecision(
                             record_position=position,
-                            path=raw_path,
-                            action="quarantine",
-                            category="invalid",
-                            reasons=("invalid_or_missing_image",),
-                            error=str(exc),
-                        ))
+                            path=relative,
+                            action=decision.action,
+                            category=decision.category,
+                            reasons=decision.reasons,
+                            scores=decision.scores,
+                            signals=decision.signals,
+                            confidence=decision.confidence,
+                            error=decision.error,
+                        )
+                        decisions.append(decision)
+                        reused += 1
                         progress.update(1)
-                if not valid:
-                    continue
-                scores = self.scorer.score_images([item[2] for item in valid])
-                if len(scores) != len(valid):
+                        continue
+                    with Image.open(absolute) as opened:
+                        image = opened.convert("RGB")
+                    pending.append((position, relative, image, fingerprint))
+                except (FileNotFoundError, UnidentifiedImageError, OSError, ValueError) as exc:
+                    decisions.append(FilterDecision(
+                        record_position=position,
+                        path=raw_path,
+                        action="quarantine",
+                        category="invalid",
+                        reasons=("invalid_or_missing_image",),
+                        error=str(exc),
+                    ))
+                    progress.update(1)
+
+            for offset in range(0, len(pending), self.batch_size):
+                batch = pending[offset:offset + self.batch_size]
+                scores = self.scorer.score_images([item[2] for item in batch])
+                if len(scores) != len(batch):
                     raise ValueError("scorer returned a row count different from input images")
-                for (position, relative, image), semantic_scores in zip(valid, scores):
+                for (position, relative, image, fingerprint), semantic_scores in zip(batch, scores):
                     signals = self.analyzer.analyze(image, semantic_scores)
-                    decisions.append(self.policy.decide(
+                    decision = self.policy.decide(
                         record_position=position,
                         path=relative,
                         scores=semantic_scores,
                         signals=signals,
-                    ))
+                    )
+                    decisions.append(decision)
+                    if incremental:
+                        entries[relative] = {
+                            **fingerprint,
+                            "decision": decision.to_dict(),
+                        }
                     progress.update(1)
         finally:
             progress.close()
         decisions.sort(key=lambda item: item.record_position)
+        if incremental:
+            self._write_incremental_state({"version": 1, "entries": entries})
+            self._last_incremental_reused = reused
+        else:
+            self._last_incremental_reused = 0
         return decisions, len(records)
+
+    @staticmethod
+    def _file_fingerprint(path: Path) -> dict[str, int]:
+        stat = path.stat()
+        return {
+            "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            "size": int(stat.st_size),
+        }
+
+    def _incremental_state_path(self) -> Path:
+        return self.dataset_dir / self.INCREMENTAL_STATE_FILE
+
+    def _load_incremental_state(self) -> dict[str, Any]:
+        path = self._incremental_state_path()
+        if not path.exists():
+            return {"version": 1, "entries": {}}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"version": 1, "entries": {}}
+        if not isinstance(payload, dict):
+            return {"version": 1, "entries": {}}
+        entries = payload.get("entries")
+        if not isinstance(entries, dict):
+            entries = {}
+        return {"version": 1, "entries": entries}
+
+    def _write_incremental_state(self, payload: dict[str, Any]) -> None:
+        path = self._incremental_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(path, payload)
 
     @staticmethod
     def _percentiles(values: Sequence[float]) -> dict[str, float]:
@@ -938,6 +398,12 @@ class DatasetImageFilter:
                 ]),
             },
         }
+        reused = int(getattr(self, "_last_incremental_reused", 0) or 0)
+        if reused:
+            report["incremental"] = {
+                "reused_decisions": reused,
+                "rescored": max(0, len(decisions) - reused),
+            }
         if hasattr(self.scorer, "cache_hits"):
             report["feature_cache"] = {
                 "enabled": getattr(self.scorer, "cache_dir", None) is not None,
@@ -1039,6 +505,7 @@ class DatasetImageFilter:
         limit: Optional[int] = None,
         apply: bool = False,
         run_id: Optional[str] = None,
+        incremental: bool = False,
     ) -> dict[str, Any]:
         if apply and limit is not None:
             raise ValueError("--apply cannot be combined with --limit")
@@ -1048,7 +515,7 @@ class DatasetImageFilter:
         base = "_quarantine" if apply else "_filter_runs"
         run_dir = self.dataset_dir / base / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
-        decisions, total_records = self.evaluate(limit=limit)
+        decisions, total_records = self.evaluate(limit=limit, incremental=incremental)
         records = self._load_records()
         _atomic_write_jsonl(
             run_dir / "decisions.jsonl",
@@ -1156,7 +623,9 @@ class DatasetImageFilter:
         return report
 
     @staticmethod
-    def _perceptual_signature(path: Path) -> tuple[int, float, tuple[float, float, float]]:
+    def _perceptual_signature(
+        path: Path,
+    ) -> tuple[int, int, float, tuple[float, float, float]]:
         with Image.open(path) as opened:
             rgb = opened.convert("RGB")
             aspect = rgb.width / max(rgb.height, 1)
@@ -1164,13 +633,8 @@ class DatasetImageFilter:
                 float(value)
                 for value in np.asarray(rgb.resize((1, 1), Image.Resampling.BOX))[0, 0]
             )
-            gray = rgb.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
-            pixels = np.asarray(gray, dtype=np.int16)
-        bits = (pixels[:, 1:] > pixels[:, :-1]).reshape(-1)
-        value = 0
-        for enabled in bits:
-            value = (value << 1) | int(enabled)
-        return value, aspect, mean_color
+            fingerprint = perceptual_fingerprint(rgb)
+        return int(fingerprint.phash, 16), int(fingerprint.dhash, 16), aspect, mean_color
 
     @classmethod
     def run_near_dedupe(
@@ -1182,14 +646,24 @@ class DatasetImageFilter:
         max_color_distance: float = 35.0,
         apply: bool = False,
         run_id: Optional[str] = None,
+        embedding_similarity: float = 0.98,
+        embeddings: Optional[Mapping[str, Sequence[float]]] = None,
+        use_embedding_clusters: bool = False,
     ) -> dict[str, Any]:
-        """Find visually near-identical images with conservative safety gates."""
+        """Find visually near-identical images with conservative safety gates.
+
+        When ``embeddings`` are provided or ``use_embedding_clusters`` is true,
+        images are first grouped via :func:`cluster_embeddings`, then pairwise
+        pHash / aspect / colour gates run only inside each cluster.
+        """
         if not 0 <= max_distance <= 64:
             raise ValueError("near-duplicate hash distance must be between 0 and 64")
         if max_aspect_delta < 0.0:
             raise ValueError("near-duplicate aspect delta cannot be negative")
         if max_color_distance < 0.0:
             raise ValueError("near-duplicate color distance cannot be negative")
+        if not -1.0 <= embedding_similarity <= 1.0:
+            raise ValueError("embedding_similarity must be between -1 and 1")
         dataset = Path(dataset_dir).expanduser().resolve()
         if not dataset.is_dir():
             raise NotADirectoryError(f"dataset directory not found: {dataset}")
@@ -1201,55 +675,96 @@ class DatasetImageFilter:
         run_dir.mkdir(parents=True, exist_ok=False)
 
         records = _read_jsonl(dataset / "metadata.jsonl")
-        representatives: list[tuple[str, int, float, tuple[float, float, float]]] = []
-        duplicate_groups: set[str] = set()
-        decisions: list[FilterDecision] = []
+        inspected: list[tuple[int, str, int, int, float, tuple[float, float, float]]] = []
         for position, record in enumerate(records):
             raw_path = _record_path(record)
             try:
                 absolute, relative = cls._resolve_for_verify(dataset, raw_path)
-                image_hash, aspect, mean_color = cls._perceptual_signature(absolute)
+                phash, dhash, aspect, mean_color = cls._perceptual_signature(absolute)
             except (FileNotFoundError, UnidentifiedImageError, OSError, ValueError) as exc:
                 raise RuntimeError(f"cannot inspect near duplicate {raw_path}: {exc}") from exc
-            best: Optional[tuple[str, int, float]] = None
-            for original, known_hash, known_aspect, known_color in representatives:
-                aspect_delta = abs(aspect - known_aspect) / max(aspect, known_aspect, 1e-9)
-                if aspect_delta > max_aspect_delta:
+            inspected.append((position, relative, phash, dhash, aspect, mean_color))
+
+        if embeddings is not None or use_embedding_clusters:
+            vector_map: dict[str, Sequence[float]] = {}
+            if embeddings is not None:
+                for _, relative, *_rest in inspected:
+                    if relative not in embeddings:
+                        raise ValueError(f"missing embedding for {relative}")
+                    vector_map[relative] = embeddings[relative]
+            else:
+                # Coarse colour/aspect vectors only — bit-level pHash vectors are
+                # a poor cosine blocking key across JPEG recompressions.
+                for _, relative, _phash, _dhash, aspect, mean_color in inspected:
+                    vector_map[relative] = [
+                        float(aspect),
+                        float(mean_color[0]) / 255.0,
+                        float(mean_color[1]) / 255.0,
+                        float(mean_color[2]) / 255.0,
+                    ]
+            clusters = cluster_embeddings(
+                vector_map,
+                similarity_threshold=embedding_similarity,
+            )
+        else:
+            # Legacy all-pairs path: one cluster containing every image.
+            clusters = {relative: "all" for _, relative, *_ in inspected}
+
+        by_cluster: dict[str, list[tuple[int, str, int, int, float, tuple[float, float, float]]]] = {}
+        for item in inspected:
+            by_cluster.setdefault(clusters[item[1]], []).append(item)
+
+        decisions: list[FilterDecision] = []
+        duplicate_groups: set[str] = set()
+        for members in by_cluster.values():
+            representatives: list[tuple[str, int, int, float, tuple[float, float, float]]] = []
+            for position, relative, phash, dhash, aspect, mean_color in members:
+                best: Optional[tuple[str, int, int, float]] = None
+                for original, known_phash, known_dhash, known_aspect, known_color in representatives:
+                    aspect_delta = abs(aspect - known_aspect) / max(aspect, known_aspect, 1e-9)
+                    if aspect_delta > max_aspect_delta:
+                        continue
+                    color_distance = sum(
+                        (left - right) ** 2 for left, right in zip(mean_color, known_color)
+                    ) ** 0.5
+                    if color_distance > max_color_distance:
+                        continue
+                    phash_distance = (phash ^ known_phash).bit_count()
+                    dhash_distance = (dhash ^ known_dhash).bit_count()
+                    # A lossy JPEG re-encode can perturb one fingerprint heavily.
+                    # Either hash may nominate a duplicate; aspect and colour gates
+                    # below remain mandatory before quarantining it.
+                    distance = min(phash_distance, dhash_distance)
+                    if distance <= max_distance and (best is None or distance < best[1]):
+                        best = (original, distance, max(phash_distance, dhash_distance), color_distance)
+                if best is None:
+                    representatives.append((relative, phash, dhash, aspect, mean_color))
+                    decisions.append(FilterDecision(
+                        record_position=position,
+                        path=relative,
+                        action="keep",
+                        category="perceptually_unique",
+                        reasons=(),
+                        confidence="high",
+                    ))
                     continue
-                color_distance = sum(
-                    (left - right) ** 2 for left, right in zip(mean_color, known_color)
-                ) ** 0.5
-                if color_distance > max_color_distance:
-                    continue
-                distance = (image_hash ^ known_hash).bit_count()
-                if distance <= max_distance and (best is None or distance < best[1]):
-                    best = (original, distance, color_distance)
-            if best is None:
-                representatives.append((relative, image_hash, aspect, mean_color))
+                original, distance, secondary_distance, color_distance = best
+                duplicate_groups.add(original)
                 decisions.append(FilterDecision(
                     record_position=position,
                     path=relative,
-                    action="keep",
-                    category="perceptually_unique",
-                    reasons=(),
-                    confidence="high",
+                    action="quarantine",
+                    category="near_duplicate",
+                    reasons=("perceptual_hash_near_duplicate",),
+                    confidence="medium",
+                    error=(
+                        f"duplicate_of={original};hamming_distance={distance};"
+                        f"secondary_hamming_distance={secondary_distance};"
+                        f"color_distance={color_distance:.3f}"
+                    ),
                 ))
-                continue
-            original, distance, color_distance = best
-            duplicate_groups.add(original)
-            decisions.append(FilterDecision(
-                record_position=position,
-                path=relative,
-                action="quarantine",
-                category="near_duplicate",
-                reasons=("perceptual_hash_near_duplicate",),
-                confidence="medium",
-                error=(
-                    f"duplicate_of={original};hamming_distance={distance};"
-                    f"color_distance={color_distance:.3f}"
-                ),
-            ))
 
+        decisions.sort(key=lambda item: item.record_position)
         _atomic_write_jsonl(
             run_dir / "decisions.jsonl",
             [decision.to_dict() for decision in decisions],
@@ -1275,6 +790,13 @@ class DatasetImageFilter:
                 "max_distance": max_distance,
                 "max_aspect_delta": max_aspect_delta,
                 "max_color_distance": max_color_distance,
+                "hashes": ("phash", "dhash"),
+            },
+            "embedding_clusters": {
+                "enabled": embeddings is not None or use_embedding_clusters,
+                "similarity_threshold": embedding_similarity,
+                "cluster_count": len(by_cluster),
+                "external_embeddings": embeddings is not None,
             },
         }
         if apply:
@@ -1287,6 +809,28 @@ class DatasetImageFilter:
             report["remaining"] = len(records) - duplicate_count
         _atomic_write_json(run_dir / "report.json", report)
         return report
+
+    @staticmethod
+    def _signature_embedding(
+        phash: int,
+        dhash: int,
+        aspect: float,
+        mean_color: tuple[float, float, float],
+    ) -> list[float]:
+        """Deterministic vector used to block near-dup comparisons via clustering."""
+        bits: list[float] = []
+        for value in (phash, dhash):
+            for shift in range(64):
+                bits.append(1.0 if (value >> shift) & 1 else -1.0)
+        bits.extend(
+            [
+                float(aspect),
+                float(mean_color[0]) / 255.0,
+                float(mean_color[1]) / 255.0,
+                float(mean_color[2]) / 255.0,
+            ]
+        )
+        return bits
 
     @classmethod
     def run_review_rejections(
@@ -1570,9 +1114,42 @@ class DatasetImageFilter:
                 dataset / "_quarantine" / active_runs[0]["run_id"] / "backups" / "metadata.jsonl"
             )
             baseline_paths = normalized_paths(baseline, _record_path)
-            if baseline_paths and baseline_paths != seen_paths:
-                missing = len(baseline_paths - seen_paths)
-                unexpected = len(seen_paths - baseline_paths)
+            # A later layout repair may renumber/rebucket active files and a
+            # replenishment crawl may legitimately add new paths.  Translate
+            # baseline paths through each repair map, then require every
+            # baseline path to remain represented while only allowing extras
+            # explicitly recorded as new layout targets.
+            layout_maps: list[dict[str, str]] = []
+            layout_added_paths: set[str] = set()
+            layout_root = dataset / "_layout_repairs"
+            if layout_root.is_dir():
+                for map_path in sorted(layout_root.glob("*/path_map.jsonl")):
+                    try:
+                        with map_path.open("r", encoding="utf-8") as handle:
+                            mapping: dict[str, str] = {}
+                            for line in handle:
+                                item = json.loads(line)
+                                old_path = str(item["old_rel"])
+                                new_path = str(item["new_rel"])
+                                mapping[old_path] = new_path
+                                layout_added_paths.add(new_path)
+                            if mapping:
+                                layout_maps.append(mapping)
+                    except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                        errors.append(f"invalid layout repair map {map_path}: {exc}")
+
+            def repaired_path(path: str) -> str:
+                current = path
+                for mapping in layout_maps:
+                    current = mapping.get(current, current)
+                return current
+
+            expected_paths = {repaired_path(path) for path in baseline_paths}
+            missing_paths = expected_paths - seen_paths
+            unexpected_paths = (seen_paths - expected_paths) - layout_added_paths
+            if missing_paths or unexpected_paths:
+                missing = len(missing_paths)
+                unexpected = len(unexpected_paths)
                 errors.append(
                     f"active/quarantine chain differs from baseline: "
                     f"missing={missing}, unexpected={unexpected}"

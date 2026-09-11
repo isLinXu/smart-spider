@@ -54,6 +54,30 @@ def test_expired_lease_is_recoverable():
             assert store.get_candidate(candidate_id)["state"] == "retry_wait"
 
 
+def test_aborting_multimodal_prepare_releases_leased_candidates():
+    with tempfile.TemporaryDirectory() as tmp:
+        with DatasetStateStore(os.path.join(tmp, "state.sqlite3")) as store:
+            store.create_job("job-1")
+            candidate_id = store.add_candidate(
+                "job-1", CandidateResource("https://example.com/recover.jpg", "bing")
+            )
+            assert store.claim_candidate(candidate_id)
+            prepared = store.prepare_multimodal_item(
+                "job-1",
+                SampleRecord(sample_id="recover-sample"),
+                candidate_ids=[candidate_id],
+                assets=[{
+                    "relative_path": "assets/missing.jpg",
+                    "staging_path": "assets/.staging/missing.tmp",
+                    "mime_type": "image/jpeg",
+                    "digest": "missing",
+                }],
+            )
+            assert prepared["status"] == "prepared"
+            assert store.abort_multimodal_item(prepared["item_id"])
+            assert store.get_candidate(candidate_id)["state"] == "retry_wait"
+
+
 def test_sample_submission_is_idempotent_by_content_hash():
     with tempfile.TemporaryDirectory() as tmp:
         with DatasetStateStore(os.path.join(tmp, "state.sqlite3")) as store:
@@ -114,3 +138,33 @@ def test_dataset_item_reservation_is_unique_and_monotonic():
             assert duplicate["status"] == "duplicate"
             assert second["index"] == 1
             assert store.dataset_next_index("job-1") == 2
+
+
+def test_collect_stats_and_checkpoint():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "state.sqlite3")
+        with DatasetStateStore(db_path) as store:
+            store.create_job("job-stats")
+            store.add_candidate(
+                "job-stats",
+                CandidateResource("https://example.com/stats.jpg", "bing"),
+            )
+            stats = store.collect_stats()
+            assert stats["table_counts"]["jobs"] >= 1
+            assert stats["table_counts"]["candidates"] >= 1
+            assert "pending" in stats["candidate_states"] or stats["candidate_states"]
+            checkpoint = store.checkpoint(mode="TRUNCATE")
+            assert set(checkpoint) == {"busy", "log", "checkpointed"}
+
+
+def test_db_stats_cli_json(tmp_path, capsys):
+    from smart_spider.db_stats_cli import main
+
+    db_path = tmp_path / "state.sqlite3"
+    with DatasetStateStore(str(db_path)) as store:
+        store.create_job("job-cli")
+    code = main(["--db", str(db_path), "--json", "--checkpoint", "TRUNCATE"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert '"table_counts"' in out
+    assert '"wal_bytes"' in out

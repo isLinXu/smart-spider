@@ -43,6 +43,7 @@ class DatasetStateStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=30000")
+        self._lease_recoveries_total = 0
         self._init_schema()
 
     def _init_schema(self):
@@ -131,6 +132,21 @@ class DatasetStateStore:
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(job_id) REFERENCES jobs(job_id)
                 );
+                CREATE TABLE IF NOT EXISTS multimodal_items (
+                    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    sample_id TEXT NOT NULL,
+                    candidate_ids_json TEXT NOT NULL DEFAULT '[]',
+                    asset_paths_json TEXT NOT NULL DEFAULT '[]',
+                    manifest_json TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'prepared',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(job_id, sample_id),
+                    FOREIGN KEY(job_id) REFERENCES jobs(job_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_multimodal_items_state
+                    ON multimodal_items(job_id, state, item_id);
                 """
             )
 
@@ -679,7 +695,16 @@ class DatasetStateStore:
                 """,
                 [now, utc_now(), *args],
             )
-            return cursor.rowcount
+            recovered = int(cursor.rowcount or 0)
+            self._lease_recoveries_total += recovered
+            if recovered:
+                self._record_event_locked(
+                    job_id or "",
+                    None,
+                    "leases_recovered",
+                    {"count": recovered},
+                )
+            return recovered
 
     def add_sample(
         self,
@@ -709,6 +734,207 @@ class DatasetStateStore:
                 self._record_event_locked(job_id, candidate_id, "sample_accepted", sample.to_dict())
                 return True
             return False
+
+    def prepare_multimodal_item(
+        self,
+        job_id: str,
+        sample: SampleRecord,
+        *,
+        candidate_ids: list[str],
+        assets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Persist a durable multimodal prepare record before publishing assets.
+
+        ``assets`` contains both the final relative path and its same-volume
+        staging path.  A later recovery pass can therefore finish a process
+        interrupted between the asset fsync and manifest publication.
+        """
+        now = utc_now()
+        manifest_json = json.dumps(sample.to_dict(), ensure_ascii=False)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT item_id, state FROM multimodal_items
+                    WHERE job_id=? AND sample_id=?
+                    """,
+                    (job_id, sample.sample_id),
+                ).fetchone()
+                if row is not None:
+                    self._conn.rollback()
+                    return {"status": str(row["state"]), "item_id": int(row["item_id"])}
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO multimodal_items(
+                        job_id, sample_id, candidate_ids_json, asset_paths_json,
+                        manifest_json, state, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'prepared', ?, ?)
+                    """,
+                    (
+                        job_id,
+                        sample.sample_id,
+                        json.dumps(candidate_ids, ensure_ascii=False),
+                        json.dumps(assets, ensure_ascii=False),
+                        manifest_json,
+                        now,
+                        now,
+                    ),
+                )
+                self._record_event_locked(
+                    job_id,
+                    candidate_ids[0] if candidate_ids else None,
+                    "multimodal_prepared",
+                    {"id": sample.sample_id, "state": "prepared"},
+                )
+                self._conn.commit()
+                return {"status": "prepared", "item_id": int(cursor.lastrowid)}
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def finalize_multimodal_item(self, item_id: int) -> bool:
+        """Atomically mark a prepared multimodal sample and its candidates accepted."""
+        now = utc_now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM multimodal_items WHERE item_id=?", (item_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"unknown multimodal item: {item_id}")
+                if row["state"] == "committed":
+                    self._conn.rollback()
+                    return False
+                if row["state"] != "prepared":
+                    raise RuntimeError(f"multimodal item {item_id} is not prepared")
+                candidate_ids = json.loads(row["candidate_ids_json"])
+                primary_candidate = candidate_ids[0] if candidate_ids else None
+                content_hash = hashlib.sha256(
+                    row["manifest_json"].encode("utf-8")
+                ).hexdigest()
+                cursor = self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO samples(
+                        sample_id, job_id, candidate_id, content_hash,
+                        payload_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["sample_id"], row["job_id"], primary_candidate,
+                        content_hash, row["manifest_json"], now, now,
+                    ),
+                )
+                if not cursor.rowcount:
+                    existing = self._conn.execute(
+                        "SELECT job_id, content_hash FROM samples WHERE sample_id=?",
+                        (row["sample_id"],),
+                    ).fetchone()
+                    if (
+                        existing is None
+                        or existing["job_id"] != row["job_id"]
+                        or existing["content_hash"] != content_hash
+                    ):
+                        raise RuntimeError(
+                            f"sample conflict while finalizing multimodal item {item_id}"
+                        )
+                for candidate_id in candidate_ids:
+                    self._conn.execute(
+                        """
+                        UPDATE candidates
+                        SET state='accepted', lease_token=NULL, lease_until=NULL,
+                            last_error=NULL, updated_at=?
+                        WHERE candidate_id=?
+                        """,
+                        (now, candidate_id),
+                    )
+                self._conn.execute(
+                    """
+                    UPDATE multimodal_items
+                    SET state='committed', updated_at=? WHERE item_id=?
+                    """,
+                    (now, item_id),
+                )
+                self._record_event_locked(
+                    row["job_id"], primary_candidate, "sample_accepted",
+                    json.loads(row["manifest_json"]),
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def abort_multimodal_item(self, item_id: int) -> bool:
+        """Discard a prepare record and release candidates leased by it.
+
+        Only candidates still in ``leased`` state are returned to the retry
+        queue; an unrelated terminal/accepted transition is left untouched.
+        """
+        now = time.time()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT job_id, candidate_ids_json, state FROM multimodal_items WHERE item_id=?",
+                    (item_id,),
+                ).fetchone()
+                if row is None or row["state"] == "committed":
+                    self._conn.rollback()
+                    return False
+                candidate_ids = json.loads(row["candidate_ids_json"])
+                for candidate_id in candidate_ids:
+                    self._conn.execute(
+                        """
+                        UPDATE candidates
+                        SET state='retry_wait', available_at=?, lease_token=NULL,
+                            lease_until=NULL, last_error=?, updated_at=?
+                        WHERE candidate_id=? AND state='leased'
+                        """,
+                        (now, "multimodal_prepare_aborted", utc_now(), candidate_id),
+                    )
+                self._conn.execute(
+                    "DELETE FROM multimodal_items WHERE item_id=? AND state!='committed'",
+                    (item_id,),
+                )
+                self._record_event_locked(
+                    row["job_id"],
+                    candidate_ids[0] if candidate_ids else None,
+                    "multimodal_aborted",
+                    {"item_id": int(item_id), "reason": "asset_recovery_failed"},
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def list_multimodal_items(
+        self,
+        job_id: str,
+        states: tuple[str, ...] = ("committed",),
+    ) -> list[dict[str, Any]]:
+        if not states:
+            return []
+        placeholders = ",".join("?" for _ in states)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM multimodal_items
+                WHERE job_id=? AND state IN ({placeholders})
+                ORDER BY item_id
+                """,
+                (job_id, *states),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["candidate_ids"] = json.loads(item.pop("candidate_ids_json"))
+            item["assets"] = json.loads(item.pop("asset_paths_json"))
+            item["manifest"] = json.loads(item.pop("manifest_json"))
+            result.append(item)
+        return result
 
     def get_candidate(self, candidate_id: str) -> Optional[dict[str, Any]]:
         with self._lock:
@@ -768,7 +994,7 @@ class DatasetStateStore:
         if self.event_payload_mode == "full":
             return payload
         compact: dict[str, Any] = {}
-        for key in ("id", "file", "url", "source", "query", "modality", "state", "error", "reason"):
+        for key in ("id", "file", "url", "source", "query", "modality", "state", "error", "reason", "count"):
             value = payload.get(key)
             if value not in (None, "", [], {}):
                 compact[key] = value
@@ -797,7 +1023,107 @@ class DatasetStateStore:
 
     def close(self):
         with self._lock:
+            try:
+                self.checkpoint(mode="TRUNCATE")
+            except Exception:
+                pass
             self._conn.close()
+
+    def checkpoint(self, mode: str = "PASSIVE") -> dict[str, int]:
+        """Run ``PRAGMA wal_checkpoint`` and return ``(busy, log, checkpointed)``.
+
+        ``mode`` is one of PASSIVE / FULL / RESTART / TRUNCATE (SQLite spelling).
+        """
+        normalized = str(mode or "PASSIVE").strip().upper()
+        if normalized not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+            raise ValueError(f"unsupported wal checkpoint mode: {mode!r}")
+        with self._lock:
+            row = self._conn.execute(f"PRAGMA wal_checkpoint({normalized})").fetchone()
+        busy = int(row[0]) if row else 0
+        log = int(row[1]) if row and len(row) > 1 else 0
+        checkpointed = int(row[2]) if row and len(row) > 2 else 0
+        return {"busy": busy, "log": log, "checkpointed": checkpointed}
+
+    def collect_stats(self) -> dict[str, Any]:
+        """Return table counts, candidate state histogram, and WAL file size."""
+        tables = (
+            "jobs",
+            "candidates",
+            "samples",
+            "events",
+            "dataset_items",
+            "dataset_content_hashes",
+            "dataset_counters",
+            "multimodal_items",
+        )
+        with self._lock:
+            table_counts: dict[str, int] = {}
+            for table in tables:
+                try:
+                    row = self._conn.execute(
+                        f"SELECT COUNT(*) AS n FROM {table}"
+                    ).fetchone()
+                    table_counts[table] = int(row["n"] if row is not None else 0)
+                except sqlite3.Error:
+                    table_counts[table] = -1
+            state_rows = self._conn.execute(
+                """
+                SELECT state, COUNT(*) AS n
+                FROM candidates
+                GROUP BY state
+                ORDER BY state
+                """
+            ).fetchall()
+            candidate_states = {
+                str(row["state"]): int(row["n"]) for row in state_rows
+            }
+            leased = self._conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM candidates
+                WHERE state='leased'
+                  AND lease_until IS NOT NULL
+                  AND lease_until < ?
+                """,
+                (time.time(),),
+            ).fetchone()
+            expired_leases = int(leased["n"] if leased is not None else 0)
+            page_count = self._conn.execute("PRAGMA page_count").fetchone()
+            page_size = self._conn.execute("PRAGMA page_size").fetchone()
+            freelist = self._conn.execute("PRAGMA freelist_count").fetchone()
+        db_bytes = 0
+        wal_bytes = 0
+        shm_bytes = 0
+        try:
+            db_bytes = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+        except OSError:
+            db_bytes = 0
+        for suffix, target in (("-wal", "wal"), ("-shm", "shm")):
+            path = f"{self.path}{suffix}"
+            try:
+                size = os.path.getsize(path) if os.path.exists(path) else 0
+            except OSError:
+                size = 0
+            if target == "wal":
+                wal_bytes = size
+            else:
+                shm_bytes = size
+        pages = int(page_count[0]) if page_count else 0
+        psz = int(page_size[0]) if page_size else 0
+        free = int(freelist[0]) if freelist else 0
+        return {
+            "path": self.path,
+            "table_counts": table_counts,
+            "candidate_states": candidate_states,
+            "expired_leases": expired_leases,
+            "lease_recoveries_total": int(self._lease_recoveries_total),
+            "db_bytes": db_bytes,
+            "wal_bytes": wal_bytes,
+            "shm_bytes": shm_bytes,
+            "page_count": pages,
+            "page_size": psz,
+            "freelist_count": free,
+            "approx_db_bytes": pages * psz,
+        }
 
     def __enter__(self):
         return self

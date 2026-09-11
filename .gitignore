@@ -169,8 +169,19 @@ cython_debug/
 
 # 爬取输出目录与临时文件
 output_*/
+output/
+dataset_*/
+dataset_output/
+.artifacts/
 artifacts/
+dinox_*/
+dinox_relabel_*/
+.filter_cache/
+quarantine_*/
+*_report.json
 .session_tmps/
+runs/
+
 crawl_dzdmr.py
 crawl_shutterstock.py
 verify_*.py

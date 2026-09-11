@@ -1,0 +1,126 @@
+{
+  "format_version": 1,
+  "description": "SceneQualityGate truth cases driven by injected detector signals (no model required).",
+  "source": "synthetic signal vectors calibrated to built-in SceneQualityProfile thresholds",
+  "cases": [
+    {
+      "id": "phone_call_accept",
+      "profile": "phone_call",
+      "semantic_score": 0.30,
+      "signals": {"person": 0.7, "mobile_phone": 0.6, "operational_area": 0.55},
+      "expected_action": "accept"
+    },
+    {
+      "id": "phone_call_review_missing_phone",
+      "profile": "phone_call",
+      "semantic_score": 0.30,
+      "signals": {"person": 0.7, "operational_area": 0.55},
+      "expected_action": "review"
+    },
+    {
+      "id": "phone_call_reject_low_score",
+      "profile": "phone_call",
+      "semantic_score": 0.10,
+      "signals": {"person": 0.7, "mobile_phone": 0.6, "operational_area": 0.55},
+      "expected_action": "reject"
+    },
+    {
+      "id": "mobile_phone_use_accept",
+      "profile": "mobile_phone_use",
+      "semantic_score": 0.28,
+      "signals": {"person": 0.7, "mobile_phone": 0.55, "operational_area": 0.5},
+      "expected_action": "accept"
+    },
+    {
+      "id": "mobile_phone_use_review_weak_phone",
+      "profile": "mobile_phone_use",
+      "semantic_score": 0.28,
+      "signals": {"person": 0.7, "mobile_phone": 0.2, "operational_area": 0.5},
+      "expected_action": "review"
+    },
+    {
+      "id": "smoking_accept",
+      "profile": "smoking",
+      "semantic_score": 0.30,
+      "signals": {"person": 0.7, "cigarette_or_smoke": 0.55, "operational_area": 0.5},
+      "expected_action": "accept"
+    },
+    {
+      "id": "smoking_reject_low_score",
+      "profile": "smoking",
+      "semantic_score": 0.15,
+      "signals": {"person": 0.7, "cigarette_or_smoke": 0.55, "operational_area": 0.5},
+      "expected_action": "reject"
+    },
+    {
+      "id": "no_reflective_vest_accept",
+      "profile": "no_reflective_vest",
+      "semantic_score": 0.32,
+      "signals": {"person": 0.8, "upper_body": 0.75, "operational_area": 0.6, "reflective_vest": 0.05},
+      "expected_action": "accept"
+    },
+    {
+      "id": "no_reflective_vest_review_missing_vest_signal",
+      "profile": "no_reflective_vest",
+      "semantic_score": 0.32,
+      "signals": {"person": 0.8, "upper_body": 0.75, "operational_area": 0.6},
+      "expected_action": "review"
+    },
+    {
+      "id": "no_reflective_vest_review_wearing_vest",
+      "profile": "no_reflective_vest",
+      "semantic_score": 0.32,
+      "signals": {"person": 0.8, "upper_body": 0.75, "operational_area": 0.6, "reflective_vest": 0.85},
+      "expected_action": "review"
+    },
+    {
+      "id": "forklift_driver_no_helmet_accept",
+      "profile": "forklift_driver_no_helmet",
+      "semantic_score": 0.35,
+      "signals": {"forklift": 0.8, "forklift_operator": 0.75, "head": 0.8, "safety_helmet": 0.05},
+      "expected_action": "accept"
+    },
+    {
+      "id": "forklift_driver_no_helmet_review_wearing_helmet",
+      "profile": "forklift_driver_no_helmet",
+      "semantic_score": 0.35,
+      "signals": {"forklift": 0.8, "forklift_operator": 0.75, "head": 0.8, "safety_helmet": 0.9},
+      "expected_action": "review"
+    },
+    {
+      "id": "material_stagnation_accept",
+      "profile": "material_stagnation",
+      "semantic_score": 0.30,
+      "signals": {"materials": 0.7, "passage_or_exit": 0.65, "obstruction": 0.6},
+      "expected_action": "accept"
+    },
+    {
+      "id": "material_stagnation_review_missing_obstruction",
+      "profile": "material_stagnation",
+      "semantic_score": 0.30,
+      "signals": {"materials": 0.7, "passage_or_exit": 0.65},
+      "expected_action": "review"
+    },
+    {
+      "id": "material_stagnation_reject_low_score",
+      "profile": "material_stagnation",
+      "semantic_score": 0.10,
+      "signals": {"materials": 0.7, "passage_or_exit": 0.65, "obstruction": 0.6},
+      "expected_action": "reject"
+    },
+    {
+      "id": "pedestrian_accept_real_photo",
+      "profile": "pedestrian",
+      "semantic_score": 0.30,
+      "signals": {"person_detector": 0.9, "scene_context": 0.9, "synthetic_image": 0.02, "non_photographic": 0.02},
+      "expected_action": "accept"
+    },
+    {
+      "id": "road_vehicle_review_synthetic",
+      "profile": "road_vehicle",
+      "semantic_score": 0.30,
+      "signals": {"road_vehicle_detector": 0.9, "scene_context": 0.9, "synthetic_image": 0.999, "non_photographic": 0.02},
+      "expected_action": "review"
+    }
+  ]
+}

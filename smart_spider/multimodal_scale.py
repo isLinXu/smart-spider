@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
@@ -103,12 +104,62 @@ class ShardedManifestWriter:
             self._ensure_open()
             self._file.write(json.dumps(sample.to_dict(), ensure_ascii=False) + "\n")
             self._file.flush()
+            os.fsync(self._file.fileno())
             self._records_in_shard += 1
+
+    def replace(self, samples: list[SampleRecord]):
+        """Atomically rebuild all manifest shards from committed state records."""
+        encoded = [json.dumps(sample.to_dict(), ensure_ascii=False) + "\n" for sample in samples]
+        if self.shard_size > 0:
+            chunks = [
+                encoded[index:index + self.shard_size]
+                for index in range(0, len(encoded), self.shard_size)
+            ] or [[]]
+            paths = [self._shard_path(index) for index in range(len(chunks))]
+        else:
+            chunks = [encoded]
+            paths = [os.path.join(self.output_dir, f"{self.prefix}.jsonl")]
+
+        with self._lock:
+            if self._file is not None and not self._file.closed:
+                self._file.flush()
+                os.fsync(self._file.fileno())
+                self._file.close()
+            for path, lines in zip(paths, chunks):
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", encoding="utf-8", dir=self.output_dir,
+                        prefix=f".{self.prefix}-", suffix=".tmp", delete=False,
+                    ) as handle:
+                        temporary = handle.name
+                        handle.writelines(lines)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, path)
+                finally:
+                    if temporary and os.path.exists(temporary):
+                        os.unlink(temporary)
+            expected = set(paths)
+            pattern = (
+                os.path.join(self.output_dir, f"{self.prefix}-*.jsonl")
+                if self.shard_size > 0
+                else os.path.join(self.output_dir, f"{self.prefix}.jsonl")
+            )
+            for obsolete in glob(pattern):
+                if obsolete not in expected:
+                    os.unlink(obsolete)
+            self._file = None
+            self._paths = paths
+            self.path = paths[-1]
+            self._next_index = len(paths) - 1 if self.shard_size > 0 else 0
+            self._records_in_shard = len(chunks[-1])
 
     def close(self):
         with self._lock:
             if self._file is not None and not self._file.closed:
                 self._file.flush()
+                os.fsync(self._file.fileno())
                 self._file.close()
 
 
@@ -124,15 +175,29 @@ class QualityReport:
     task_type_counts: Counter = field(default_factory=Counter)
     label_counts: Counter = field(default_factory=Counter)
     route_counts: Counter = field(default_factory=Counter)
+    route_reasons: Counter = field(default_factory=Counter)
+    block_kinds: Counter = field(default_factory=Counter)
+    scene_decisions: Counter = field(default_factory=Counter)
     rejection_reasons: Counter = field(default_factory=Counter)
     errors: list[str] = field(default_factory=list)
 
-    def observe_route(self, route: str):
+    def observe_route(self, route: str, reason: str = ""):
         if route:
             self.route_counts[str(route)] += 1
+        if reason:
+            self.route_reasons[str(reason)] += 1
+
+    def observe_block(self, kind: str):
+        if kind:
+            self.block_kinds[str(kind)] += 1
 
     def observe_materialized_image(self, count: int = 1):
         self.materialized_images += max(0, int(count))
+
+    def observe_scene_decision(self, action: str):
+        """Record detector-backed scene gate outcomes without retaining images."""
+        if action:
+            self.scene_decisions[str(action)] += 1
 
     def observe_sample(self, sample: SampleRecord):
         self.accepted += 1
@@ -162,6 +227,9 @@ class QualityReport:
             "task_type_counts": dict(sorted(self.task_type_counts.items())),
             "label_counts": dict(sorted(self.label_counts.items())),
             "route_counts": dict(sorted(self.route_counts.items())),
+            "route_reasons": dict(sorted(self.route_reasons.items())),
+            "block_kinds": dict(sorted(self.block_kinds.items())),
+            "scene_decisions": dict(sorted(self.scene_decisions.items())),
             "rejection_reasons": dict(sorted(self.rejection_reasons.items())),
             "errors": list(self.errors),
         }

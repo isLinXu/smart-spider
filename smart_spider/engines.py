@@ -347,6 +347,28 @@ class BilibiliVideoEngine(SearchEngine):
         return items
 
 
+class DouyinVideoEngine(SearchEngine):
+    """抖音搜索；连续滚动由 DouyinCrawler 完成，不伪造 offset 分页。"""
+    name = "douyin"
+    media_type = MediaType.VIDEO
+    render_mode = RenderMode.DYNAMIC
+    explicit_only = True
+
+    def build_search_url(self, keyword, page):
+        from .douyin import normalize_input
+        return normalize_input(keyword, keyword=True)
+
+    def extract_items(self, html):
+        from .douyin import parse_page
+        try:
+            data = json.loads(html)
+            if isinstance(data, dict) and "douyin_items" in data:
+                return data["douyin_items"]
+        except (ValueError, TypeError):
+            pass
+        return parse_page(html)
+
+
 class BingVideoEngine(SearchEngine):
     """Bing 视频搜索引擎（静态 API）。"""
     name = "bing_video"
@@ -607,6 +629,7 @@ ENGINE_REGISTRY: dict[str, SearchEngine] = {
     "weibo":        WeiboPicEngine(),
     # 视频
     "bilibili":     BilibiliVideoEngine(),
+    "douyin":       DouyinVideoEngine(),
     "bing_video":   BingVideoEngine(),
     # 文本
     "baidu_text":   BaiduTextEngine(),
@@ -668,11 +691,30 @@ def check_engine_health(
             html = http_client.get_text(url, engine=engine_name)
         else:
             import requests as _req
-            resp = _req.get(url, timeout=timeout, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-            })
-            resp.encoding = resp.apparent_encoding or "utf-8"
-            html = resp.text
+            resp = _req.get(
+                url,
+                timeout=timeout,
+                stream=True,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            try:
+                max_health_bytes = 2 * 1024 * 1024
+                declared = resp.headers.get("Content-Length")
+                if declared and int(declared) > max_health_bytes:
+                    raise ValueError("health response exceeds 2 MiB")
+                chunks = []
+                total = 0
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_health_bytes:
+                        raise ValueError("health response exceeds 2 MiB")
+                    chunks.append(chunk)
+                encoding = getattr(resp, "encoding", None) or "utf-8"
+                html = b"".join(chunks).decode(encoding, errors="replace")
+            finally:
+                resp.close()
         items = eng.extract_items(html)
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"

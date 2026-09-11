@@ -171,7 +171,7 @@ class TestEngineRegistry:
     def test_all_engines_registered(self):
         expected = {
             "baidu", "bing", "sogou", "360", "google", "weibo",
-            "bilibili", "bing_video",
+            "bilibili", "bing_video", "douyin",
             "baidu_text", "bing_text",
             "weixin", "xiaohongshu",
         }

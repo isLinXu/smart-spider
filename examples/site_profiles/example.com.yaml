@@ -1,0 +1,28 @@
+# Example authorized site profile for smart-spider-browse (S17).
+#
+# Usage:
+#   smart-spider-browse --profile examples/site_profiles/example.com.yaml
+#   smart-spider-browse --profile examples/site_profiles/example.com.yaml --enqueue
+#   smart-spider-browse --profile examples/site_profiles/example.com.yaml --once
+
+name: example.com
+description: Public example.org-style site (replace hosts for your authorized target)
+seed_urls:
+  - https://example.com/
+allow_hosts:
+  - example.com
+deny_hosts: []
+respect_robots: true
+requests_per_second: 1.0
+action_delay_seconds: 0.5
+max_depth: 1
+max_links_per_page: 20
+scroll_passes: 1
+prefer_browser: true
+# storage_state_path: ./runtime/example_storage_state.json
+# session_cookies_path: ./runtime/example_cookies.json
+enqueue_links: true
+max_attempts: 3
+headless: true
+license: ""
+source_terms: "Only crawl sites you are authorized to access."

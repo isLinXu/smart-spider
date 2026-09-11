@@ -7,8 +7,11 @@ import tempfile
 
 from PIL import Image
 
-from smart_spider.dataset_contracts import CandidateResource, Modality
-from smart_spider.multimodal_job import MultimodalDatasetOrchestrator, MultimodalJobConfig
+from smart_spider.dataset_contracts import CandidateResource, Modality, ModalityAsset, SampleRecord
+from smart_spider.dataset_state import DatasetStateStore
+from smart_spider.multimodal_job import AssetStore, MultimodalDatasetOrchestrator, MultimodalJobConfig
+from smart_spider.multimodal_repository import MultimodalRepository
+from smart_spider.multimodal_scale import ShardedManifestWriter
 from smart_spider.multimodal_pipeline import DiscoveryTask, PageSampleExtractor, SourceResponse
 
 
@@ -57,7 +60,12 @@ def test_orchestrator_materializes_page_assets_and_commits_manifest():
             )
 
         job = MultimodalDatasetOrchestrator(
-            MultimodalJobConfig(output_dir=tmp, max_samples=1),
+            MultimodalJobConfig(
+                output_dir=tmp,
+                max_samples=1,
+                license="CC-BY-4.0",
+                source_terms="test terms",
+            ),
             http_client=_BytesHttpClient(),
             extractor=extractor,
         )
@@ -69,12 +77,23 @@ def test_orchestrator_materializes_page_assets_and_commits_manifest():
         assert report.accepted == 1
         assert report.materialized_images == 1
         assert report.quality_report_path == os.path.join(tmp, "quality_report.json")
+        assert os.path.isfile(report.unified_report_path)
+        assert os.path.isfile(report.publish_checklist_path)
         with open(report.quality_report_path, encoding="utf-8") as handle:
             quality = json.load(handle)
         assert quality["accepted"] == 1
         assert quality["materialized_images"] == 1
+        assert "route_reasons" in quality
+        with open(report.unified_report_path, encoding="utf-8") as handle:
+            unified = json.load(handle)
+        assert unified["track"] == "multimodal"
+        assert unified["extras"]["compliance"]["license"] == "CC-BY-4.0"
+        with open(report.publish_checklist_path, encoding="utf-8") as handle:
+            checklist = json.load(handle)
+        assert checklist["ready"] is True
         with open(os.path.join(tmp, "manifest.jsonl"), encoding="utf-8") as handle:
             manifest = json.loads(handle.readline())
+        assert manifest["provenance"]["license"] == "CC-BY-4.0"
         image_asset = next(item for item in manifest["modalities"] if item["modality"] == "image")
         assert image_asset["uri"].startswith("assets/")
         assert os.path.exists(os.path.join(tmp, image_asset["uri"]))
@@ -106,3 +125,57 @@ def test_orchestrator_can_keep_remote_assets_for_reference_only():
             manifest = json.loads(handle.readline())
         image_asset = next(item for item in manifest["modalities"] if item["modality"] == "image")
         assert image_asset["uri"].startswith("https://")
+
+
+def test_multimodal_repository_recovers_prepared_staged_asset_and_manifest():
+    with tempfile.TemporaryDirectory() as tmp:
+        state = DatasetStateStore(os.path.join(tmp, "state.sqlite3"))
+        state.create_job("recover-job", {})
+        assets = AssetStore(tmp)
+        staged = assets.stage_image(_jpeg_bytes())
+        sample = SampleRecord(
+            sample_id="recover-sample",
+            file=staged.relative_path,
+            modalities=[ModalityAsset(Modality.IMAGE, role="input", uri=staged.relative_path)],
+        )
+        prepared = state.prepare_multimodal_item(
+            "recover-job",
+            sample,
+            candidate_ids=[],
+            assets=[assets.staged_payload(staged)],
+        )
+        assert prepared["status"] == "prepared"
+
+        writer = ShardedManifestWriter(tmp)
+        repository = MultimodalRepository(tmp, state, "recover-job", writer, assets)
+        repository.recover()
+
+        committed = state.list_multimodal_items("recover-job")
+        assert [item["state"] for item in committed] == ["committed"]
+        assert os.path.exists(os.path.join(tmp, staged.relative_path))
+        with open(os.path.join(tmp, "manifest.jsonl"), encoding="utf-8") as handle:
+            assert json.loads(handle.readline())["id"] == "recover-sample"
+        writer.close()
+        state.close()
+
+
+def test_manifest_failure_does_not_reject_durable_multimodal_commit():
+    class BrokenManifest:
+        def write(self, sample):
+            raise OSError("manifest unavailable")
+
+        def replace(self, samples):
+            raise OSError("manifest unavailable")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        state = DatasetStateStore(os.path.join(tmp, "state.sqlite3"))
+        state.create_job("durable-job", {})
+        repository = MultimodalRepository(
+            tmp, state, "durable-job", BrokenManifest(), AssetStore(tmp)
+        )
+        sample = SampleRecord(sample_id="durable-sample")
+
+        assert repository.commit(sample, candidate_ids=[], staged_assets=[])
+        committed = state.list_multimodal_items("durable-job")
+        assert [item["manifest"]["id"] for item in committed] == ["durable-sample"]
+        state.close()

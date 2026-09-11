@@ -38,6 +38,18 @@ jobs:
           pip install pybloom-live || true
           pip install curl_cffi || true
 
+      - name: CLI smoke (no optional extras required)
+        run: |
+          PYTHONPATH=. python -m smart_spider.dataset_cli --help
+          PYTHONPATH=. python -m smart_spider.multimodal_cli --help
+          PYTHONPATH=. python -m smart_spider.dataset_filter_cli --help
+          PYTHONPATH=. python spider.py --help
+          PYTHONPATH=. python -c "from smart_spider.report import UnifiedReport; from smart_spider.config_io import load_mapping; print('p0-imports-ok')"
+
+      - name: Scene gate truth regression
+        run: |
+          PYTHONPATH=. pytest tests/test_scene_gate_truth.py tests/test_contract_validate.py tests/test_report.py tests/test_config_io.py tests/test_repository_crash_e2e.py -q --tb=short
+
       - name: Run tests (optional ML dependencies skipped)
         run: |
           # CLIP/torch tests self-skip when heavyweight ML dependencies are absent.

@@ -345,6 +345,10 @@ class StaticPageSource:
         response = self.http_client.get(task.start_url)
         try:
             html = getattr(response, "text", "") or ""
+            status_code = int(getattr(response, "status_code", 200) or 200)
+            from .block_signals import BlockKind, classify_page_html
+
+            signal = classify_page_html(html, status_code=status_code)
             sample = self.extractor.extract_page(
                 task.start_url,
                 html,
@@ -356,12 +360,24 @@ class StaticPageSource:
                 source=task.source or "static_html",
                 query=task.query,
             )
+            blocked = signal.kind in {
+                BlockKind.RATE_LIMITED,
+                BlockKind.AUTH_REQUIRED,
+                BlockKind.CHALLENGE,
+                BlockKind.FORBIDDEN,
+                BlockKind.SERVER_ERROR,
+            }
             return SourceResponse(
                 candidates=candidates,
-                status_code=int(getattr(response, "status_code", 200) or 200),
+                status_code=status_code,
                 html_length=len(html),
-                metadata={"url": task.start_url},
+                blocked=blocked,
+                metadata={
+                    "url": task.start_url,
+                    "block": signal.to_dict(),
+                },
                 sample=sample,
+                error="" if signal.kind != BlockKind.EMPTY else "empty_html",
             )
         finally:
             close = getattr(response, "close", None)
@@ -400,8 +416,77 @@ class BrowserPageSource:
         )
 
 
+class PlaybookBrowserSource:
+    """用 AuthorizedBrowsePlaybook 作为 AdaptiveSourceRouter 的 browser_source。"""
+
+    def __init__(
+        self,
+        playbook,
+        extractor: Optional[PageSampleExtractor] = None,
+        *,
+        include_discovered_links: bool = True,
+    ):
+        self.playbook = playbook
+        self.extractor = extractor or PageSampleExtractor()
+        self.include_discovered_links = include_discovered_links
+
+    def __call__(self, task: DiscoveryTask) -> SourceResponse:
+        if not task.start_url:
+            return SourceResponse(error="missing_start_url")
+        from .block_signals import BlockKind
+
+        result = self.playbook.run(task.start_url, depth=int(task.metadata.get("depth") or 0))
+        signal = result.block
+        html = result.html or ""
+        if signal is not None and signal.kind != BlockKind.OK:
+            return SourceResponse(
+                status_code=int(signal.status_code or 0),
+                html_length=len(html),
+                blocked=True,
+                dynamic=True,
+                error=signal.queue_error,
+                metadata={
+                    "url": task.start_url,
+                    "block": signal.to_dict(),
+                    "playbook": result.to_dict(),
+                },
+            )
+        sample = self.extractor.extract_page(
+            result.final_url or task.start_url,
+            html,
+            source=task.source or "authorized_browse",
+            query=task.query,
+        )
+        candidates = self.extractor.candidates_from_sample(
+            sample,
+            source=task.source or "authorized_browse",
+            query=task.query,
+        )
+        if self.include_discovered_links:
+            for link in result.links:
+                candidates.append(
+                    CandidateResource(
+                        link.url,
+                        source=task.source or "authorized_browse",
+                        modality=Modality.WEBPAGE,
+                        source_meta={"text": link.text, "depth": link.depth},
+                    )
+                )
+        return SourceResponse(
+            candidates=candidates,
+            status_code=200,
+            html_length=len(html),
+            dynamic=True,
+            metadata={
+                "url": result.final_url or task.start_url,
+                "playbook": result.to_dict(),
+            },
+            sample=sample,
+        )
+
+
 class AdaptiveSourceRouter:
-    """静态来源优先，按质量信号切换 Browser Use。"""
+    """静态来源优先，按质量信号切换 Browser Use / Playbook。"""
 
     def __init__(
         self,
@@ -414,10 +499,30 @@ class AdaptiveSourceRouter:
         self.blocked_statuses = blocked_statuses
 
     def decide(self, response: SourceResponse, min_candidates: int = 1) -> RouteDecision:
-        if response.error:
+        from .block_signals import BlockKind, classify_http_status
+
+        if response.error and response.error not in {"empty_html"}:
             return RouteDecision(RouteAction.BROWSER, "static_error", 1.0)
+        signal = classify_http_status(
+            response.status_code,
+            body_text="",
+        )
+        meta_block = (response.metadata or {}).get("block") or {}
+        kind = str(meta_block.get("kind") or signal.kind.value)
         if response.blocked or response.status_code in self.blocked_statuses:
-            return RouteDecision(RouteAction.BROWSER, "blocked_or_rate_limited", 1.0)
+            return RouteDecision(
+                RouteAction.BROWSER,
+                f"blocked_or_rate_limited:{kind}",
+                1.0,
+            )
+        if kind in {
+            BlockKind.CHALLENGE.value,
+            BlockKind.AUTH_REQUIRED.value,
+            BlockKind.RATE_LIMITED.value,
+            BlockKind.FORBIDDEN.value,
+            BlockKind.SERVER_ERROR.value,
+        }:
+            return RouteDecision(RouteAction.BROWSER, f"block:{kind}", 1.0)
         if response.dynamic:
             return RouteDecision(RouteAction.BROWSER, "dynamic_page_signal", 0.9)
         if (
@@ -426,6 +531,8 @@ class AdaptiveSourceRouter:
             and response.html_length < self.min_html_length
         ):
             return RouteDecision(RouteAction.BROWSER, "insufficient_static_content", 0.75)
+        if response.error == "empty_html":
+            return RouteDecision(RouteAction.BROWSER, "empty_html", 0.8)
         return RouteDecision(RouteAction.STATIC, "static_quality_sufficient", 0.0)
 
     def discover(

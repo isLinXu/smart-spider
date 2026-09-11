@@ -161,6 +161,90 @@ def test_url_dedup_claim_is_retryable_until_committed():
         dedup.close()
 
 
+def test_scene_targets_and_source_quotas_are_initialized(tmp_path):
+    crawler = DatasetCrawler(
+        ["未穿反光衣"],
+        total_count=4,
+        output_dir=str(tmp_path),
+        use_clip=False,
+        state_db="",
+        scene_targets={"未穿反光衣": 4},
+        max_source_share=0.5,
+        max_domain_share=0.5,
+    )
+    try:
+        assert crawler.scene_targets == {"no_reflective_vest": 4}
+        assert crawler._source_quotas.limit_for("bing") == 2
+        assert crawler._domain_quotas.limit_for("images.example") == 2
+    finally:
+        crawler.close()
+
+
+def test_scene_quality_gate_queues_missing_detector_evidence(tmp_path):
+    from smart_spider.scene_quality import get_scene_quality_profile
+
+    crawler = DatasetCrawler(
+        ["未穿反光衣"],
+        total_count=1,
+        output_dir=str(tmp_path),
+        use_clip=False,
+        state_db="",
+        scene_targets={"未穿反光衣": 1},
+        scene_quality_gate_enabled=True,
+    )
+    try:
+        image = Image.new("RGB", (256, 256), (30, 90, 160))
+        profile = get_scene_quality_profile("未穿反光衣")
+        decision = crawler._evaluate_scene_quality(profile, image, 0.7)
+        assert decision is not None
+        assert decision.action == "review"
+        crawler._record_scene_quality_review("https://img.example/review.jpg", decision)
+        assert crawler.scene_review_queue_path.endswith("scene_review_queue.jsonl")
+        assert crawler.scene_review_queue.path.read_text(encoding="utf-8").count("\n") == 1
+    finally:
+        crawler.close()
+
+
+def test_generic_scene_gate_enables_forensic_and_style_signals_by_default(
+    tmp_path, monkeypatch
+):
+    captured = {}
+
+    class Detector:
+        model_versions = {
+            "scene_signal_detector": "fixture",
+            "yolo_model": "fixture.pt",
+        }
+
+        def detect(self, image):
+            return {}
+
+    def build_detector(**kwargs):
+        captured.update(kwargs)
+        return Detector()
+
+    monkeypatch.setattr(
+        "smart_spider.dataset_crawler.default_scene_signal_detector",
+        build_detector,
+    )
+    crawler = DatasetCrawler(
+        ["车辆"],
+        total_count=1,
+        output_dir=str(tmp_path),
+        use_clip=False,
+        state_db="",
+        scene_targets={"车辆": 1},
+        scene_quality_gate_enabled=True,
+    )
+    try:
+        assert captured["prefer_yolo"] is True
+        assert captured["include_synthetic"] is True
+        assert captured["include_style"] is True
+        assert captured["style_device"] == "auto"
+    finally:
+        crawler.close()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # ProgressManager 测试
 # ──────────────────────────────────────────────────────────────────────────────
@@ -313,7 +397,7 @@ class TestDatasetCrawlerInit:
         tmp = tempfile.mkdtemp()
         query = os.path.join(tmp, "query.jpg")
         Image.new("RGB", (32, 32), (255, 0, 0)).save(query)
-        with pytest.raises(RuntimeError, match="query_image requires CLIP"):
+        with pytest.raises(ValueError, match="query_image requires use_clip=True"):
             DatasetCrawler(
                 keywords=["test"],
                 total_count=1,
@@ -402,6 +486,45 @@ class TestDatasetCrawlerInit:
             assert crawler._dir_manager.output_dir == tmp
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_backpressure_limits_are_memory_bounded_and_reported(self):
+        tmp = tempfile.mkdtemp()
+        crawler = None
+        try:
+            crawler = DatasetCrawler(
+                keywords=["test"],
+                total_count=10,
+                output_dir=tmp,
+                use_clip=False,
+                max_workers=20,
+                max_file_size=4 * 1024 * 1024,
+                memory_budget_mb=8,
+                max_inflight_pages=3,
+                max_pending_candidates=5,
+                per_domain_concurrency=1,
+            )
+            assert crawler.max_inflight_downloads == 2
+            assert crawler.max_inflight_pages == 3
+            gauges = crawler.stats.summary()["resource_metrics"]
+            assert gauges["max_inflight_downloads"] == 2
+            assert gauges["max_pending_candidates"] == 5
+            assert gauges["per_domain_concurrency"] == 1
+            assert gauges["memory_budget_bytes"] == 8 * 1024 * 1024
+        finally:
+            if crawler is not None:
+                crawler.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_memory_budget_must_fit_one_bounded_response(self, tmp_path):
+        with pytest.raises(ValueError, match="at least one max_file_size"):
+            DatasetCrawler(
+                keywords=["test"],
+                total_count=1,
+                output_dir=str(tmp_path),
+                use_clip=False,
+                max_file_size=2 * 1024 * 1024,
+                memory_budget_mb=1,
+            )
 
     def test_query_label_decisions_support_multiple_labels_and_aliases(self):
         """组合查询词应解析为多个固定标签，并支持可选别名。"""

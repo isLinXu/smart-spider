@@ -19,6 +19,7 @@ from loguru import logger
 
 from .dataset_contracts import Modality, ModalityAsset, SampleRecord
 from .dataset_state import DatasetStateStore
+from .image_safety import write_bytes_with_sha256
 
 
 @dataclass(frozen=True)
@@ -306,14 +307,18 @@ class DatasetRepository:
         candidate_id: Optional[str],
         max_count: int,
         build_records: Callable[[int, str, str, str], tuple[SampleRecord, dict[str, Any]]],
+        source_hash: Optional[str] = None,
     ) -> DatasetCommit:
         """Commit final bytes exactly once and publish compatibility views."""
         if self._closed:
             raise RuntimeError("dataset repository is closed")
         final_bytes = bytes(content)
-        content_hash = hashlib.sha256(final_bytes).hexdigest()
-        source_hash = hashlib.sha256(bytes(source_content)).hexdigest()
+        source_bytes = bytes(source_content)
         filename_token = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
+        computed_source_hash = hashlib.sha256(source_bytes).hexdigest()
+        if source_hash is not None and source_hash != computed_source_hash:
+            raise ValueError("source_hash does not match source_content")
+        source_hash = computed_source_hash
 
         with self._lock:
             temporary: Optional[str] = None
@@ -327,9 +332,10 @@ class DatasetRepository:
                     delete=False,
                 ) as handle:
                     temporary = handle.name
-                    handle.write(final_bytes)
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                    # Single pass: persist staging bytes and compute SHA-256.
+                    content_hash = write_bytes_with_sha256(
+                        handle, final_bytes, fsync=True
+                    )
                 staging_relative = Path(temporary).relative_to(self.root).as_posix()
                 reservation = self.state.reserve_dataset_item(
                     self.job_id,

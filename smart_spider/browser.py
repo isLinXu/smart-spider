@@ -26,11 +26,31 @@ playwright install chromium
 import asyncio
 import os
 import random
-import re
 import threading
 from typing import Optional
+from urllib.parse import urlsplit
 
 from loguru import logger
+from .url_policy import URLPolicy, UnsafeURLError
+
+
+def _validate_browser_request(url: str, policy: URLPolicy) -> bool:
+    """Validate an outbound browser request before Chromium opens it.
+
+    Browser internals such as ``data:`` and ``blob:`` are local page resources,
+    not network destinations.  All HTTP(S) requests still use the same policy
+    as the streaming HTTP client; unsupported external schemes are blocked.
+    """
+    scheme = urlsplit(url).scheme.lower()
+    if scheme in {"data", "blob", "about"}:
+        return True
+    if scheme not in {"http", "https"}:
+        return False
+    try:
+        policy.validate(url)
+    except UnsafeURLError:
+        return False
+    return True
 
 try:
     from playwright.async_api import (
@@ -143,6 +163,8 @@ class DynamicRenderer:
         cookies: Optional[list[dict]] = None,
         screenshot_dir: Optional[str] = None,
         max_restarts: int = 3,
+        url_policy: Optional[URLPolicy] = None,
+        allow_private_hosts: bool = False,
     ):
         if not _PLAYWRIGHT_AVAILABLE:
             raise RuntimeError(
@@ -155,6 +177,9 @@ class DynamicRenderer:
         self._cookies = cookies or []
         self._screenshot_dir = screenshot_dir
         self._max_restarts = max_restarts
+        self.url_policy = url_policy or URLPolicy(
+            allow_private_hosts=allow_private_hosts
+        )
         self._restart_count = 0
 
         # 同步包装用的事件循环（在独立线程中运行）
@@ -224,6 +249,9 @@ class DynamicRenderer:
     async def _route_handler(self, route):
         """拦截并丢弃不必要的资源请求。"""
         req = route.request
+        if not _validate_browser_request(req.url, self.url_policy):
+            await route.abort()
+            return
         if req.resource_type in _BLOCK_RESOURCE_TYPES:
             await route.abort()
             return
@@ -272,6 +300,7 @@ class DynamicRenderer:
         Returns:
             str: 页面完整 HTML
         """
+        url = self.url_policy.validate(url)
         # 浏览器崩溃自动重启
         if self._browser is None or not self._browser.is_connected():
             logger.warning(f"Browser disconnected, attempting restart for {url[:60]}")
@@ -469,6 +498,7 @@ class DynamicRenderer:
 
             try:
                 if url:
+                    url = self.url_policy.validate(url)
                     await page.goto(url, wait_until="networkidle", timeout=self._page_timeout)
                     await self._simulate_human(page)
 
@@ -517,6 +547,7 @@ class DynamicRenderer:
 
             try:
                 if url:
+                    url = self.url_policy.validate(url)
                     await page.goto(url, wait_until="networkidle", timeout=self._page_timeout)
                     await self._simulate_human(page)
 
@@ -543,6 +574,7 @@ class DynamicRenderer:
         Returns:
             是否保存成功
         """
+        url = self.url_policy.validate(url)
         if self._browser is None or not self._browser.is_connected():
             await self._restart_browser()
             if self._browser is None:
@@ -641,6 +673,9 @@ class PersistentBrowserSession:
         headless: bool = True,
         page_timeout: int = 30_000,
         cookies: Optional[list[dict]] = None,
+        storage_state: Optional[object] = None,
+        url_policy: Optional[URLPolicy] = None,
+        allow_private_hosts: bool = False,
     ):
         if not _PLAYWRIGHT_AVAILABLE:
             raise RuntimeError(
@@ -651,6 +686,10 @@ class PersistentBrowserSession:
         self._headless = headless
         self._page_timeout = page_timeout
         self._cookies = cookies or []
+        self._storage_state = storage_state
+        self.url_policy = url_policy or URLPolicy(
+            allow_private_hosts=allow_private_hosts
+        )
 
         # 异步事件循环（独立线程）
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -695,18 +734,21 @@ class PersistentBrowserSession:
             launch_kwargs["proxy"] = {"server": self._proxy}
 
         self._browser = await self._playwright.chromium.launch(**launch_kwargs)
-        self._context = await self._browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=__import__("fake_useragent").UserAgent().random,
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            extra_http_headers={
+        context_kwargs = {
+            "viewport": {"width": 1920, "height": 1080},
+            "user_agent": __import__("fake_useragent").UserAgent().random,
+            "locale": "zh-CN",
+            "timezone_id": "Asia/Shanghai",
+            "extra_http_headers": {
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                 "DNT": "1",
             },
-        )
+        }
+        if self._storage_state:
+            context_kwargs["storage_state"] = self._storage_state
+        self._context = await self._browser.new_context(**context_kwargs)
 
-        # 注入 Cookie
+        # 注入额外 Cookie（storage_state 之外）
         if self._cookies:
             await self._context.add_cookies(self._cookies)
 
@@ -724,6 +766,9 @@ class PersistentBrowserSession:
     async def _route_handler(self, route):
         """拦截并丢弃不必要的资源请求。"""
         req = route.request
+        if not _validate_browser_request(req.url, self.url_policy):
+            await route.abort()
+            return
         if req.resource_type in _BLOCK_RESOURCE_TYPES:
             await route.abort()
             return
@@ -740,6 +785,7 @@ class PersistentBrowserSession:
             return ""
 
         try:
+            url = self.url_policy.validate(url)
             await self._page.goto(url, wait_until=wait_for, timeout=self._page_timeout)
             await self._simulate_human(self._page)
             self._current_url = url
@@ -883,6 +929,23 @@ class PersistentBrowserSession:
             self._get_current_html_async(), self._loop,
         )
         return future.result(timeout=10)
+
+    async def _export_storage_state_async(self) -> dict:
+        if self._context is None:
+            return {"cookies": [], "origins": []}
+        return await self._context.storage_state()
+
+    def export_storage_state(self, path: str = "") -> dict:
+        """导出当前 Playwright storage_state；可选写入 JSON 文件。"""
+        future = asyncio.run_coroutine_threadsafe(
+            self._export_storage_state_async(), self._loop,
+        )
+        state = future.result(timeout=30)
+        if path:
+            from .session_state import write_json_file
+
+            write_json_file(path, state)
+        return state
 
     @property
     def current_url(self) -> str:
