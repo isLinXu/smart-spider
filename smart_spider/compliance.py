@@ -164,6 +164,13 @@ def build_publish_checklist(
     return checklist.evaluate()
 
 
+def checklist_exit_code(checklist: Optional[PublishChecklist], *, allow_unready: bool) -> int:
+    """Return 0 when publish-ready (or explicitly allowed); 2 when unready."""
+    if checklist is None or checklist.ready or allow_unready:
+        return 0
+    return 2
+
+
 def write_publish_checklist(output_dir: str, checklist: PublishChecklist) -> str:
     path = os.path.join(output_dir, PUBLISH_CHECKLIST_FILENAME)
     os.makedirs(os.path.abspath(output_dir), exist_ok=True)

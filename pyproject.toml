@@ -102,8 +102,9 @@ s3 = [
 ]
 
 [project.scripts]
-smart-spider = "spider:main"
+smart-spider = "smart_spider.cli:main"
 smart-spider-douyin = "smart_spider.douyin_cli:main"
+smart-spider-xiaohongshu = "smart_spider.xiaohongshu_cli:main"
 smart-spider-multimodal = "smart_spider.multimodal_cli:main"
 smart-spider-image-search = "smart_spider.image_search_cli:main"
 smart-spider-reverse-image-search = "smart_spider.reverse_image_search_cli:main"

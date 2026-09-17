@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from typing import Optional
 
 from .dataset_contracts import LabelMode, LabelPolicy, Modality
@@ -108,6 +110,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--export-storage-state",
         help="任务结束后导出当前浏览器 storage_state 到该路径",
+    )
+    parser.add_argument(
+        "--allow-unready",
+        action="store_true",
+        help="publish_checklist.ready=false 时仍返回退出码 0",
     )
     parser.add_argument(
         "--ignore-robots",
@@ -268,7 +275,29 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         report = orchestrator.run(tasks, static_source, browser_source)
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
-        return 0
+        from .compliance import PublishChecklist, checklist_exit_code
+
+        checklist = None
+        path = report.publish_checklist_path
+        if path and os.path.isfile(path):
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            checklist = PublishChecklist(
+                job_id=str(payload.get("job_id") or ""),
+                license=str(payload.get("license") or ""),
+                source_terms=str(payload.get("source_terms") or ""),
+                respect_robots=bool(payload.get("respect_robots", True)),
+                redact_urls=bool(payload.get("redact_urls", True)),
+                warnings=list(payload.get("warnings") or []),
+                ready=bool(payload.get("ready")),
+            )
+        code = checklist_exit_code(checklist, allow_unready=args.allow_unready)
+        if code:
+            print(
+                "publish_checklist.ready is false; pass --allow-unready to ignore",
+                file=sys.stderr,
+            )
+        return code
     finally:
         if browser_controller is not None:
             if args.export_storage_state:
