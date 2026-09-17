@@ -240,6 +240,7 @@ class LocalSqliteTaskQueue:
         kind: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
+        block_kind: Optional[str] = None,
     ) -> Sequence[TaskRecord]:
         if limit <= 0:
             raise ValueError("limit must be positive")
@@ -255,6 +256,9 @@ class LocalSqliteTaskQueue:
         if kind:
             clauses.append("kind=?")
             args.append(kind)
+        if block_kind:
+            clauses.append("error LIKE ?")
+            args.append(f"block:{block_kind}:%")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = (
             f"SELECT * FROM tasks {where} "

@@ -1,0 +1,8 @@
+[
+  {"engine": "baidu", "file": "baidu_api.json", "min_items": 2},
+  {"engine": "bing", "file": "bing_image.html", "min_items": 2},
+  {"engine": "baidu_text", "file": "baidu_text.html", "min_items": 1},
+  {"engine": "weixin", "file": "weixin.html", "min_items": 2},
+  {"engine": "xiaohongshu", "file": "xiaohongshu.html", "min_items": 2},
+  {"engine": "bilibili", "file": "bilibili.json", "min_items": 1}
+]

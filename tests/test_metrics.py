@@ -2,7 +2,13 @@
 """进程内 metrics 与 Prometheus 文本导出测试。"""
 from __future__ import annotations
 
-from smart_spider.metrics import MetricsRegistry, observe_task_outcome, render_metrics_text
+from smart_spider.metrics import (
+    MetricsRegistry,
+    observe_browse_block,
+    observe_browse_skip,
+    observe_task_outcome,
+    render_metrics_text,
+)
 from smart_spider.pipeline import LocalSqliteTaskQueue
 
 
@@ -26,3 +32,15 @@ def test_render_metrics_includes_queue_gauges(tmp_path):
     assert "smart_spider_queue_tasks" in text
     assert 'status="pending"' in text
     assert "smart_spider_tasks_total" in text
+
+
+def test_browse_skip_metrics():
+    observe_browse_block("challenge")
+    observe_browse_skip("policy_denied")
+    observe_browse_skip("robots_skip")
+    observe_browse_skip("challenge_dead")
+    text = render_metrics_text()
+    assert "smart_spider_browse_blocks_total" in text
+    assert 'reason="policy_denied"' in text
+    assert 'reason="robots_skip"' in text
+    assert 'reason="challenge_dead"' in text

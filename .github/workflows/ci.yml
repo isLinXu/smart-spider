@@ -40,6 +40,9 @@ jobs:
 
       - name: CLI smoke (no optional extras required)
         run: |
+          PYTHONPATH=. python -m smart_spider.cli --help
+          PYTHONPATH=. python -m smart_spider.cli dataset --help
+          PYTHONPATH=. python -m smart_spider.cli browse --help
           PYTHONPATH=. python -m smart_spider.dataset_cli --help
           PYTHONPATH=. python -m smart_spider.multimodal_cli --help
           PYTHONPATH=. python -m smart_spider.dataset_filter_cli --help
@@ -49,6 +52,10 @@ jobs:
       - name: Scene gate truth regression
         run: |
           PYTHONPATH=. pytest tests/test_scene_gate_truth.py tests/test_contract_validate.py tests/test_report.py tests/test_config_io.py tests/test_repository_crash_e2e.py -q --tb=short
+
+      - name: CLIP-gate stub and engine HTML fixtures (no torch)
+        run: |
+          PYTHONPATH=. pytest tests/test_clip_gate_stub.py tests/test_engine_html_fixtures.py tests/test_dataset_split.py tests/test_cli.py tests/test_browser_playbook.py tests/test_report.py tests/test_site_profile.py tests/test_worker.py tests/test_pipeline_plugins.py -q --tb=short
 
       - name: Run tests (optional ML dependencies skipped)
         run: |

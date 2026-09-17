@@ -2,18 +2,75 @@
 """统一任务报告 schema（S3）。"""
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from .dataset_contracts import CONTRACT_FORMAT_VERSION, utc_now
+
+ALLOWED_TRACKS = {"crawl", "dataset", "multimodal", "filter", "browse"}
+
+
+def summarize_browse_results(
+    results: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Short seed → block/reason routes for browse --once and UnifiedReport."""
+    routes: list[dict[str, Any]] = []
+    kinds: dict[str, int] = {}
+    links = 0
+    for item in results:
+        block = item.get("block") or {}
+        kind = str(block.get("kind") or "") or "unknown"
+        reason = str(block.get("reason") or "")
+        link_count = int(item.get("link_count") or len(item.get("links") or []) or 0)
+        links += link_count
+        kinds[kind] = kinds.get(kind, 0) + 1
+        routes.append(
+            {
+                "seed": str(item.get("seed_url") or ""),
+                "final_url": str(item.get("final_url") or ""),
+                "block": kind,
+                "reason": reason,
+                "links": link_count,
+                "failed_step": str(item.get("failed_step") or ""),
+            }
+        )
+    return {
+        "pages": len(routes),
+        "ok": int(kinds.get("ok", 0)),
+        "blocked": sum(count for kind, count in kinds.items() if kind != "ok"),
+        "links": links,
+        "block_kinds": kinds,
+        "routes": routes,
+    }
+
+
+def format_browse_summary(summary: Mapping[str, Any]) -> str:
+    lines = [
+        "browse: {pages} pages, {ok} ok, {blocked} blocked, {links} links".format(
+            pages=summary.get("pages", 0),
+            ok=summary.get("ok", 0),
+            blocked=summary.get("blocked", 0),
+            links=summary.get("links", 0),
+        )
+    ]
+    for route in summary.get("routes") or []:
+        reason = str(route.get("reason") or "")
+        kind = str(route.get("block") or "")
+        extra = f" ({reason})" if reason and reason != kind else ""
+        step = route.get("failed_step") or ""
+        step_bit = f" step={step}" if step else ""
+        lines.append(f"  {route.get('seed') or ''} -> {kind}{extra}{step_bit}")
+    return "\n".join(lines)
 
 
 @dataclass
 class UnifiedReport:
-    """四条采集轨道共用的报告事实源。"""
+    """采集轨道共用的报告事实源。"""
 
     job_id: str
-    track: str  # crawl | dataset | multimodal | filter
+    track: str  # crawl | dataset | multimodal | filter | browse
     created_at: str = field(default_factory=utc_now)
     format_version: int = CONTRACT_FORMAT_VERSION
     config_snapshot: dict[str, Any] = field(default_factory=dict)
@@ -28,7 +85,7 @@ class UnifiedReport:
     def validate(self) -> None:
         if not self.job_id:
             raise ValueError("job_id is required")
-        if self.track not in {"crawl", "dataset", "multimodal", "filter"}:
+        if self.track not in ALLOWED_TRACKS:
             raise ValueError(f"unknown track: {self.track!r}")
         if self.format_version != CONTRACT_FORMAT_VERSION:
             raise ValueError(
@@ -39,6 +96,16 @@ class UnifiedReport:
     def to_dict(self) -> dict[str, Any]:
         self.validate()
         return asdict(self)
+
+    def write(self, path: str) -> str:
+        """Serialize to JSON and return the written path."""
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(self.to_dict(), handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        return path
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> "UnifiedReport":
@@ -184,4 +251,58 @@ class UnifiedReport:
             },
             source_stats=dict(stats.get("source_metrics") or {}),
             resource_stats=dict(stats.get("resource_metrics") or {}),
+        )
+
+    @classmethod
+    def from_browse_plan(
+        cls,
+        plan: dict[str, Any],
+        *,
+        job_id: str = "",
+        config_snapshot: Optional[dict[str, Any]] = None,
+    ) -> "UnifiedReport":
+        """Map browse CLI plan + page results into UnifiedReport."""
+        results = list(plan.get("results") or [])
+        link_count = 0
+        blocked_pages = 0
+        skipped_by_policy = 0
+        skipped_by_robots = 0
+        for item in results:
+            links = item.get("links") or []
+            link_count += int(item.get("link_count") or len(links) or 0)
+            block = item.get("block") or {}
+            kind = str(block.get("kind") or "")
+            if kind and kind != "ok":
+                blocked_pages += 1
+            skipped_by_policy += int(item.get("skipped_by_policy") or 0)
+            skipped_by_robots += int(item.get("skipped_by_robots") or 0)
+        snapshot = dict(config_snapshot or {})
+        if not snapshot:
+            snapshot = {
+                "profile": plan.get("profile"),
+                "urls": list(plan.get("urls") or []),
+                "policy": dict(plan.get("policy") or {}),
+                "steps": list(plan.get("steps") or []),
+            }
+        summary = dict(plan.get("summary") or summarize_browse_results(results))
+        return cls(
+            job_id=str(job_id or plan.get("profile") or "browse"),
+            track="browse",
+            config_snapshot=snapshot,
+            stage_stats={
+                "seeds": len(plan.get("urls") or []),
+                "pages": len(results),
+                "links": link_count,
+                "blocked_pages": blocked_pages,
+                "skipped_by_policy": skipped_by_policy,
+                "skipped_by_robots": skipped_by_robots,
+            },
+            source_stats={"block_kinds": dict(plan.get("block_kinds") or {})},
+            extras={
+                "mode": plan.get("mode"),
+                "summary": summary,
+                "publish_checklist_path": plan.get("publish_checklist_path"),
+                "unified_report_path": plan.get("unified_report_path"),
+                "results": results,
+            },
         )

@@ -9,6 +9,7 @@ from smart_spider.compliance import (
     CompliancePolicy,
     apply_compliance_to_provenance,
     build_publish_checklist,
+    checklist_exit_code,
     redact_url,
     write_publish_checklist,
 )
@@ -58,3 +59,5 @@ def test_checklist_warns_when_license_missing():
     assert "license_missing" in checklist.warnings
     assert "robots_disabled" in checklist.warnings
     assert "challenge_pages_observed" in checklist.warnings
+    assert checklist_exit_code(checklist, allow_unready=False) == 2
+    assert checklist_exit_code(checklist, allow_unready=True) == 0

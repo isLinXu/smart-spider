@@ -1,0 +1,18 @@
+{
+  "data": [
+    {
+      "objURL": "https://img.example.com/1.jpg",
+      "thumbURL": "https://thumb.example.com/t1.jpg",
+      "fromPageTitleEncode": "Example Title 1",
+      "width": 800,
+      "height": 600
+    },
+    {
+      "objURL": "https://img.example.com/2.jpg",
+      "thumbURL": "https://thumb.example.com/t2.jpg",
+      "fromPageTitleEncode": "Example Title 2",
+      "width": 1024,
+      "height": 768
+    }
+  ]
+}

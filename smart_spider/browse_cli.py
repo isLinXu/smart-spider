@@ -1,22 +1,29 @@
 # coding=utf-8
-"""授权站点浏览 CLI（S17）。
+"""授权站点浏览 CLI（S17–S20）。
 
 示例::
 
-    smart-spider-browse --profile examples/site_profiles/example.com.yaml
-    smart-spider-browse --profile ./site.yaml --url https://example.com/a --enqueue
-    smart-spider-browse --profile ./site.yaml --once
-    smart-spider-browse --profile ./site.yaml --dump-resolved ./resolved.json
+    smart-spider browse --profile examples/site_profiles/example.com.yaml
+    smart-spider browse --profile ./site.yaml --once
+    smart-spider browse --profile ./site.yaml --login --export-storage-state ./state.json
+    smart-spider browse --profile ./site.yaml --retry-dead --block-kind challenge
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import sys
 from typing import Optional
 
+from .compliance import (
+    build_publish_checklist,
+    checklist_exit_code,
+    write_publish_checklist,
+)
 from .config_io import ConfigIOError, dump_mapping
 from .pipeline import get_task_queue
+from .report import UnifiedReport, format_browse_summary, summarize_browse_results
 from .site_profile import SiteProfile, load_site_profile
 
 
@@ -67,6 +74,7 @@ def run_profile_once(
     urls: list[str],
     *,
     controller=None,
+    bfs: bool = True,
 ) -> list[dict]:
     """本地执行授权浏览剧本（默认创建 BrowserController）。"""
     from .browser_controller import BrowserController
@@ -84,9 +92,14 @@ def run_profile_once(
         )
     results: list[dict] = []
     try:
-        playbook = AuthorizedBrowsePlaybook(controller, profile.policy)
-        for url in accepted:
-            result = playbook.run(url, depth=0)
+        playbook = AuthorizedBrowsePlaybook(
+            controller, profile.policy, steps=profile.steps
+        )
+        if bfs:
+            pages = playbook.crawl_bfs(accepted, steps=profile.steps)
+        else:
+            pages = [playbook.run(url, depth=0, steps=profile.steps) for url in accepted]
+        for result in pages:
             payload = result.to_dict()
             payload["profile"] = profile.name
             results.append(payload)
@@ -94,6 +107,36 @@ def run_profile_once(
         if owns_controller:
             controller.close()
     return results
+
+
+def retry_dead_tasks(
+    *,
+    queue,
+    block_kind: str = "",
+    reset_attempts: bool = True,
+) -> list[str]:
+    """Retry dead authorized_browse tasks, optionally filtered by block kind."""
+    records = queue.list_tasks(
+        status="dead",
+        kind="authorized_browse",
+        block_kind=block_kind or None,
+        limit=1000,
+    )
+    retried: list[str] = []
+    for record in records:
+        updated = queue.retry(record.task_id, reset_attempts=reset_attempts)
+        retried.append(updated.task_id)
+    return retried
+
+
+def _block_kinds(results: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in results:
+        block = item.get("block") or {}
+        kind = str(block.get("kind") or "")
+        if kind:
+            counts[kind] = counts.get(kind, 0) + 1
+    return counts
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -121,10 +164,44 @@ def _build_parser() -> argparse.ArgumentParser:
         help="本地立即执行浏览剧本（需要 Playwright）",
     )
     parser.add_argument(
+        "--no-bfs",
+        action="store_true",
+        help="--once 时只访问种子，不做同域 BFS",
+    )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="显示浏览器等待人工登录，然后导出会话",
+    )
+    parser.add_argument(
+        "--export-storage-state",
+        help="将 Playwright storage_state 写到该路径",
+    )
+    parser.add_argument(
+        "--retry-dead",
+        action="store_true",
+        help="将 dead 的 authorized_browse 任务重新入队",
+    )
+    parser.add_argument(
+        "--block-kind",
+        default="",
+        help="按 block kind 过滤死信（challenge/auth_required/...）",
+    )
+    parser.add_argument(
+        "--allow-unready",
+        action="store_true",
+        help="publish_checklist.ready=false 时仍返回 0",
+    )
+    parser.add_argument(
+        "--output",
+        default="",
+        help="浏览报告与 publish checklist 输出目录",
+    )
+    parser.add_argument(
         "--backend",
         default=os.environ.get("SMART_SPIDER_QUEUE_BACKEND", "sqlite"),
         choices=("sqlite", "local", "redis"),
-        help="队列后端（配合 --enqueue）",
+        help="队列后端（配合 --enqueue / --retry-dead）",
     )
     parser.add_argument(
         "--queue",
@@ -149,6 +226,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="发现链接后不自动入队后续任务",
     )
     return parser
+
+
+def _open_queue(args):
+    if args.backend in {"sqlite", "local", ""}:
+        return get_task_queue("sqlite", path=args.queue)
+    return get_task_queue("redis", url=os.environ.get("SMART_SPIDER_REDIS_URL"))
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -181,10 +264,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         "enqueue_links": profile.enqueue_links,
         "max_attempts": profile.max_attempts,
         "compliance": profile.compliance_policy().to_dict(),
+        "steps": [step.to_dict() for step in profile.steps],
     }
 
-    if args.enqueue and args.once:
-        raise SystemExit("use either --enqueue or --once, not both")
+    exclusive = [args.enqueue, args.once, args.login, args.retry_dead]
+    if sum(bool(item) for item in exclusive) > 1:
+        raise SystemExit("use only one of --enqueue, --once, --login, --retry-dead")
+
+    if args.retry_dead:
+        queue = _open_queue(args)
+        ids = retry_dead_tasks(
+            queue=queue,
+            block_kind=args.block_kind,
+        )
+        plan["mode"] = "retry-dead"
+        plan["task_ids"] = ids
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        return 0
 
     if args.enqueue:
         task_ids = enqueue_profile_jobs(
@@ -198,12 +294,66 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return 0
 
-    if args.once:
-        results = run_profile_once(profile, accepted)
-        plan["mode"] = "once"
-        plan["results"] = results
+    if args.login:
+        from .browser_controller import BrowserController
+
+        export_path = args.export_storage_state or profile.policy.storage_state_path
+        if not export_path:
+            raise SystemExit("--login requires --export-storage-state or profile.storage_state_path")
+        controller = BrowserController(
+            headless=False,
+            allow_private_hosts=profile.policy.allow_private_hosts,
+        )
+        try:
+            seed = accepted[0]
+            controller.navigate(seed)
+            print(
+                f"Complete login in the browser for {seed}, then press Enter to export storage_state.",
+                file=sys.stderr,
+            )
+            try:
+                input()
+            except EOFError as exc:
+                raise SystemExit("login aborted: no terminal input") from exc
+            controller.export_storage_state(export_path)
+        finally:
+            controller.close()
+        plan["mode"] = "login"
+        plan["storage_state"] = export_path
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return 0
+
+    if args.once:
+        results = run_profile_once(
+            profile, accepted, bfs=not args.no_bfs
+        )
+        plan["mode"] = "once"
+        plan["results"] = results
+        block_kinds = _block_kinds(results)
+        plan["block_kinds"] = block_kinds
+        summary = summarize_browse_results(results)
+        plan["summary"] = summary
+        output_dir = args.output or os.path.join("runs", "browse", profile.name)
+        os.makedirs(output_dir, exist_ok=True)
+        checklist = build_publish_checklist(
+            job_id=profile.name,
+            policy=profile.compliance_policy(),
+            block_kinds=block_kinds,
+        )
+        plan["publish_checklist_path"] = write_publish_checklist(output_dir, checklist)
+        plan["publish_checklist"] = checklist.to_dict()
+        unified_path = os.path.join(output_dir, "unified_report.json")
+        plan["unified_report_path"] = unified_path
+        UnifiedReport.from_browse_plan(plan, job_id=profile.name).write(unified_path)
+        print(format_browse_summary(summary), file=sys.stderr)
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        code = checklist_exit_code(checklist, allow_unready=args.allow_unready)
+        if code:
+            print(
+                "publish_checklist.ready is false; pass --allow-unready to ignore",
+                file=sys.stderr,
+            )
+        return code
 
     plan["mode"] = "dry-run"
     print(json.dumps(plan, ensure_ascii=False, indent=2))

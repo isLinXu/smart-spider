@@ -169,6 +169,49 @@ def test_worker_authorized_browse_enqueues_links(tmp_path, monkeypatch):
     assert pending[0].payload["url"].endswith("/a")
 
 
+def test_worker_default_kind_claims_browse(tmp_path, monkeypatch):
+    queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"))
+    queue.enqueue(
+        "authorized_browse",
+        {
+            "url": "https://example.com/",
+            "depth": 0,
+            "policy": {
+                "allow_hosts": ["example.com"],
+                "action_delay_seconds": 0,
+                "scroll_passes": 0,
+                "respect_robots": False,
+                "requests_per_second": 1000,
+            },
+            "enqueue_links": False,
+        },
+    )
+
+    class FakeController:
+        current_url = "https://example.com/"
+
+        def __init__(self, **kwargs):
+            pass
+
+        def navigate(self, url):
+            self.current_url = url
+            return "<html><body><p>ok page content here</p></body></html>"
+
+        def scroll(self):
+            return True, self.navigate(self.current_url)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "smart_spider.browser_controller.BrowserController", FakeController
+    )
+    processed = run_worker(queue, once=True)
+    assert processed == 1
+    pending = queue.list_tasks(status="pending", kind="authorized_browse")
+    assert pending == []
+
+
 def test_worker_authorized_browse_challenge_goes_dead(tmp_path, monkeypatch):
     queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"), default_max_attempts=3)
     enqueued = queue.enqueue(

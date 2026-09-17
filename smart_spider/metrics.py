@@ -102,8 +102,12 @@ _REGISTRY.help(
     "Task terminal outcomes observed by workers (by kind and status).",
 )
 _REGISTRY.help(
-    "smart_spider_queue_tasks",
-    "Current queue depth by status (scraped at /metrics).",
+    "smart_spider_browse_blocks_total",
+    "Authorized-browse block classifications (challenge, forbidden, ...).",
+)
+_REGISTRY.help(
+    "smart_spider_browse_skips_total",
+    "Authorized-browse skips: policy_denied, robots_skip, challenge_dead.",
 )
 
 
@@ -115,6 +119,21 @@ def observe_task_outcome(kind: str, status: str) -> None:
     get_metrics().inc(
         "smart_spider_tasks_total",
         labels={"kind": kind or "unknown", "status": status or "unknown"},
+    )
+
+
+def observe_browse_block(kind: str) -> None:
+    get_metrics().inc(
+        "smart_spider_browse_blocks_total",
+        labels={"kind": kind or "unknown"},
+    )
+
+
+def observe_browse_skip(reason: str, amount: float = 1.0) -> None:
+    get_metrics().inc(
+        "smart_spider_browse_skips_total",
+        amount=amount,
+        labels={"reason": reason or "unknown"},
     )
 
 

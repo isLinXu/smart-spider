@@ -75,51 +75,79 @@ import re
 import signal
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 from urllib.parse import urlsplit
 
-import numpy as np
 from loguru import logger
 from PIL import Image
 from tqdm import tqdm
 
 from .http_client import SmartHttpClient, ProxyPool
-from .image_safety import UnsafeImageError, assert_header_within_budget, decode_image_bytes
 from .smart_spider import (
     CrawlEvent,
     CrawlStats,
     UrlDeduplicator,
-    _detect_ext,
 )
 from .engines import ENGINE_REGISTRY, MediaType, get_engine
 from .site_crawler import SiteCrawler
 from .site_parser import get_site_parser
 from .dataset_contracts import (
-    CandidateResource,
     LabelDecision,
     LabelMode,
     LabelPolicy,
-    Modality,
-    ModalityAsset,
-    QualityMetrics,
-    SampleRecord,
-    URL_NORMALIZE_VERSION,
 )
-from .dataset_lineage import build_lineage, publish_dataset_artifacts
-from .compliance import apply_compliance_to_provenance, build_publish_checklist, write_publish_checklist
-from .report import UnifiedReport
+from .dataset_lineage import build_lineage
+from .dataset_job_report import (
+    attach_dataset_lineage,
+    attach_dataset_publish_bundle,
+    merge_dataset_crawl_stats,
+    write_dataset_report_json,
+)
 from .dataset_state import DatasetStateStore
 from .dataset_repository import DatasetRepository
-from .dataset_governance import QuotaLedger, SceneQuotaLedger, perceptual_fingerprint
+from .dataset_governance import QuotaLedger, SceneQuotaLedger
 from .dataset_config import DatasetCrawlConfig
 from .dataset_layout import (
     DatasetDirManager,
     ManifestWriter,
     MetadataWriter,
     ProgressManager,
+)
+from .dataset_discovery import (
+    DiscoveredImage,
+    collection_limit_reached,
+    discover_page_images,
+    drain_inflight_window,
+    estimate_pages_needed,
+    order_search_engines,
+    page_offsets,
+    urls_to_discovered,
+)
+from .dataset_crawl_plan import (
+    keyword_progress_snapshot,
+    remaining_keywords,
+    remaining_quota,
+    site_crawler_kwargs,
+    spider_tools_to_discovered,
+)
+from .dataset_download_window import DownloadWindow
+from .dataset_download_session import ImageDownloadSession
+from .dataset_scene_admission import (
+    admit_ingested_image,
+    evaluate_scene_quality,
+    normalize_scene_targets,
+    scene_key,
+    scene_semantic_threshold,
+)
+from .dataset_image_ingest import ingest_remote_image, prepare_output_image
+from .dataset_image_commit import materialize_accepted_image, reserve_ingest_quotas
+from .dataset_semantic_gate import evaluate_semantic_filters
+from .dataset_sample_builder import (
+    AcceptedImageFacts,
+    bind_record_builder,
+    build_image_quality_metrics,
 )
 from .scene_quality import get_scene_quality_profile
 from .scene_quality_gate import (
@@ -389,7 +417,7 @@ class DatasetCrawler:
         self.total_count = total_count
         if total_count <= 0:
             raise ValueError("total_count must be positive")
-        self.scene_targets = self._normalize_scene_targets(scene_targets)
+        self.scene_targets = normalize_scene_targets(scene_targets)
         if self.scene_targets and sum(self.scene_targets.values()) > total_count:
             raise ValueError("total_count cannot be lower than the sum of scene_targets")
         self.max_source_share = float(max_source_share)
@@ -400,7 +428,7 @@ class DatasetCrawler:
         if self.scene_quality_gate_enabled and self.scene_quality_gate is None:
             scene_names = set(self.scene_targets)
             scene_names.update(
-                self._scene_key(keyword) for keyword in (keywords or [])
+                scene_key(keyword) for keyword in (keywords or [])
             )
             unknown_scenes = []
             for scene_name in scene_names:
@@ -447,6 +475,7 @@ class DatasetCrawler:
                         )
         self.scene_review_queue: Optional[JsonlSceneReviewQueue] = None
         self._scene_quality_stats = {"accept": 0, "review": 0, "reject": 0}
+        self.last_publish_checklist = None
         if self.scene_quality_gate_enabled:
             queue_path = scene_review_queue_path or os.path.join(
                 output_dir, "scene_review_queue.jsonl"
@@ -523,12 +552,7 @@ class DatasetCrawler:
         if self.max_pending_candidates <= 0:
             raise ValueError("max_pending_candidates must be positive")
         self.per_domain_concurrency = int(per_domain_concurrency)
-        self._download_slots = threading.BoundedSemaphore(self.max_inflight_downloads)
-        self._candidate_slots = threading.BoundedSemaphore(self.max_pending_candidates)
-        self._domain_slots: dict[str, threading.BoundedSemaphore] = {}
-        self._backpressure_lock = threading.Lock()
-        self._inflight_downloads = 0
-        self._inflight_candidates = 0
+        self._window: Optional[DownloadWindow] = None
         self._callbacks = callbacks or []
         self._disk_guard_mb = disk_guard_mb
         self.job_id = job_id or hashlib.sha256(
@@ -563,6 +587,14 @@ class DatasetCrawler:
 
         signal.signal(signal.SIGINT, _shutdown_handler)
         signal.signal(signal.SIGTERM, _shutdown_handler)
+
+        self._window = DownloadWindow(
+            max_inflight_downloads=self.max_inflight_downloads,
+            max_pending_candidates=self.max_pending_candidates,
+            per_domain_concurrency=self.per_domain_concurrency,
+            should_stop=self._should_stop,
+            on_change=lambda: self._record_backpressure(),
+        )
 
         # 采集统计
         self.stats = CrawlStats()
@@ -719,35 +751,40 @@ class DatasetCrawler:
     def _should_stop(self) -> bool:
         return self._shutdown_requested.is_set() or not self._check_disk_space()
 
+    def _collection_limit_reached(self, keyword: Optional[str] = None) -> bool:
+        return collection_limit_reached(
+            stopped=self._should_stop(),
+            saved_count=self._dir_manager.saved_count,
+            total_count=self.total_count,
+            scene_target_reached=(
+                self._scene_target_reached(keyword) if keyword is not None else False
+            ),
+        )
+
+    def _save_discovered_images(
+        self,
+        discovered: Iterable[DiscoveredImage],
+        pbar: tqdm,
+        *,
+        check_scene: bool = True,
+    ) -> None:
+        for item in discovered:
+            halt_keyword = item.keyword if check_scene else None
+            if self._collection_limit_reached(halt_keyword):
+                break
+            if self._download_and_save(item.url, item.keyword, item.source):
+                with self._dir_manager._lock:
+                    pbar.update(1)
+
     @staticmethod
     def _normalize_scene_targets(
         scene_targets: Optional[Mapping[str, int]],
     ) -> dict[str, int]:
-        if scene_targets is None:
-            return {}
-        if not isinstance(scene_targets, Mapping):
-            raise ValueError("scene_targets must be a mapping of scene names to counts")
-        result: dict[str, int] = {}
-        for raw_name, raw_target in scene_targets.items():
-            try:
-                name = get_scene_quality_profile(str(raw_name)).name
-            except ValueError:
-                name = str(raw_name).strip()
-            try:
-                target = int(raw_target)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"invalid scene target for {raw_name!r}") from exc
-            if not name or target <= 0:
-                raise ValueError("scene targets need non-empty names and positive counts")
-            result[name] = result.get(name, 0) + target
-        return result
+        return normalize_scene_targets(scene_targets)
 
     @staticmethod
     def _scene_key(keyword: str) -> str:
-        try:
-            return get_scene_quality_profile(keyword).name
-        except ValueError:
-            return keyword.strip()
+        return scene_key(keyword)
 
     def _load_resumed_quota_counts(self) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
         scene_counts: dict[str, int] = {}
@@ -790,21 +827,22 @@ class DatasetCrawler:
         therefore opt-in, but once enabled it is fail-closed: a configured scene
         without a profile or detector evidence can never be accepted silently.
         """
-        if not self.scene_quality_gate_enabled:
-            return None
-        gate = self.scene_quality_gate
-        if gate is None:
-            if scene_profile is None:
-                raise ValueError(
-                    "scene quality gate requires a built-in/custom scene profile "
-                    "or an injected SceneQualityGate"
-                )
-            gate = SceneQualityGate(scene_profile, detector=self.scene_signal_detector)
-        if gate.detector is not None:
-            return gate.evaluate_image(image, semantic_score)
-        # Missing detector signals intentionally become a review decision for
-        # absence-based safety scenes instead of being treated as acceptance.
-        return gate.evaluate(semantic_score, signals={})
+        return evaluate_scene_quality(
+            enabled=self.scene_quality_gate_enabled,
+            gate=self.scene_quality_gate,
+            scene_profile=scene_profile,
+            detector=self.scene_signal_detector,
+            image=image,
+            semantic_score=semantic_score,
+        )
+
+    def _scene_semantic_threshold(self, scene_profile: Any) -> float:
+        return scene_semantic_threshold(
+            gate_enabled=self.scene_quality_gate_enabled,
+            gate=self.scene_quality_gate,
+            scene_profile=scene_profile,
+            default_threshold=self.similarity_threshold,
+        )
 
     def _record_scene_quality_review(
         self,
@@ -829,9 +867,9 @@ class DatasetCrawler:
             disk_free_bytes = shutil.disk_usage(self.output_dir).free
         except OSError:
             disk_free_bytes = None
-        with self._backpressure_lock:
-            active_downloads = self._inflight_downloads
-            active_candidates = self._inflight_candidates
+        window = self._window
+        active_downloads = 0 if window is None else window.inflight_downloads
+        active_candidates = 0 if window is None else window.inflight_candidates
         self.stats.set_resource_metrics(
             max_inflight_pages=self.max_inflight_pages,
             in_flight_pages=in_flight_pages,
@@ -851,49 +889,19 @@ class DatasetCrawler:
         )
 
     def _acquire_candidate_slot(self) -> bool:
-        while not self._candidate_slots.acquire(timeout=0.2):
-            if self._should_stop():
-                return False
-        with self._backpressure_lock:
-            self._inflight_candidates += 1
-        self._record_backpressure()
-        return True
+        return self._window.acquire_candidate_slot()
 
     def _release_candidate_slot(self) -> None:
-        with self._backpressure_lock:
-            self._inflight_candidates = max(0, self._inflight_candidates - 1)
-        self._candidate_slots.release()
-        self._record_backpressure()
+        self._window.release_candidate_slot()
 
     def _domain_slot(self, url: str) -> threading.BoundedSemaphore:
-        hostname = (urlsplit(url).hostname or "_unknown").casefold()
-        with self._backpressure_lock:
-            slot = self._domain_slots.get(hostname)
-            if slot is None:
-                slot = threading.BoundedSemaphore(self.per_domain_concurrency)
-                self._domain_slots[hostname] = slot
-            return slot
+        return self._window.domain_slot(url)
 
     def _acquire_download_slot(self, url: str) -> Optional[threading.BoundedSemaphore]:
-        while not self._download_slots.acquire(timeout=0.2):
-            if self._should_stop():
-                return None
-        domain_slot = self._domain_slot(url)
-        while not domain_slot.acquire(timeout=0.2):
-            if self._should_stop():
-                self._download_slots.release()
-                return None
-        with self._backpressure_lock:
-            self._inflight_downloads += 1
-        self._record_backpressure()
-        return domain_slot
+        return self._window.acquire_download_slot(url)
 
     def _release_download_slot(self, domain_slot: threading.BoundedSemaphore) -> None:
-        with self._backpressure_lock:
-            self._inflight_downloads = max(0, self._inflight_downloads - 1)
-        domain_slot.release()
-        self._download_slots.release()
-        self._record_backpressure()
+        self._window.release_download_slot(domain_slot)
 
     def _check_disk_space(self) -> bool:
         try:
@@ -967,9 +975,233 @@ class DatasetCrawler:
             self._image_query_feature,
         ).item())
 
-    # ──────────────────────────────────────────────────────────────
-    # 图片下载 + 过滤 + 保存
-    # ──────────────────────────────────────────────────────────────
+    def _clip_cosine_similarity(self, left, right) -> float:
+        return float(torch.nn.functional.cosine_similarity(left, right).item())
+
+    def _evaluate_semantic_filters(self, image, keyword: str, *, scene_profile: Any, threshold: float):
+        return evaluate_semantic_filters(
+            clip_enabled=bool(self.use_clip and self.model is not None),
+            encode_image=self._encode_image,
+            get_text_feature=self._get_text_feature,
+            cosine_similarity=self._clip_cosine_similarity,
+            image=image,
+            keyword=keyword,
+            clip_threshold=threshold,
+            scene_profile_name=scene_profile.name if scene_profile else None,
+            image_query_enabled=self._image_query_feature is not None,
+            image_query_similarity=self._image_query_similarity,
+            image_query_threshold=self.image_similarity_threshold,
+        )
+
+    def _admit_ingested_image(
+        self,
+        image: Image.Image,
+        keyword: str,
+        *,
+        scene_profile: Any,
+        threshold: float,
+    ):
+        semantic = self._evaluate_semantic_filters(
+            image,
+            keyword,
+            scene_profile=scene_profile,
+            threshold=threshold,
+        )
+        return admit_ingested_image(
+            semantic,
+            scene_evaluator=lambda score: self._evaluate_scene_quality(
+                scene_profile, image, score
+            ),
+        )
+
+    def _apply_admission_events(self, admission, *, keyword: str, url: str) -> None:
+        if admission.inc_filtered:
+            self.stats.inc_filtered("image")
+            self._emit_callback(CrawlEvent(
+                event_type="item_filtered",
+                keyword=keyword,
+                media_type="image",
+                url=url,
+                detail=admission.event_detail,
+            ))
+        if admission.scene_decision is not None:
+            self._record_scene_quality_review(url, admission.scene_decision)
+            self._emit_callback(CrawlEvent(
+                event_type="scene_quality_decision",
+                keyword=keyword,
+                media_type="image",
+                url=url,
+                detail=admission.scene_decision.to_dict(),
+            ))
+
+    # Download-session steps consumed by `_download_and_save`.
+    def _begin_image_session(
+        self, url: str, keyword: str, source: str
+    ) -> Optional[ImageDownloadSession]:
+        session = ImageDownloadSession(
+            url=url,
+            keyword=keyword,
+            source=source,
+            job_id=self.job_id,
+            dedup=self._dedup,
+            window=self._window,
+            state_store=self._state_store,
+        )
+        if not session.claim_url():
+            return None
+        session.register_candidate()
+        return session
+
+    def _scene_context(self, keyword: str) -> tuple[str, Any, float]:
+        key = self._scene_key(keyword)
+        profile = None
+        try:
+            profile = get_scene_quality_profile(key)
+        except ValueError:
+            pass
+        return key, profile, self._scene_semantic_threshold(profile)
+
+    def _ingest_session_image(self, session: ImageDownloadSession):
+        ingested = ingest_remote_image(
+            self._http,
+            session.url,
+            max_file_size=self.max_file_size,
+            max_image_pixels=self.max_image_pixels,
+            min_file_size=self.min_file_size,
+            min_width=self.min_width,
+            min_height=self.min_height,
+            min_variance=self.min_variance,
+        )
+        session.attach_response(ingested.response)
+        return ingested
+
+    def _accepted_ingest(self, session: ImageDownloadSession, ingested):
+        if not ingested.ok:
+            if ingested.inc_filtered:
+                self.stats.inc_filtered("image")
+            if ingested.inc_failed:
+                self.stats.inc_failed("image")
+            if ingested.status == "reject":
+                session.reject(ingested.reason)
+            else:
+                session.fail(ingested.reason)
+            return None
+        if ingested.image is None or ingested.thumbnail is None:
+            session.fail("ingest_missing_image")
+            return None
+        return ingested
+
+    def _commit_admitted_image(
+        self,
+        session: ImageDownloadSession,
+        ingested,
+        admission,
+        *,
+        scene_key: str,
+        scene_profile: Any,
+        threshold: float,
+    ):
+        img = ingested.image
+        arr = ingested.thumbnail
+        ext = ingested.ext
+        output_content, output_ext, output_format, format_conversion = (
+            self._prepare_output_image(img, ingested.content, ext)
+        )
+        quota_hold, quota_reason = reserve_ingest_quotas(
+            scene_quotas=self._scene_quotas,
+            source_quotas=self._source_quotas,
+            domain_quotas=self._domain_quotas,
+            scene_key=scene_key,
+            source_key=str(session.source).strip(),
+            domain_key=(urlsplit(session.url).hostname or "").casefold(),
+            track_scene=scene_key in self.scene_targets,
+        )
+        if quota_hold is None:
+            session.reject(quota_reason)
+            return None
+        session.quota_hold = quota_hold
+        quality = build_image_quality_metrics(
+            image=img,
+            thumbnail=arr,
+            output_content=output_content,
+            output_format=output_format,
+            scene_profile=scene_profile,
+            semantic_threshold=threshold,
+            scene_decision=admission.scene_decision,
+        )
+        facts = AcceptedImageFacts(
+            url=session.url,
+            keyword=session.keyword,
+            source=session.source,
+            job_id=self.job_id,
+            dataset_id=getattr(self, "_dataset_id", ""),
+            config_fingerprint=getattr(self, "_config_fingerprint", ""),
+            clip_model_name=self.clip_model_name if self.use_clip else None,
+            query_image=self.query_image or "",
+            image_similarity_threshold=self.image_similarity_threshold,
+            sim=admission.sim,
+            image_sim=admission.image_sim,
+            output_ext=output_ext,
+            source_ext=ext,
+            width=img.width,
+            height=img.height,
+            format_conversion=format_conversion,
+            scene_quality_decision=admission.scene_decision,
+        )
+        materialized = materialize_accepted_image(
+            repository=self._repository,
+            dir_manager=self._dir_manager,
+            state_store=self._state_store,
+            job_id=self.job_id,
+            output_dir=self.output_dir,
+            manifest_writer=self._manifest_writer,
+            metadata_writer=self._metadata_writer,
+            output_content=output_content,
+            source_content=ingested.content,
+            url=session.url,
+            output_ext=output_ext,
+            candidate_id=session.candidate_id,
+            max_count=self.total_count,
+            build_records=bind_record_builder(
+                facts=facts,
+                quality=quality,
+                label_resolution=self.label_policy.resolve(
+                    self._query_label_decisions(session.keyword)
+                ),
+                label_policy=self.label_policy,
+                compliance_policy=self.config.compliance_policy(),
+            ),
+            source_hash=ingested.content_hash,
+            content_hash=hashlib.sha256(output_content).hexdigest(),
+        )
+        if not materialized.ok:
+            if materialized.fail:
+                session.fail(materialized.reason)
+            else:
+                session.reject(materialized.reason)
+            return None
+        return materialized
+
+    def _record_saved(self, *, url: str, keyword: str, admission, materialized) -> None:
+        self.stats.inc_saved("image")
+        self._emit_callback(CrawlEvent(
+            event_type="item_saved",
+            keyword=keyword,
+            media_type="image",
+            url=url,
+            detail={
+                "sim": round(admission.sim, 4),
+                "image_sim": (
+                    round(admission.image_sim, 4)
+                    if admission.image_sim is not None
+                    else None
+                ),
+                "file": materialized.path,
+                "index": materialized.index,
+            },
+        ))
+        if materialized.index % 100 == 0 and materialized.index > 0:
+            logger.info(f"已保存 {materialized.index} 张图片 (目标: {self.total_count})")
 
     @staticmethod
     def _query_contains_term(query: str, term: str) -> bool:
@@ -1029,32 +1261,18 @@ class DatasetCrawler:
         source_content: bytes,
         source_ext: str,
     ) -> tuple[bytes, str, str, dict[str, Any]]:
-        """在图片通过过滤后，按配置生成最终落盘内容。
-
-        内容去重仍使用下载到的原始字节；这里只负责生成数据集最终保存的
-        字节，因此 WebP/GIF 等源格式默认会以 JPEG 文件落盘。
-        """
-        source_format = (image.format or source_ext.lstrip(".") or "unknown").lower()
-        if self.image_output_format is None:
-            return source_content, source_ext, source_format, {
-                "enabled": False,
-                "from_format": source_format,
-                "to_format": source_format,
-            }
-
-        output = BytesIO()
-        image.save(
-            output,
-            format="JPEG",
-            quality=self.jpeg_quality,
-            optimize=True,
+        """在图片通过过滤后，按配置生成最终落盘内容。"""
+        return prepare_output_image(
+            image,
+            source_content,
+            source_ext,
+            output_format=self.image_output_format,
+            jpeg_quality=self.jpeg_quality,
         )
-        return output.getvalue(), ".jpg", "jpeg", {
-            "enabled": True,
-            "from_format": source_format,
-            "to_format": "jpeg",
-            "quality": self.jpeg_quality,
-        }
+
+    # ──────────────────────────────────────────────────────────────
+    # 图片下载 + 过滤 + 保存
+    # ──────────────────────────────────────────────────────────────
 
     def _download_and_save(self, url: str, keyword: str, source: str) -> bool:
         """下载单张图片，经过过滤后保存到分桶目录。
@@ -1066,451 +1284,54 @@ class DatasetCrawler:
         """
         if self._dir_manager.saved_count >= self.total_count:
             return False
-
-        if not self._dedup.claim(url):
+        session = self._begin_image_session(url, keyword, source)
+        if session is None:
             return False
-        url_claimed = True
-        content_claimed = False
-        scene_key = self._scene_key(keyword)
-        scene_profile = None
+        scene_key, scene_profile, threshold = self._scene_context(keyword)
         try:
-            scene_profile = get_scene_quality_profile(scene_key)
-        except ValueError:
-            pass
-        if self.scene_quality_gate_enabled:
-            gate_profile = (
-                self.scene_quality_gate.profile
-                if self.scene_quality_gate is not None
-                else scene_profile
+            slot_error = session.acquire_slots()
+            if slot_error:
+                return session.fail(slot_error)
+            ingested = self._accepted_ingest(
+                session, self._ingest_session_image(session)
             )
-            scene_semantic_threshold = (
-                gate_profile.review_score
-                if gate_profile is not None
-                else self.similarity_threshold
+            if ingested is None:
+                return False
+            if not session.claim_content(ingested.content):
+                return session.reject("duplicate_content")
+            admission = self._admit_ingested_image(
+                ingested.image,
+                keyword,
+                scene_profile=scene_profile,
+                threshold=threshold,
             )
-        else:
-            scene_semantic_threshold = (
-                scene_profile.acceptance_score
-                if scene_profile is not None
-                else self.similarity_threshold
+            self._apply_admission_events(admission, keyword=keyword, url=url)
+            if not admission.accepted:
+                return session.reject(admission.reason)
+            materialized = self._commit_admitted_image(
+                session,
+                ingested,
+                admission,
+                scene_key=scene_key,
+                scene_profile=scene_profile,
+                threshold=threshold,
             )
-        source_quota_key = str(source).strip()
-        domain_quota_key = (urlsplit(url).hostname or "").casefold()
-        scene_reserved = False
-        source_reserved = False
-        domain_reserved = False
-
-        candidate_id = None
-        if self._state_store is not None:
-            try:
-                candidate_id = self._state_store.add_candidate(
-                    self.job_id,
-                    CandidateResource(
-                        url=url,
-                        source=source,
-                        query=keyword,
-                        source_meta={"keyword": keyword},
-                    ),
-                )
-            except Exception as state_err:
-                logger.warning(f"State store candidate error: {state_err}")
-
-        def reject(reason: str) -> bool:
-            if candidate_id and self._state_store is not None:
-                try:
-                    self._state_store.reject_candidate(candidate_id, reason)
-                except Exception as state_err:
-                    logger.warning(f"State store reject error: {state_err}")
-            return False
-
-        def fail(error: str) -> bool:
-            if candidate_id and self._state_store is not None:
-                try:
-                    self._state_store.fail_candidate(candidate_id, error)
-                except Exception as state_err:
-                    logger.warning(f"State store failure error: {state_err}")
-            return False
-
-        candidate_slot_acquired = self._acquire_candidate_slot()
-        if not candidate_slot_acquired:
-            return fail("crawl_stopped_before_candidate_processing")
-        domain_slot = None
-        resp = None
-        full_content = None
-        try:
-            domain_slot = self._acquire_download_slot(url)
-            if domain_slot is None:
-                return fail("crawl_stopped_before_download")
-            # The client is constructed with max_response_bytes=max_file_size.
-            # Keep the call signature compatible with injected test/custom
-            # clients while retaining the HTTP-level hard limit.
-            peek, resp = self._http.get_stream(url, peek_bytes=8192)
-            ext = _detect_ext(peek)
-            if ext not in (".jpg", ".png", ".webp", ".gif", ".avif", ".avis"):
-                return reject("unsupported_image_format")
-
-            response_headers = getattr(resp, "headers", {}) or {}
-            content_length = response_headers.get("Content-Length")
-            if content_length:
-                try:
-                    if int(content_length) > self.max_file_size:
-                        self.stats.inc_filtered("image")
-                        return reject("file_too_large")
-                except (TypeError, ValueError):
-                    pass
-
-            # 读取完整内容（流式 SHA-256；头部可提前拒掉超像素图）
-            try:
-                hasher = hashlib.sha256()
-                hasher.update(peek)
-                try:
-                    assert_header_within_budget(peek, max_pixels=self.max_image_pixels)
-                except UnsafeImageError:
-                    self.stats.inc_failed("image")
-                    return reject("image_too_large_pixels")
-                chunks = [peek]
-                total_bytes = len(peek)
-                for chunk in resp.iter_content(chunk_size=65536):
-                    if not chunk:
-                        continue
-                    total_bytes += len(chunk)
-                    if total_bytes > self.max_file_size:
-                        self.stats.inc_filtered("image")
-                        return reject("file_too_large")
-                    hasher.update(chunk)
-                    chunks.append(chunk)
-                    # Re-probe once the SOF / IHDR is likely present.
-                    if total_bytes < 65536 or len(chunks) == 2:
-                        try:
-                            assert_header_within_budget(
-                                b"".join(chunks), max_pixels=self.max_image_pixels
-                            )
-                        except UnsafeImageError:
-                            self.stats.inc_failed("image")
-                            return reject("image_too_large_pixels")
-                full_content = b"".join(chunks)
-                source_content_hash = hasher.hexdigest()
-            except Exception as read_err:
-                logger.warning(f"Image body read failed: {url[:55]}: {read_err}")
-                return fail(f"read_error: {read_err}")
-
-            if len(full_content) < self.min_file_size:
-                self.stats.inc_filtered("image")
-                return reject("file_too_small")
-
-            # Decode under the shared decompression-bomb and pixel budget.
-            try:
-                img = decode_image_bytes(
-                    full_content, max_pixels=self.max_image_pixels
-                )
-            except UnsafeImageError:
-                logger.debug(f"Image verification failed: {url[:55]}")
-                self.stats.inc_failed("image")
-                return reject("invalid_image")
-
-            # 尺寸过滤
-            if img.width < self.min_width or img.height < self.min_height:
-                self.stats.inc_filtered("image")
-                return reject("image_too_small")
-
-            # 低方差过滤
-            arr = np.array(img.resize((32, 32)))
-            if np.std(arr) < self.min_variance:
-                self.stats.inc_filtered("image")
-                return reject("low_variance")
-
-            # 内容去重
-            if not self._dedup.claim_content(full_content):
-                return reject("duplicate_content")
-            content_claimed = True
-
-            # CLIP 过滤（可选）
-            sim = 0.0
-            image_sim = None
-            if self.use_clip and self.model is not None:
-                text_feat = self._get_text_feature(keyword)
-                if text_feat is not None:
-                    try:
-                        img_feat = self._encode_image(img)
-                        sim = torch.nn.functional.cosine_similarity(
-                            img_feat, text_feat
-                        ).item()
-                        if sim < scene_semantic_threshold:
-                            self.stats.inc_filtered("image")
-                            self._emit_callback(CrawlEvent(
-                                event_type="item_filtered", keyword=keyword,
-                                media_type="image", url=url,
-                                detail={
-                                    "sim": round(sim, 4),
-                                    "threshold": scene_semantic_threshold,
-                                    "reason": "clip_low_sim",
-                                    "scene_profile": scene_profile.name if scene_profile else None,
-                                },
-                            ))
-                            return reject("clip_low_sim")
-                    except Exception as e:
-                        logger.debug(f"CLIP inference error: {e}")
-
-            # 以图搜图过滤：关键词/站点负责发现候选，查询图片负责视觉二次筛选。
-            if self._image_query_feature is not None:
-                try:
-                    image_sim = self._image_query_similarity(img)
-                    if image_sim is None:
-                        return reject("image_query_inference_error")
-                    if image_sim < self.image_similarity_threshold:
-                        self.stats.inc_filtered("image")
-                        self._emit_callback(CrawlEvent(
-                            event_type="item_filtered", keyword=keyword,
-                            media_type="image", url=url,
-                            detail={
-                                "image_sim": round(image_sim, 4),
-                                "image_similarity_threshold": self.image_similarity_threshold,
-                                "reason": "image_query_low_sim",
-                            },
-                        ))
-                        return reject("image_query_low_sim")
-                except Exception as e:
-                    logger.debug(f"Image query inference error: {e}")
-                    return reject("image_query_inference_error")
-
-            scene_quality_decision = self._evaluate_scene_quality(
-                scene_profile, img, sim
+            if materialized is None:
+                return False
+            session.commit_success()
+            self._record_saved(
+                url=url,
+                keyword=keyword,
+                admission=admission,
+                materialized=materialized,
             )
-            if scene_quality_decision is not None:
-                self._record_scene_quality_review(url, scene_quality_decision)
-                self._emit_callback(CrawlEvent(
-                    event_type="scene_quality_decision",
-                    keyword=keyword,
-                    media_type="image",
-                    url=url,
-                    detail=scene_quality_decision.to_dict(),
-                ))
-                if scene_quality_decision.action != "accept":
-                    return reject(
-                        "scene_quality_review"
-                        if scene_quality_decision.action == "review"
-                        else "scene_quality_reject"
-                    )
-
-            output_content, output_ext, output_format, format_conversion = (
-                self._prepare_output_image(img, full_content, ext)
-            )
-
-            # Reserve every quota immediately before materialization.  The
-            # reservation is released in finally on any failed commit.
-            if not self._scene_quotas.try_reserve(scene_key):
-                return reject("scene_target_reached")
-            scene_reserved = scene_key in self.scene_targets
-            if not self._source_quotas.try_reserve(source_quota_key):
-                return reject("source_quota_reached")
-            source_reserved = bool(source_quota_key)
-            if not self._domain_quotas.try_reserve(domain_quota_key):
-                return reject("domain_quota_reached")
-            domain_reserved = bool(domain_quota_key)
-
-            label_resolution = self.label_policy.resolve(
-                self._query_label_decisions(keyword)
-            )
-            content_hash = hashlib.sha256(output_content).hexdigest()
-            fingerprint = perceptual_fingerprint(img)
-            quality = QualityMetrics(
-                modality=Modality.IMAGE.value,
-                width=img.width,
-                height=img.height,
-                file_size=len(output_content),
-                format=output_format,
-                variance=float(np.var(arr)),
-                phash=fingerprint.phash,
-                validated=True,
-                attributes={
-                    "dhash": fingerprint.dhash,
-                    "scene_quality": scene_profile.to_dict() if scene_profile else None,
-                    "scene_semantic_threshold": scene_semantic_threshold,
-                    "scene_quality_gate": (
-                        scene_quality_decision.to_dict()
-                        if scene_quality_decision is not None
-                        else None
-                    ),
-                },
-            )
-
-            def build_records(
-                idx: int,
-                save_path: str,
-                relative_path: str,
-                final_hash: str,
-            ) -> tuple[SampleRecord, dict[str, Any]]:
-                sample = SampleRecord(
-                    sample_id=f"sha256:{final_hash}",
-                    file=relative_path,
-                    labels=label_resolution.labels,
-                    quality=quality,
-                    provenance=apply_compliance_to_provenance(
-                        {
-                            "source": source,
-                            "query": keyword,
-                            "url": url,
-                            "url_normalize_version": URL_NORMALIZE_VERSION,
-                            "clip_model": self.clip_model_name if self.use_clip else None,
-                        },
-                        self.config.compliance_policy(),
-                    ),
-                    pipeline={
-                        "job_id": self.job_id,
-                        "dataset_id": getattr(self, "_dataset_id", ""),
-                        "config_fingerprint": getattr(self, "_config_fingerprint", ""),
-                        "label_policy": self.label_policy.to_dict(),
-                        "format_conversion": format_conversion,
-                        "image_query": {
-                            "path": self.query_image,
-                            "similarity": round(image_sim, 4) if image_sim is not None else None,
-                            "threshold": self.image_similarity_threshold,
-                        } if self.query_image else None,
-                        "status": "accepted",
-                    },
-                    modalities=[ModalityAsset(
-                        modality=Modality.IMAGE,
-                        role="image",
-                        uri=relative_path,
-                        mime_type=(
-                            "image/jpeg"
-                            if output_ext == ".jpg"
-                            else f"image/{output_ext.lstrip('.') }"
-                        ),
-                    )],
-                    task_type="image_classification",
-                )
-                metadata = {
-                    "index": idx,
-                    "url": url,
-                    "file_path": save_path,
-                    "sha256": final_hash,
-                    "batch": Path(relative_path).parent.name,
-                    "keyword": keyword,
-                    "source": source,
-                    "sim": round(sim, 4),
-                    "image_sim": round(image_sim, 4) if image_sim is not None else None,
-                    "width": img.width,
-                    "height": img.height,
-                    "ext": output_ext,
-                    "source_ext": ext,
-                    "format_conversion": format_conversion,
-                    "labels": [item.to_dict() for item in label_resolution.labels],
-                    "label_candidates": [item.to_dict() for item in label_resolution.candidates],
-                    "quality": quality.to_dict(),
-                    "scene_quality_gate": (
-                        scene_quality_decision.to_dict()
-                        if scene_quality_decision is not None
-                        else None
-                    ),
-                }
-                return sample, metadata
-
-            if self._repository is not None:
-                commit = self._repository.commit_image(
-                    output_content,
-                    source_content=full_content,
-                    url=url,
-                    extension=output_ext,
-                    candidate_id=candidate_id,
-                    max_count=self.total_count,
-                    build_records=build_records,
-                    source_hash=source_content_hash,
-                )
-                if commit.status != "committed":
-                    return reject(
-                        "target_reached" if commit.status == "target_reached" else "duplicate_content"
-                    )
-                idx = int(commit.index or 0)
-                save_path = commit.path
-                sample = commit.sample
-                if sample is None:
-                    return fail("repository_commit_missing_sample")
-                self._dir_manager.record_repository_commit(idx)
-            else:
-                # 兼容无 SQLite 状态库的旧执行模式。
-                saved = self._dir_manager.save_content(
-                    url,
-                    output_ext,
-                    output_content,
-                    max_count=self.total_count,
-                )
-                if saved is None:
-                    return reject("target_reached")
-                idx, save_path = saved
-                relative_path = os.path.relpath(save_path, self.output_dir)
-                sample, metadata = build_records(
-                    idx, save_path, relative_path, content_hash
-                )
-                if candidate_id and self._state_store is not None:
-                    try:
-                        self._state_store.add_sample(
-                            self.job_id,
-                            sample,
-                            candidate_id=candidate_id,
-                            content_hash=content_hash,
-                        )
-                    except Exception as state_err:
-                        # 文件已经原子提交，状态库异常不能让样本被误报为下载失败。
-                        logger.warning(f"State store sample error: {state_err}")
-                self._manifest_writer.write(sample)
-                self._metadata_writer.write(metadata)
-
-            self._dedup.commit_content(full_content)
-            content_claimed = False
-            self._dedup.commit(url)
-            url_claimed = False
-            if scene_reserved:
-                self._scene_quotas.commit(scene_key)
-                scene_reserved = False
-            if source_reserved:
-                self._source_quotas.commit(source_quota_key)
-                source_reserved = False
-            if domain_reserved:
-                self._domain_quotas.commit(domain_quota_key)
-                domain_reserved = False
-
-            self.stats.inc_saved("image")
-            self._emit_callback(CrawlEvent(
-                event_type="item_saved", keyword=keyword,
-                media_type="image", url=url,
-                detail={
-                    "sim": round(sim, 4),
-                    "image_sim": round(image_sim, 4) if image_sim is not None else None,
-                    "file": save_path,
-                    "index": idx,
-                },
-            ))
-
-            if idx % 100 == 0 and idx > 0:
-                logger.info(f"已保存 {idx} 张图片 (目标: {self.total_count})")
-
             return True
-
         except Exception as e:
             logger.warning(f"Download error {url[:55]}: {e}")
             self.stats.inc_failed("image")
-            return fail(str(e))
+            return session.fail(str(e))
         finally:
-            if resp is not None:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-            if content_claimed and full_content is not None:
-                self._dedup.release_content(full_content)
-            if domain_reserved:
-                self._domain_quotas.release(domain_quota_key)
-            if source_reserved:
-                self._source_quotas.release(source_quota_key)
-            if scene_reserved:
-                self._scene_quotas.release(scene_key)
-            if url_claimed:
-                self._dedup.release(url)
-            if domain_slot is not None:
-                self._release_download_slot(domain_slot)
-            if candidate_slot_acquired:
-                self._release_candidate_slot()
+            session.close()
 
     # ──────────────────────────────────────────────────────────────
     # 搜索引擎爬取
@@ -1518,26 +1339,10 @@ class DatasetCrawler:
 
     def _ordered_search_engines(self) -> list[str]:
         """Prioritize engines with observed page success and candidate yield."""
-        names = list(self.search_engines)
-        snapshot = self.stats.summary().get("source_metrics", {})
-        if not snapshot:
-            return names
-        position = {name: index for index, name in enumerate(names)}
-
-        def key(name: str) -> tuple[int, float, float, int]:
-            row = snapshot.get(name)
-            if not row or not row.get("attempts"):
-                return (1, 0.0, 0.0, position[name])
-            attempts = max(int(row["attempts"]), 1)
-            yield_per_attempt = float(row.get("candidates", 0)) / attempts
-            return (
-                0,
-                -float(row.get("success_rate", 0.0)),
-                -yield_per_attempt,
-                position[name],
-            )
-
-        return sorted(names, key=key)
+        return order_search_engines(
+            self.search_engines,
+            self.stats.summary().get("source_metrics", {}),
+        )
 
     def _crawl_search_engines(self, keyword: str, pbar: tqdm) -> int:
         """通过搜索引擎爬取指定关键词的图片。
@@ -1548,70 +1353,49 @@ class DatasetCrawler:
         saved_before = self._dir_manager.saved_count
 
         for engine_name in self._ordered_search_engines():
-            if (
-                self._should_stop()
-                or self._dir_manager.saved_count >= self.total_count
-                or self._scene_target_reached(keyword)
-            ):
+            if self._collection_limit_reached(keyword):
                 break
 
             eng = get_engine(engine_name)
             if eng.media_type != MediaType.IMAGE:
                 continue
 
-            # 估算需要的页数
             remaining = self.total_count - self._dir_manager.saved_count
-            pages_needed = max(1, remaining // max(eng.page_step, 1) + 2)
-            pages_needed = min(pages_needed, 50)
-
+            pages_needed = estimate_pages_needed(remaining, eng.page_step)
             logger.info(f"[{engine_name}] keyword='{keyword}', pages={pages_needed}")
 
-            page_offsets = iter(range(0, pages_needed * eng.page_step, eng.page_step))
+            offsets = iter(page_offsets(eng.page_step, pages_needed))
             page_workers = min(self.max_workers, self.max_inflight_pages)
-            page_window = page_workers
             with ThreadPoolExecutor(max_workers=page_workers) as executor:
-                futures = set()
 
-                def submit_next_page() -> bool:
-                    if (
-                        self._should_stop()
-                        or self._dir_manager.saved_count >= self.total_count
-                        or self._scene_target_reached(keyword)
-                    ):
-                        return False
+                def spawn():
+                    if self._collection_limit_reached(keyword):
+                        return None
                     try:
-                        page_offset = next(page_offsets)
+                        page_offset = next(offsets)
                     except StopIteration:
-                        return False
+                        return None
                     url = eng.build_search_url(keyword, page_offset)
-                    futures.add(executor.submit(
+                    return executor.submit(
                         self._fetch_and_process_page, url, keyword, engine_name, pbar
-                    ))
-                    self._record_backpressure(in_flight_pages=len(futures))
-                    return True
+                    )
 
-                while len(futures) < page_window and submit_next_page():
-                    pass
-                while futures:
-                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
-                    futures.difference_update(done)
-                    for future in done:
-                        try:
-                            future.result()
-                        except Exception as exc:
-                            logger.debug(f"Page processing error: {exc}")
-                        submit_next_page()
-                    self._record_backpressure(in_flight_pages=len(futures))
+                drain_inflight_window(
+                    spawn,
+                    window=page_workers,
+                    on_error=lambda exc: logger.debug(
+                        f"Page processing error: {exc}"
+                    ),
+                    on_inflight=lambda n: self._record_backpressure(
+                        in_flight_pages=n
+                    ),
+                )
 
         return self._dir_manager.saved_count - saved_before
 
     def _fetch_and_process_page(self, url: str, keyword: str, engine_name: str, pbar: tqdm):
         """获取搜索结果页并处理其中的图片。"""
-        if (
-            self._should_stop()
-            or self._dir_manager.saved_count >= self.total_count
-            or self._scene_target_reached(keyword)
-        ):
+        if self._collection_limit_reached(keyword):
             return
 
         eng = get_engine(engine_name)
@@ -1626,32 +1410,19 @@ class DatasetCrawler:
             )
             return
 
-        items = eng.extract_items(html)
-        discovered_count = len(items)
-        # A malformed search page can advertise thousands of URLs.  Only keep
-        # one bounded candidate window; later pages remain available if the
-        # current window is filtered out.
-        if discovered_count > self.max_pending_candidates:
-            items = items[:self.max_pending_candidates]
+        raw_count, discovered = discover_page_images(
+            eng.extract_items(html),
+            keyword=keyword,
+            source=engine_name,
+            max_pending=self.max_pending_candidates,
+        )
         self.stats.observe_source(
             engine_name,
             success=True,
-            candidates=discovered_count,
+            candidates=raw_count,
             elapsed_ms=(time.monotonic() - fetch_started) * 1000,
         )
-        for item in items:
-            if (
-                self._should_stop()
-                or self._dir_manager.saved_count >= self.total_count
-                or self._scene_target_reached(keyword)
-            ):
-                break
-            img_url = item.get("url", "")
-            if not img_url:
-                continue
-            if self._download_and_save(img_url, keyword, engine_name):
-                with self._dir_manager._lock:
-                    pbar.update(1)
+        self._save_discovered_images(discovered, pbar)
 
     # ──────────────────────────────────────────────────────────────
     # 站点深度爬取
@@ -1675,20 +1446,7 @@ class DatasetCrawler:
             return 0
 
         # 使用 SiteCrawler 收集图片 URL
-        site_crawler = SiteCrawler(
-            site_parser=parser,
-            output_dir=os.path.join(self.output_dir, f"_site_tmp_{parser_name}"),
-            start_page=self._site_start_page,
-            end_page=self._site_end_page,
-            max_workers=self.max_workers,
-            min_width=self.min_width,
-            min_height=self.min_height,
-            timeout=self.timeout,
-            connect_timeout=self.connect_timeout,
-            read_timeout=self.read_timeout,
-            max_image_bytes=self.max_file_size,
-            max_image_pixels=self.max_image_pixels,
-        )
+        site_crawler = self._build_site_crawler(parser, parser_name)
 
         # 收集文章
         started = time.monotonic()
@@ -1712,16 +1470,17 @@ class DatasetCrawler:
         logger.info(f"[site:{parser_name}] collected {len(articles)} articles")
 
         for article in articles:
-            if self._should_stop() or self._dir_manager.saved_count >= self.total_count:
+            if self._collection_limit_reached():
                 break
-
-            image_urls = site_crawler.fetch_article_images(article)
-            for img_url in image_urls:
-                if self._should_stop() or self._dir_manager.saved_count >= self.total_count:
-                    break
-                if self._download_and_save(img_url, parser_name, f"site:{parser_name}"):
-                    with self._dir_manager._lock:
-                        pbar.update(1)
+            self._save_discovered_images(
+                urls_to_discovered(
+                    site_crawler.fetch_article_images(article),
+                    keyword=parser_name,
+                    source=f"site:{parser_name}",
+                ),
+                pbar,
+                check_scene=False,
+            )
 
         return self._dir_manager.saved_count - saved_before
 
@@ -1764,15 +1523,86 @@ class DatasetCrawler:
         )
         logger.info(f"[spider_tools] collected {len(urls)} URLs from {self._st_sites}")
 
-        for u in urls:
-            if self._should_stop() or self._dir_manager.saved_count >= self.total_count:
-                break
-            keyword = u.tags[0] if u.tags else (self._st_tags or self._st_query or "")
-            if self._download_and_save(u.url, keyword, f"st:{u.site}"):
-                with self._dir_manager._lock:
-                    pbar.update(1)
+        self._save_discovered_images(
+            spider_tools_to_discovered(
+                urls,
+                default_keyword=self._st_tags or self._st_query or "",
+            ),
+            pbar,
+            check_scene=False,
+        )
 
         return self._dir_manager.saved_count - saved_before
+
+    def _build_site_crawler(self, parser, parser_name: str) -> SiteCrawler:
+        return SiteCrawler(
+            site_parser=parser,
+            **site_crawler_kwargs(
+                parser_name=parser_name,
+                output_dir=self.output_dir,
+                start_page=self._site_start_page,
+                end_page=self._site_end_page,
+                max_workers=self.max_workers,
+                min_width=self.min_width,
+                min_height=self.min_height,
+                timeout=self.timeout,
+                connect_timeout=self.connect_timeout,
+                read_timeout=self.read_timeout,
+                max_image_bytes=self.max_file_size,
+                max_image_pixels=self.max_image_pixels,
+            ),
+        )
+
+    def _log_crawl_start(self, already_saved: int, remaining: int) -> None:
+        logger.info(
+            f"数据集爬取开始: 目标={self.total_count}, 已有={already_saved}, "
+            f"剩余={remaining}, 关键词={self.keywords}"
+        )
+        logger.info(f"搜索引擎: {self.search_engines}")
+        logger.info(f"站点: {self._site_parsers}")
+        logger.info(f"CLIP过滤: {'启用' if self.use_clip else '禁用'}")
+        logger.info(f"分桶大小: {self.batch_size}")
+
+    def _run_keyword_sources(self, pbar: tqdm) -> None:
+        done = list(self._progress.keywords_done)
+        for keyword in remaining_keywords(self.keywords, done):
+            if self._collection_limit_reached():
+                break
+            logger.info(
+                f"开始爬取关键词: '{keyword}' "
+                f"(进度: {self._dir_manager.saved_count}/{self.total_count})"
+            )
+            self._crawl_search_engines(keyword, pbar)
+            done.append(keyword)
+            self._progress.save(
+                **keyword_progress_snapshot(
+                    keywords=self.keywords,
+                    done=done,
+                    saved_count=self._dir_manager.saved_count,
+                    total_target=self.total_count,
+                )
+            )
+
+    def _run_site_sources(self, pbar: tqdm) -> None:
+        for parser_name in self._site_parsers:
+            if self._collection_limit_reached():
+                break
+            logger.info(
+                f"开始站点爬取: '{parser_name}' "
+                f"(进度: {self._dir_manager.saved_count}/{self.total_count})"
+            )
+            self._crawl_site(parser_name, pbar)
+
+    def _run_spider_tools_source(self, pbar: tqdm) -> None:
+        if self._st_sites:
+            self._crawl_spider_tools(pbar)
+
+    def _finish_job(self):
+        if self._state_store is not None:
+            self._lease_recoveries += int(
+                self._state_store.recover_expired_leases(self.job_id)
+            )
+        return self._generate_report()
 
     # ──────────────────────────────────────────────────────────────
     # 主入口
@@ -1800,105 +1630,84 @@ class DatasetCrawler:
         """执行数据集爬取任务。"""
         try:
             self.stats.start_time = time.monotonic()
-
-            # 计算剩余数量
             already_saved = self._dir_manager.saved_count
-            remaining = self.total_count - already_saved
+            remaining = remaining_quota(already_saved, self.total_count)
             if remaining <= 0:
                 logger.info(f"已达到目标数量 {self.total_count}，无需继续爬取")
-                return
+                return self._generate_report()
 
-            logger.info(f"数据集爬取开始: 目标={self.total_count}, 已有={already_saved}, "
-                       f"剩余={remaining}, 关键词={self.keywords}")
-            logger.info(f"搜索引擎: {self.search_engines}")
-            logger.info(f"站点: {self._site_parsers}")
-            logger.info(f"CLIP过滤: {'启用' if self.use_clip else '禁用'}")
-            logger.info(f"分桶大小: {self.batch_size}")
-
-            keywords_done = list(self._progress.keywords_done)
-            keywords_remaining = [kw for kw in self.keywords if kw not in keywords_done]
-
-            with tqdm(total=self.total_count, initial=already_saved,
-                     desc="DatasetCrawler") as pbar:
-
-                # 1. 搜索引擎爬取
-                for keyword in keywords_remaining:
-                    if self._should_stop() or self._dir_manager.saved_count >= self.total_count:
-                        break
-
-                    logger.info(f"开始爬取关键词: '{keyword}' "
-                               f"(进度: {self._dir_manager.saved_count}/{self.total_count})")
-                    self._crawl_search_engines(keyword, pbar)
-                    keywords_done.append(keyword)
-
-                    # 定期保存进度
-                    self._progress.save(
-                        saved_count=self._dir_manager.saved_count,
-                        total_target=self.total_count,
-                        keywords_done=keywords_done,
-                        keywords_remaining=[kw for kw in self.keywords if kw not in keywords_done],
-                    )
-
-                # 2. 站点深度爬取
-                for parser_name in self._site_parsers:
-                    if self._should_stop() or self._dir_manager.saved_count >= self.total_count:
-                        break
-
-                    logger.info(f"开始站点爬取: '{parser_name}' "
-                               f"(进度: {self._dir_manager.saved_count}/{self.total_count})")
-                    self._crawl_site(parser_name, pbar)
-
-                # 3. spider_tools 站点爬取
-                if self._st_sites:
-                    self._crawl_spider_tools(pbar)
-
-            # 生成报告
-            if self._state_store is not None:
-                self._lease_recoveries += int(
-                    self._state_store.recover_expired_leases(self.job_id)
-                )
-            self._generate_report()
-
+            self._log_crawl_start(already_saved, remaining)
+            with tqdm(
+                total=self.total_count,
+                initial=already_saved,
+                desc="DatasetCrawler",
+            ) as pbar:
+                self._run_keyword_sources(pbar)
+                self._run_site_sources(pbar)
+                self._run_spider_tools_source(pbar)
+            return self._finish_job()
         finally:
-            # 清理资源
             self.close()
             signal.signal(signal.SIGINT, self._original_sigint)
             signal.signal(signal.SIGTERM, self._original_sigterm)
 
+    def _collect_job_report_stats(self) -> dict[str, Any]:
+        db_stats = None
+        db_stats_error = None
+        if self._state_store is not None:
+            try:
+                db_stats = self._state_store.collect_stats()
+            except Exception as exc:
+                db_stats_error = str(exc)
+        return merge_dataset_crawl_stats(
+            self.stats.summary(),
+            total_target=self.total_count,
+            keywords=self.keywords,
+            search_engines=self.search_engines,
+            site_parsers=self._site_parsers,
+            use_clip=self.use_clip,
+            image_output_format=self.image_output_format,
+            jpeg_quality=self.jpeg_quality,
+            max_file_size=self.max_file_size,
+            scene_targets=self._scene_quotas.snapshot(),
+            scene_quality_gate={
+                "enabled": self.scene_quality_gate_enabled,
+                "review_queue_path": self.scene_review_queue_path,
+                "decisions": dict(self._scene_quality_stats),
+            },
+            source_quotas=self._source_quotas.snapshot(),
+            domain_quotas=self._domain_quotas.snapshot(),
+            batch_size=self.batch_size,
+            batches=self._dir_manager.list_batches(),
+            shutdown=self._shutdown_requested.is_set(),
+            http_metrics=self._http.metrics.snapshot(),
+            lease_recoveries=int(self._lease_recoveries),
+            repository_recovery=(
+                dict(self._repository.recovery_report)
+                if self._repository is not None
+                else None
+            ),
+            db_stats=db_stats,
+            db_stats_error=db_stats_error,
+        )
+
+    def _persist_job_report(self, report: dict[str, Any]) -> None:
+        try:
+            report_path = write_dataset_report_json(report, self.output_dir)
+            logger.info(f"Dataset report saved to {report_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save report: {e}")
+        logger.info(f"数据集爬取完成! 共保存 {self._dir_manager.saved_count} 张图片")
+        logger.info(f"分桶目录: {self._dir_manager.list_batches()}")
+        logger.info(f"统计: {json.dumps(report, ensure_ascii=False)}")
+
     def _generate_report(self):
         """生成数据集采集报告。"""
         self.stats.end_time = time.monotonic()
-        report = self.stats.summary()
-        report["total_target"] = self.total_count
-        report["keywords"] = self.keywords
-        report["search_engines"] = self.search_engines
-        report["site_parsers"] = self._site_parsers
-        report["use_clip"] = self.use_clip
-        report["image_output_format"] = self.image_output_format or "original"
-        report["jpeg_quality"] = self.jpeg_quality
-        report["max_file_size"] = self.max_file_size
-        report["scene_targets"] = self._scene_quotas.snapshot()
-        report["scene_quality_gate"] = {
-            "enabled": self.scene_quality_gate_enabled,
-            "review_queue_path": self.scene_review_queue_path,
-            "decisions": dict(self._scene_quality_stats),
-        }
-        report["source_quotas"] = self._source_quotas.snapshot()
-        report["domain_quotas"] = self._domain_quotas.snapshot()
-        report["batch_size"] = self.batch_size
-        report["batches"] = self._dir_manager.list_batches()
-        report["shutdown"] = self._shutdown_requested.is_set()
-        report["http_metrics"] = self._http.metrics.snapshot()
-        if self._repository is not None:
-            report["repository_recovery"] = dict(self._repository.recovery_report)
-        report["lease_recoveries"] = int(self._lease_recoveries)
-        if self._state_store is not None:
-            try:
-                report["db_stats"] = self._state_store.collect_stats()
-            except Exception as exc:
-                report["db_stats_error"] = str(exc)
-
-        lineage = build_lineage(
+        report = self._collect_job_report_stats()
+        policy = self.config.compliance_policy()
+        attach_dataset_lineage(
+            report,
             job_id=self.job_id,
             output_dir=self.output_dir,
             config_snapshot=getattr(self, "_config_snapshot", {}),
@@ -1906,56 +1715,21 @@ class DatasetCrawler:
             extra_provenance={
                 "saved_count": self._dir_manager.saved_count,
                 "scene_quality_gate_enabled": self.scene_quality_gate_enabled,
-                "compliance": self.config.compliance_policy().to_dict(),
+                "compliance": policy.to_dict(),
             },
         )
-        try:
-            published = publish_dataset_artifacts(self.output_dir, lineage)
-            report["lineage"] = published["lineage"]
-            report["manifest_checksum"] = published["checksum"]
-        except Exception as exc:
-            report["lineage_error"] = str(exc)
-
-        policy = self.config.compliance_policy()
-        report["compliance"] = policy.to_dict()
-        try:
-            checklist = build_publish_checklist(
-                job_id=self.job_id,
-                policy=policy,
-                route_counts={},
-                block_kinds={},
-            )
-            report["publish_checklist_path"] = write_publish_checklist(
-                self.output_dir, checklist
-            )
-            unified = UnifiedReport.from_dataset_report(
-                report,
-                job_id=self.job_id,
-                config_snapshot=getattr(self, "_config_snapshot", {}),
-            )
-            unified.extras["compliance"] = policy.to_dict()
-            unified.extras["publish_checklist_path"] = report.get("publish_checklist_path")
-            unified_path = os.path.join(self.output_dir, "unified_report.json")
-            with open(unified_path, "w", encoding="utf-8") as handle:
-                json.dump(unified.to_dict(), handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-            report["unified_report_path"] = unified_path
-        except Exception as exc:
-            report["compliance_report_error"] = str(exc)
-
-        report_path = os.path.join(self.output_dir, "_dataset_report.json")
-        try:
-            with open(report_path, "w", encoding="utf-8") as f:
-                json.dump(report, f, ensure_ascii=False, indent=2)
-            logger.info(f"Dataset report saved to {report_path}")
-        except Exception as e:
-            logger.warning(f"Failed to save report: {e}")
-
-        logger.info(f"数据集爬取完成! 共保存 {self._dir_manager.saved_count} 张图片")
-        logger.info(f"分桶目录: {self._dir_manager.list_batches()}")
-        logger.info(f"统计: {json.dumps(report, ensure_ascii=False)}")
-
+        checklist = attach_dataset_publish_bundle(
+            report,
+            job_id=self.job_id,
+            output_dir=self.output_dir,
+            policy=policy,
+            config_snapshot=getattr(self, "_config_snapshot", {}),
+        )
+        if checklist is not None:
+            self.last_publish_checklist = checklist
+        self._persist_job_report(report)
         self._emit_callback(CrawlEvent(
             event_type="crawl_done", keyword="",
             media_type="image", detail=report,
         ))
+        return report

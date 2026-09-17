@@ -796,6 +796,19 @@ class PersistentBrowserSession:
             logger.error(f"Navigate error for {url[:60]}: {e}")
             return ""
 
+    async def _wait_for_selector_async(
+        self, selector: str, timeout_ms: int = 10_000
+    ) -> tuple[bool, str]:
+        if self._page is None:
+            return False, ""
+        try:
+            await self._page.wait_for_selector(selector, timeout=int(timeout_ms))
+            html = await self._page.content()
+            return True, html
+        except Exception as e:
+            logger.error(f"wait_for_selector error for {selector}: {e}")
+            return False, ""
+
     async def _click_async(self, selector: str) -> tuple[bool, str]:
         """点击元素，返回 (成功与否, 更新后的HTML)。"""
         if self._page is None:
@@ -894,6 +907,16 @@ class PersistentBrowserSession:
             self._navigate_async(url, wait_for=wait_for), self._loop,
         )
         return future.result(timeout=self._page_timeout / 1000 + 10)
+
+    def wait_for_selector(
+        self, selector: str, timeout_ms: int = 10_000
+    ) -> tuple[bool, str]:
+        """Wait until selector is visible; return (ok, html)."""
+        future = asyncio.run_coroutine_threadsafe(
+            self._wait_for_selector_async(selector, timeout_ms=timeout_ms),
+            self._loop,
+        )
+        return future.result(timeout=max(self._page_timeout / 1000 + 10, timeout_ms / 1000 + 5))
 
     def click(self, selector: str) -> tuple[bool, str]:
         """点击元素，返回 (成功与否, 更新后的HTML)。"""

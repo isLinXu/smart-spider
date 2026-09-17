@@ -116,6 +116,27 @@ class BrowserController:
 
     # ── 交互操作（返回更新后的 HTML）──────────────────────────────
 
+    def wait_for_selector(
+        self, selector: str, timeout_ms: int = 10_000
+    ) -> tuple[bool, str]:
+        """Wait for a CSS selector, returning (success, html)."""
+        if self._mode == "session":
+            success, html = self._session.wait_for_selector(
+                selector, timeout_ms=timeout_ms
+            )
+        else:
+            waiter = getattr(self._renderer, "wait_for_selector", None)
+            if waiter is None:
+                return False, self.current_html
+            result = waiter(selector, timeout_ms=timeout_ms)
+            if isinstance(result, tuple):
+                success, html = result[0], result[1] if len(result) > 1 else self.current_html
+            else:
+                success, html = bool(result), self.current_html
+        if success and html:
+            self.current_html = html
+        return success, html or self.current_html
+
     def click(self, selector: str) -> tuple[bool, str]:
         """点击指定选择器的元素。
 

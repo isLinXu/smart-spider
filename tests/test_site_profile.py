@@ -92,6 +92,7 @@ def test_run_profile_once_with_fake_controller():
             "scroll_passes": 0,
             "respect_robots": False,
             "requests_per_second": 1000,
+            "max_depth": 0,
         }
     )
 
@@ -161,3 +162,85 @@ def test_browse_cli_enqueue(tmp_path, capsys):
     assert len(out["task_ids"]) == 1
     queue = LocalSqliteTaskQueue(queue_path)
     assert queue.get(out["task_ids"][0]).kind == "authorized_browse"
+
+
+def test_browse_retry_dead_by_block_kind(tmp_path):
+    from smart_spider.browse_cli import retry_dead_tasks
+
+    queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"))
+    challenge = queue.enqueue("authorized_browse", {"url": "https://example.com/a"})
+    other = queue.enqueue("authorized_browse", {"url": "https://example.com/b"})
+    queue.complete(challenge.task_id, error="block:challenge:challenge_page", terminal=True)
+    queue.complete(other.task_id, error="block:forbidden:policy_denied_seed", terminal=True)
+    ids = retry_dead_tasks(queue=queue, block_kind="challenge")
+    assert ids == [challenge.task_id]
+    assert queue.get(challenge.task_id).status == "pending"
+    assert queue.get(other.task_id).status == "dead"
+
+
+def test_browse_cli_once_writes_unified_report(tmp_path, capsys, monkeypatch):
+    path = tmp_path / "site.json"
+    path.write_text(
+        json.dumps(
+            {
+                "name": "demo",
+                "seed_urls": ["https://example.com/"],
+                "allow_hosts": ["example.com"],
+                "action_delay_seconds": 0,
+                "scroll_passes": 0,
+                "respect_robots": False,
+                "requests_per_second": 1000,
+                "max_depth": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeController:
+        current_url = "https://example.com/"
+
+        def __init__(self, **kwargs):
+            pass
+
+        def navigate(self, url):
+            self.current_url = url
+            return (
+                "<html><body><a href='/next'>n</a>"
+                "<p>ok page content here</p></body></html>"
+            )
+
+        def scroll(self):
+            return True, self.navigate(self.current_url)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "smart_spider.browser_controller.BrowserController", FakeController
+    )
+    output_dir = tmp_path / "browse-out"
+    code = browse_main(
+        [
+            "--profile",
+            str(path),
+            "--once",
+            "--no-bfs",
+            "--output",
+            str(output_dir),
+            "--allow-unready",
+        ]
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert out["mode"] == "once"
+    report_path = output_dir / "unified_report.json"
+    assert report_path.is_file()
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["track"] == "browse"
+    assert payload["stage_stats"]["pages"] == 1
+    assert out["unified_report_path"] == str(report_path)
+    assert out["summary"]["pages"] == 1
+    assert out["summary"]["routes"][0]["seed"] == "https://example.com/"
+    assert "browse:" in captured.err
+    assert "https://example.com/" in captured.err

@@ -25,7 +25,7 @@ import argparse
 from smart_spider import SmartSpider
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="SmartSpider - 多模态智能爬虫（CLIP + 反爬 + Playwright + 站点深度爬取）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -124,7 +124,7 @@ def main():
     g_adv.add_argument("--check_engines", action="store_true",
                        help="仅运行引擎健康检查，不执行采集。输出各引擎可用性和延迟")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # 列出可用站点解析器
     if args.list_sites:
@@ -214,6 +214,7 @@ def main():
         video_concurrency=args.video_concurrency,
     )
     spider.download()
+    return 0
 
 
 if __name__ == "__main__":

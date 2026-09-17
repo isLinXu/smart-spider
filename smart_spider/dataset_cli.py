@@ -32,6 +32,7 @@ python -m smart_spider.dataset_cli --keywords "flower" --total 2000 --batch-size
 python -m smart_spider.dataset_cli --keywords "cat" --total 1000 --proxy http://127.0.0.1:7890 --output ./dataset_cats
 """
 import argparse
+import sys
 from typing import Optional
 
 
@@ -72,6 +73,11 @@ def main(argv: Optional[list[str]] = None):
     parser.add_argument(
         "--dump-config", type=str, default=None,
         help="将合并后的配置写出到路径后退出（yaml/json）",
+    )
+    parser.add_argument(
+        "--allow-unready",
+        action="store_true",
+        help="publish_checklist.ready=false 时仍返回退出码 0",
     )
     parser.add_argument(
         "--keywords", "-k", type=str, required=False, default=None,
@@ -416,10 +422,22 @@ def main(argv: Optional[list[str]] = None):
             dump_mapping(config.to_dict(), args.dump_config)
         except ConfigIOError as exc:
             parser.error(str(exc))
-        return
+        return 0
 
     crawler = DatasetCrawler.from_config(config)
     crawler.crawl()
+    from .compliance import checklist_exit_code
+
+    code = checklist_exit_code(
+        getattr(crawler, "last_publish_checklist", None),
+        allow_unready=args.allow_unready,
+    )
+    if code:
+        print(
+            "publish_checklist.ready is false; pass --allow-unready to ignore",
+            file=sys.stderr,
+        )
+    return code
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 from .compliance import CompliancePolicy
 from .config_io import load_mapping
+from .browser_playbook import PlaybookStep, parse_playbook_steps
 from .site_policy import SiteCrawlPolicy, host_of
 
 
@@ -46,6 +47,7 @@ class SiteProfile:
     enqueue_links: bool = True
     max_attempts: int = 3
     description: str = ""
+    steps: tuple[PlaybookStep, ...] = ()
 
     def __post_init__(self) -> None:
         self.name = str(self.name or "").strip()
@@ -57,6 +59,7 @@ class SiteProfile:
             raise ValueError("max_attempts must be positive")
         if not isinstance(self.policy, SiteCrawlPolicy):
             raise TypeError("policy must be SiteCrawlPolicy")
+        object.__setattr__(self, "steps", parse_playbook_steps(self.steps))
         # If allow_hosts empty but seeds present, default allow seed hosts.
         if not self.policy.allow_hosts and seeds:
             hosts = tuple(sorted({host_of(url) for url in seeds if host_of(url)}))
@@ -89,6 +92,7 @@ class SiteProfile:
             "headless": self.headless,
             "enqueue_links": self.enqueue_links,
             "max_attempts": self.max_attempts,
+            "steps": [step.to_dict() for step in self.steps],
         }
 
     def resolve_seeds(self, extra_urls: Optional[Sequence[str]] = None) -> list[str]:
@@ -133,6 +137,7 @@ class SiteProfile:
             "profile": self.name,
             "license": self.license,
             "source_terms": self.source_terms,
+            "steps": [step.to_dict() for step in self.steps],
         }
 
     @classmethod
@@ -165,6 +170,7 @@ class SiteProfile:
             enqueue_links=bool(data.get("enqueue_links", True)),
             max_attempts=int(data.get("max_attempts") or 3),
             description=str(data.get("description") or ""),
+            steps=parse_playbook_steps(data.get("steps") or ()),
         )
 
 

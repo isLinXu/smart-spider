@@ -221,3 +221,13 @@ def test_get_task_queue_redis_accepts_client():
     assert isinstance(queue, RedisTaskQueue)
     record = queue.enqueue("dataset_crawl", {"x": 1})
     assert queue.get(record.task_id).status == "pending"
+
+
+def test_redis_claim_without_kind_sees_browse():
+    client = FakeRedis()
+    queue = RedisTaskQueue(client=client, prefix="mix")
+    browse = queue.enqueue("authorized_browse", {"url": "https://example.com"})
+    claimed = queue.claim()
+    assert claimed is not None
+    assert claimed.task_id == browse.task_id
+    assert claimed.kind == "authorized_browse"

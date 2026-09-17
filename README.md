@@ -34,6 +34,21 @@ pip install -e ".[browser]"
 playwright install chromium
 ```
 
+## 统一 CLI
+
+安装后主入口是 `smart-spider <subcommand>`。旧的 `smart-spider-*` 脚本、`python spider.py` 和 `python -m smart_spider.*` 仍然可用。
+
+```bash
+smart-spider --help
+smart-spider crawl --keywords 猫咪 --max_items 100
+smart-spider dataset --keywords "cat" --total 1000 --output ./dataset_cats
+smart-spider browse --profile ./site.yaml --once
+smart-spider worker --once          # 默认领取队列中任意 kind
+smart-spider worker --kind dataset_crawl --once
+```
+
+`browse --once` 会写出 `unified_report.json` 与 publish checklist；checklist 未就绪时退出码为 2，可加 `--allow-unready`。
+
 ## 快速开始
 
 ```bash
@@ -504,3 +519,16 @@ python -m smart_spider.douyin_cli --keyword 三角洲行动 --max-items 10 \
 
 该模式自动显示浏览器；验证期间继续处理页面事件，关闭浏览器或终端输入结束会报错，
 不会被当作已经完成验证。
+
+### 小红书独立关键词采集
+
+采集搜索结果封面（不是笔记完整相册），使用专用 Chrome 登录目录，图片经过解码校验与内容去重。
+
+```bash
+python -m smart_spider.xiaohongshu_cli --keyword "高颜值 妹子照片" \
+  --max-items 50 --output output_xiaohongshu_portraits_50 --wait-for-login
+```
+
+在弹出的专用 Chrome 完成登录后，在运行命令的终端按回车继续。默认登录目录为 `.artifacts/xiaohongshu-profile`，仅保存在本地；后续运行可省略 `--wait-for-login`，也可添加 `--headless` 测试无窗口采集。不要同时使用同一登录目录运行多个任务。
+
+安装项目后也可以运行 `smart-spider-xiaohongshu`。输出 `results.json` 包含图片来源、尺寸、SHA-256 和失败数量。只有达到指定的不重复图片数量才返回成功；搜索耗尽、登录失效或失败时返回非零退出码，并保留已下载图片及报告。已有内容相同的文件不会重复写入。此入口独立于通用引擎中旧的小红书页面解析器。
