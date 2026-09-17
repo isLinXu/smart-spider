@@ -333,7 +333,7 @@ def integrate_with_dataset_crawler(
 
     saved = 0
     for u in urls:
-        if crawler._should_stop() or crawler._dir_manager.saved_count >= crawler.total_count:
+        if crawler._collection_limit_reached():
             break
         if crawler._download_and_save(u.url, u.tags[0] if u.tags else "", f"st:{u.site}"):
             saved += 1
