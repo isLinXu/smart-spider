@@ -19,6 +19,12 @@ max_depth: 1
 max_links_per_page: 20
 scroll_passes: 1
 prefer_browser: true
+# Declarative same-page steps (S18). Selectors must be provided by the operator.
+# steps:
+#   - action: wait_for
+#     selector: "a.more"
+#   - action: click
+#     selector: "a.more"
 # storage_state_path: ./runtime/example_storage_state.json
 # session_cookies_path: ./runtime/example_cookies.json
 enqueue_links: true
