@@ -91,8 +91,9 @@ class TaskQueue(Protocol):
         kind: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
+        block_kind: Optional[str] = None,
     ) -> Sequence[TaskRecord]:
-        """列出任务（最新更新优先）。"""
+        """列出任务（最新更新优先）。``block_kind`` 匹配 ``error`` 中的 ``block:<kind>:``。"""
 
     def recover_expired_claims(self, *, now: Optional[float] = None) -> int:
         """回收超时 running：可重试则回 pending，否则进 dead。"""

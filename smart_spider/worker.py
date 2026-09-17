@@ -1,10 +1,11 @@
 # coding=utf-8
-"""任务队列 worker：claim → DatasetCrawler.from_config → complete。
+"""任务队列 worker：claim → 执行 dataset_crawl / authorized_browse → complete。
 
 用法::
 
     smart-spider-api &
-    smart-spider-worker --once
+    smart-spider worker --once
+    smart-spider worker --kind dataset_crawl --once
     smart-spider-worker --workers 2
     SMART_SPIDER_QUEUE_BACKEND=redis smart-spider-worker
 """
@@ -66,7 +67,11 @@ def _handle_authorized_browse(task, queue: Optional[TaskQueue]) -> dict:
         allow_private_hosts=policy.allow_private_hosts,
     )
     try:
-        playbook = AuthorizedBrowsePlaybook(controller, policy)
+        playbook = AuthorizedBrowsePlaybook(
+            controller,
+            policy,
+            steps=task.payload.get("steps") or (),
+        )
         result = playbook.run(url, depth=depth)
     finally:
         controller.close()
@@ -84,6 +89,12 @@ def _handle_authorized_browse(task, queue: Optional[TaskQueue]) -> dict:
             result.links,
             policy=policy,
             max_attempts=int(task.payload.get("max_attempts") or task.max_attempts or 3),
+            extra_payload={
+                "enqueue_links": enqueue_links,
+                "headless": bool(task.payload.get("headless", True)),
+                "steps": task.payload.get("steps") or [],
+                "profile": task.payload.get("profile") or "",
+            },
         )
     logger.info(
         "authorized_browse task={} url={} links={} enqueued={}",
@@ -109,7 +120,7 @@ class BrowseBlockError(RuntimeError):
 def run_worker(
     queue: TaskQueue,
     *,
-    kind: Optional[str] = "dataset_crawl",
+    kind: Optional[str] = None,
     poll_interval: float = 2.0,
     once: bool = False,
     lease_seconds: float = 300.0,
@@ -230,7 +241,7 @@ def run_worker_pool(
     backend: str = "sqlite",
     queue_kwargs: Optional[dict] = None,
     workers: int = 1,
-    kind: Optional[str] = "dataset_crawl",
+    kind: Optional[str] = None,
     poll_interval: float = 2.0,
     once: bool = False,
     lease_seconds: float = 300.0,
@@ -302,7 +313,7 @@ def run_worker_pool(
 
 
 def main(argv: Optional[list[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="smart-spider dataset job worker")
+    parser = argparse.ArgumentParser(description="smart-spider queue worker")
     parser.add_argument(
         "--backend",
         default=os.environ.get("SMART_SPIDER_QUEUE_BACKEND", "sqlite"),
@@ -322,7 +333,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         default=os.environ.get("SMART_SPIDER_REDIS_URL"),
         help="Redis URL（backend=redis）",
     )
-    parser.add_argument("--kind", default="dataset_crawl", help="领取的任务类型")
+    parser.add_argument(
+        "--kind",
+        default="",
+        help="领取的任务类型；留空则领取队列中任意 kind（dataset_crawl / authorized_browse 等）",
+    )
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--lease-seconds", type=float, default=300.0)
     parser.add_argument("--workers", type=int, default=1, help="进程数（>1 启用多进程）")

@@ -135,12 +135,17 @@ def create_app(
     def list_jobs(
         status: Optional[str] = None,
         kind: Optional[str] = None,
+        block_kind: Optional[str] = None,
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
     ) -> Dict[str, Any]:
         try:
             records = queue.list_tasks(
-                status=status, kind=kind, limit=limit, offset=offset
+                status=status,
+                kind=kind,
+                limit=limit,
+                offset=offset,
+                block_kind=block_kind,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

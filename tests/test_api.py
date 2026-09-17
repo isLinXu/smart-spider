@@ -114,6 +114,20 @@ def test_api_submit_browse_job(tmp_path):
     assert body["kind"] == "authorized_browse"
     assert body["payload"]["url"] == "https://example.com/start"
 
+    dead = queue.enqueue(
+        "authorized_browse",
+        {"url": "https://example.com/login"},
+    )
+    queue.complete(dead.task_id, error="block:challenge:challenge_page", terminal=True)
+    filtered = client.get(
+        "/v1/jobs",
+        params={"kind": "authorized_browse", "status": "dead", "block_kind": "challenge"},
+    )
+    assert filtered.status_code == 200
+    assert filtered.json()["count"] == 1
+    retried = client.post(f"/v1/jobs/{dead.task_id}/retry", params={"reset_attempts": True})
+    assert retried.json()["status"] == "pending"
+
 
 def test_api_metrics_endpoint(tmp_path):
     queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"))

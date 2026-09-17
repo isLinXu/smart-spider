@@ -145,8 +145,6 @@ class RedisTaskQueue:
             kinds = [kind]
         else:
             kinds = sorted(self._client.smembers(self._key("kinds")) or [])
-            if not kinds:
-                kinds = ["dataset_crawl"]
         for item_kind in kinds:
             task_id = self._client.rpop(self._key("pending", item_kind))
             if not task_id:
@@ -200,6 +198,7 @@ class RedisTaskQueue:
         kind: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
+        block_kind: Optional[str] = None,
     ) -> Sequence[TaskRecord]:
         if limit <= 0:
             raise ValueError("limit must be positive")
@@ -210,6 +209,7 @@ class RedisTaskQueue:
         # Fetch a window from the updated_at index then filter.
         ids = self._client.zrevrange(self._key("index"), 0, offset + limit + 200)
         records: list[TaskRecord] = []
+        prefix = f"block:{block_kind}:" if block_kind else ""
         for task_id in ids:
             record = self._load(task_id)
             if record is None:
@@ -217,6 +217,8 @@ class RedisTaskQueue:
             if status and record.status != status:
                 continue
             if kind and record.kind != kind:
+                continue
+            if prefix and not str(record.error or "").startswith(prefix):
                 continue
             records.append(record)
         return records[offset : offset + limit]
