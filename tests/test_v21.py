@@ -248,7 +248,7 @@ class TestExistingFeaturesRegression:
         from smart_spider.engines import ENGINE_REGISTRY
         expected = {"baidu", "bing", "sogou", "360", "google", "weibo",
                     "bilibili", "bing_video", "baidu_text", "bing_text",
-                    "weixin", "xiaohongshu"}
+                    "weixin", "xiaohongshu", "douyin"}
         assert set(ENGINE_REGISTRY.keys()) == expected
 
     def test_media_type_enum(self):

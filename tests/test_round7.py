@@ -365,50 +365,32 @@ class TestFix19BytesIOSeekInsteadOfReopen:
 class TestFix20AntiCrawlResponseBodyDrained:
     """验证 SmartHttpClient.get 遇到 429/403/503 时消费响应体后 close。"""
 
-    def test_response_body_drained_on_429(self):
-        """429 响应体应被消费后 close，而非直接 continue。"""
-        import inspect
+    @pytest.mark.parametrize("status", [429, 403, 503])
+    def test_retryable_response_is_drained_and_closed(self, status, monkeypatch):
+        import requests
         from smart_spider.http_client import SmartHttpClient
-        src = inspect.getsource(SmartHttpClient.get)
 
-        # 找到 429/403/503 处理区域
-        anti_crawl_idx = src.find("429, 403, 503")
-        assert anti_crawl_idx != -1, "Anti-crawl status codes check not found"
+        events = []
 
-        after_check = src[anti_crawl_idx:]
+        class Response:
+            status_code = status
+            headers = {}
 
-        # 应有 iter_content 消费响应体
-        assert "iter_content" in after_check[:500], (
-            "Anti-crawl response body should be drained via iter_content "
-            "before retry to prevent connection pool exhaustion"
-        )
+            def iter_content(self, chunk_size):
+                events.append("drain")
+                yield b"retry response"
 
-    def test_response_closed_on_429(self):
-        """429 响应应被 close。"""
-        import inspect
-        from smart_spider.http_client import SmartHttpClient
-        src = inspect.getsource(SmartHttpClient.get)
+            def close(self):
+                events.append("close")
 
-        anti_crawl_idx = src.find("429, 403, 503")
-        after_check = src[anti_crawl_idx:]
+        client = SmartHttpClient(max_retries=0)
+        monkeypatch.setattr(client._rate_limiter, "acquire", lambda: None)
+        monkeypatch.setattr(client, "_send_with_validated_redirects", lambda *args, **kwargs: Response())
+        monkeypatch.setattr("smart_spider.http_client.time.sleep", lambda _: None)
 
-        assert "resp.close()" in after_check, (
-            "Anti-crawl response should be explicitly closed after draining"
-        )
-
-    def test_drain_and_close_pattern(self):
-        """应有 try/finally 包裹 drain + close 模式。"""
-        import inspect
-        from smart_spider.http_client import SmartHttpClient
-        src = inspect.getsource(SmartHttpClient.get)
-
-        anti_crawl_idx = src.find("429, 403, 503")
-        after_check = src[anti_crawl_idx:anti_crawl_idx + 600]
-
-        # 应有 try: ... finally: resp.close() 模式
-        assert "finally:" in after_check, (
-            "Anti-crawl drain should be wrapped in try/finally with resp.close()"
-        )
+        with pytest.raises(requests.HTTPError):
+            client.get("https://example.com/retry")
+        assert events == ["drain", "close"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
