@@ -57,6 +57,23 @@ filter = [
     "onnxruntime>=1.18.0",
     "ultralytics>=8.3.0",
 ]
+# 可选本地 Jina 推理；默认安装与原 CLIP 流程不受影响。
+jina = [
+    "sentence-transformers>=3.0",
+    "transformers>=5.0",
+    "torch>=2.5",
+    "einops>=0.8",
+    "peft>=0.17",
+]
+# Jina reranker v2 still imports a Transformers 4 API. Use a separate
+# environment from the omni/v3.5 extra above.
+jina-v2 = [
+    "transformers>=4.57,<5",
+    "huggingface-hub>=0.34,<1",
+    "tokenizers>=0.22,<0.23",
+    "torch>=2.5",
+    "einops>=0.8",
+]
 # 开发工具
 dev = [
     "pytest>=7.4.0",

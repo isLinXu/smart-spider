@@ -7,6 +7,8 @@ from PIL import Image
 
 from smart_spider.image_retrieval import ImageSimilarityIndex, iter_image_files
 from smart_spider.image_search_cli import _build_parser
+from smart_spider.image_search_cli import main as image_search_main
+from smart_spider.jina_backends import OMNI_MODEL, JinaOmniRetrievalEncoder
 
 
 class MeanColorEncoder:
@@ -98,3 +100,47 @@ def test_image_search_cli_parser():
     assert args.top_k == 5
     assert args.threshold == 0.7
     assert args.include_query is True
+
+
+def test_jina_text_to_image_search_and_index_identity(tmp_path):
+    class FakeRetrieval:
+        def encode_document(self, image):
+            color = np.asarray(image.resize((1, 1)), dtype=float)[0, 0]
+            return [color[0], color[2]]
+
+        def encode_query(self, value):
+            if isinstance(value, str):
+                return [1.0, 0.0] if value == "red" else [0.0, 1.0]
+            color = np.asarray(value.resize((1, 1)), dtype=float)[0, 0]
+            return [color[0], color[2]]
+
+    red = tmp_path / "red.png"
+    blue = tmp_path / "blue.png"
+    _write_image(red, (255, 0, 0))
+    _write_image(blue, (0, 0, 255))
+    encoder = JinaOmniRetrievalEncoder(model=FakeRetrieval())
+    index = ImageSimilarityIndex(
+        encoder, model_name=OMNI_MODEL, model_revision="test-revision"
+    )
+    index.build([red, blue])
+    path = tmp_path / "images.npz"
+    index.save(path)
+
+    loaded = ImageSimilarityIndex.load(path, encoder=encoder)
+    assert loaded.model_name == OMNI_MODEL
+    assert loaded.model_revision == "test-revision"
+    assert loaded.search_text("red", top_k=1)[0].path == str(red.resolve())
+    assert loaded.search_text("blue", top_k=1)[0].path == str(blue.resolve())
+    assert loaded.search(blue, top_k=1, exclude_query=False)[0].path == str(blue.resolve())
+
+
+def test_image_search_cli_accepts_text_query():
+    args = _build_parser().parse_args(["--query-text", "red car", "--index", "images.npz"])
+    assert args.query_text == "red car"
+
+
+def test_text_query_rejects_a_clip_index_before_loading_a_model(tmp_path):
+    path = tmp_path / "clip.npz"
+    ImageSimilarityIndex(MeanColorEncoder()).save(path)
+    with pytest.raises(SystemExit):
+        image_search_main(["--query-text", "red car", "--index", str(path)])

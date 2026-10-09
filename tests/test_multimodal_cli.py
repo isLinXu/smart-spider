@@ -72,3 +72,21 @@ def test_multimodal_cli_exposes_playbook_and_session_flags():
     assert args.ignore_robots is True
     assert args.license == "CC-BY-4.0"
     assert args.source_terms == "public pages only"
+
+
+def test_multimodal_cli_exposes_opt_in_jina_backends():
+    args = _build_parser().parse_args([
+        "--queries", "cat",
+        "--labels", "cat,dog",
+        "--jina-omni",
+        "--jina-reranker", "v3.5",
+        "--jina-top-k", "2",
+    ])
+    assert args.jina_omni is True
+    assert args.jina_reranker == "v3.5"
+    assert args.jina_top_k == 2
+
+
+def test_jina_omni_requires_label_descriptions():
+    with pytest.raises(SystemExit):
+        multimodal_cli_main(["--queries", "cat", "--jina-omni"])

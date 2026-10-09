@@ -224,6 +224,7 @@ class MultimodalJobConfig:
     source_terms: str = ""
     respect_robots: bool = True
     redact_urls: bool = True
+    model_enrichment: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         self.allowed_modalities = tuple(
@@ -266,6 +267,7 @@ class MultimodalJobConfig:
             "source_terms": self.source_terms,
             "respect_robots": self.respect_robots,
             "redact_urls": self.redact_urls,
+            "model_enrichment": dict(self.model_enrichment),
         }
 
     def compliance_policy(self) -> CompliancePolicy:
@@ -688,6 +690,7 @@ class MultimodalDatasetOrchestrator:
             for _, sample, claimed, page_id, staged_assets in prepared:
                 self._discard_staged_assets(staged_assets)
                 self._reject_sample(sample, claimed, page_id, str(exc), report)
+                sample._annotation_image_paths.clear()
             return statuses
         for index, sample, claimed, page_id, staged_assets in prepared:
             annotation = annotations.get(sample.sample_id)
@@ -709,6 +712,8 @@ class MultimodalDatasetOrchestrator:
                 report,
                 staged_assets,
             )
+        for _, sample, _, _, _ in prepared:
+            sample._annotation_image_paths.clear()
         return statuses
 
     def _prepare_sample(
@@ -749,6 +754,9 @@ class MultimodalDatasetOrchestrator:
                 staged = self.asset_store.stage_image(content)
                 staged_assets.append(staged)
                 original_url = asset.uri
+                sample._annotation_image_paths[asset.asset_id or original_url] = os.path.join(
+                    self.config.output_dir, staged.staging_path
+                )
                 asset.uri = staged.relative_path
                 asset.mime_type = staged.mime_type
                 asset.metadata["source_url"] = original_url
@@ -874,7 +882,7 @@ class MultimodalDatasetOrchestrator:
         for asset in sample.modalities:
             if asset.modality != Modality.IMAGE or not asset.uri:
                 continue
-            path = asset.uri
+            path = sample._annotation_image_paths.get(asset.asset_id) or asset.uri
             if not os.path.isabs(path):
                 path = os.path.join(self.config.output_dir, path)
             if not os.path.isfile(path):

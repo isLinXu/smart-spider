@@ -18,6 +18,7 @@ from .dataset_contracts import LabelMode, LabelPolicy, Modality
 from .http_client import SmartHttpClient
 from .multimodal_job import MultimodalDatasetOrchestrator, MultimodalJobConfig
 from .multimodal_pipeline import (
+    AnnotationRouter,
     BrowserPageSource,
     DiscoveryTask,
     PageSampleExtractor,
@@ -66,6 +67,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="允许的模态，逗号分隔（text,image,webpage,video,audio）",
     )
     parser.add_argument("--labels", help="正式标签，逗号分隔")
+    parser.add_argument("--jina-omni", action="store_true", help="用 Jina omni 生成待复核的跨模态候选标签")
+    parser.add_argument("--jina-reranker", choices=["v2", "v3.5"], help="对同一查询的文本候选记录 Jina 精排证据")
+    parser.add_argument("--jina-omni-revision", help="固定 omni 模型的 Hugging Face 修订")
+    parser.add_argument("--jina-reranker-revision", help="固定 reranker 模型的 Hugging Face 修订")
+    parser.add_argument("--jina-top-k", type=int, default=3, help="每个样本保留的 omni 候选标签数")
+    parser.add_argument("--jina-min-similarity", type=float, default=0.0, help="omni 候选标签的最低余弦相似度，使用前应校准")
     parser.add_argument(
         "--label-mode",
         choices=[item.value for item in LabelMode],
@@ -165,6 +172,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--scene-quality-gate requires --scene")
     modalities = tuple(Modality(item) for item in _split(args.modalities))
     labels = _split(args.labels)
+    if args.jina_omni and not labels:
+        parser.error("--jina-omni requires --labels")
+    if args.jina_top_k <= 0 or not -1.0 <= args.jina_min_similarity <= 1.0:
+        parser.error("invalid --jina-top-k or --jina-min-similarity")
     policy = LabelPolicy(
         mode=args.label_mode,
         fixed_labels=labels,
@@ -187,7 +198,37 @@ def main(argv: Optional[list[str]] = None) -> int:
         source_terms=args.source_terms or "",
         respect_robots=not bool(args.ignore_robots),
         redact_urls=not bool(args.no_redact_urls),
+        model_enrichment={
+            "omni": bool(args.jina_omni),
+            "omni_revision": args.jina_omni_revision,
+            "reranker": args.jina_reranker,
+            "reranker_revision": args.jina_reranker_revision,
+            "top_k": args.jina_top_k,
+            "min_similarity": args.jina_min_similarity,
+        },
     )
+    backends = {}
+    if args.jina_omni or args.jina_reranker:
+        from .jina_backends import (
+            JinaOmniAnnotationBackend,
+            JinaTextRerankBackend,
+            RERANKER_V2,
+            RERANKER_V35,
+        )
+
+        if args.jina_omni:
+            backends["jina_omni"] = JinaOmniAnnotationBackend(
+                labels,
+                revision=args.jina_omni_revision,
+                top_k=args.jina_top_k,
+                min_similarity=args.jina_min_similarity,
+            )
+        if args.jina_reranker:
+            backends["jina_reranker"] = JinaTextRerankBackend(
+                model_id=RERANKER_V2 if args.jina_reranker == "v2" else RERANKER_V35,
+                revision=args.jina_reranker_revision,
+            )
+    annotation_router = AnnotationRouter(policy, backends=backends)
     http_client = SmartHttpClient(
         proxies=args.proxy,
         rate=args.rate,
@@ -202,6 +243,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         config,
         http_client=http_client,
         extractor=extractor,
+        annotation_router=annotation_router,
     )
     browser_controller = None
     browser_source = None
@@ -266,6 +308,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 cookies=cookies or None,
                 storage_state=storage_state,
                 allow_private_hosts=args.allow_private_hosts,
+                site_policy=policy,
             )
             if args.browser_playbook:
                 playbook = AuthorizedBrowsePlaybook(browser_controller, policy)

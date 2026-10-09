@@ -111,6 +111,7 @@ class ImageSimilarityIndex:
         encoder: Optional[ImageEncoder] = None,
         *,
         model_name: str = "ViT-B/32",
+        model_revision: Optional[str] = None,
         device: str = "cpu",
         batch_size: int = 32,
     ) -> None:
@@ -118,6 +119,7 @@ class ImageSimilarityIndex:
             raise ValueError("batch_size must be positive")
         self.encoder = encoder
         self.model_name = model_name
+        self.model_revision = model_revision
         self.device = device
         self.batch_size = batch_size
         self.paths: list[str] = []
@@ -126,9 +128,18 @@ class ImageSimilarityIndex:
 
     def _ensure_encoder(self) -> ImageEncoder:
         if self.encoder is None:
-            from .perception.clip_inference import CLIPInference
+            from .jina_backends import OMNI_MODEL
 
-            self.encoder = CLIPInference(model_name=self.model_name, device=self.device)
+            if self.model_name == OMNI_MODEL:
+                from .jina_backends import JinaOmniRetrievalEncoder
+
+                self.encoder = JinaOmniRetrievalEncoder(
+                    revision=self.model_revision, device=self.device
+                )
+            else:
+                from .perception.clip_inference import CLIPInference
+
+                self.encoder = CLIPInference(model_name=self.model_name, device=self.device)
         return self.encoder
 
     @staticmethod
@@ -267,7 +278,51 @@ class ImageSimilarityIndex:
             return []
 
         image, query_path = self._open_image(query_image)
-        query_embedding = self._encode_images([image])[0]
+        encoder = self._ensure_encoder()
+        encode_query = getattr(encoder, "encode_query_image", None)
+        query_embedding = (
+            self._normalize_embeddings(encode_query(image))[0]
+            if callable(encode_query)
+            else self._encode_images([image])[0]
+        )
+        return self._search_vector(query_embedding, top_k, threshold, query_path, exclude_query)
+
+    def search_text(
+        self,
+        query: str,
+        *,
+        top_k: int = 10,
+        threshold: Optional[float] = None,
+    ) -> list[ImageSearchResult]:
+        """Cross-modal text-to-image retrieval, when the encoder supports it."""
+        if not query.strip():
+            raise ValueError("text query must not be empty")
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if threshold is not None and not -1.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be between -1 and 1")
+        if not self.paths:
+            return []
+        encode_query = getattr(self._ensure_encoder(), "encode_query_text", None)
+        if not callable(encode_query):
+            raise TypeError("index encoder does not support text-to-image search")
+        query_embedding = self._normalize_embeddings(encode_query(query))[0]
+        return self._search_vector(query_embedding, top_k, threshold, "", False)
+
+    def _search_vector(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int,
+        threshold: Optional[float],
+        query_path: str,
+        exclude_query: bool,
+    ) -> list[ImageSearchResult]:
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if threshold is not None and not -1.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be between -1 and 1")
+        if query_embedding.shape[0] != self.embeddings.shape[1]:
+            raise ValueError("query and index embedding dimensions differ")
         scores = self.embeddings @ query_embedding
         order = np.argsort(-scores, kind="stable")
         normalized_query = os.path.normcase(os.path.abspath(query_path)) if query_path else ""
@@ -297,6 +352,8 @@ class ImageSimilarityIndex:
         payload = {
             "format_version": self.FORMAT_VERSION,
             "model_name": self.model_name,
+            "model_revision": self.model_revision,
+            "embedding_task": "retrieval" if self.model_name.startswith("jinaai/") else "symmetric",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "paths": self.paths,
             "metadata": self.metadata,
@@ -354,6 +411,11 @@ class ImageSimilarityIndex:
             raise ValueError(
                 f"unsupported image index format: {payload.get('format_version')}"
             )
+        if (
+            payload.get("model_name") == "jinaai/jina-embeddings-v5-omni-nano"
+            and payload.get("embedding_task") != "retrieval"
+        ):
+            raise ValueError("Jina image index must use the retrieval task")
         paths = [str(item) for item in payload.get("paths", [])]
         metadata = [dict(item or {}) for item in payload.get("metadata", [])]
         if embeddings.ndim != 2 or (embeddings.shape[0] and embeddings.shape[1] == 0):
@@ -366,6 +428,7 @@ class ImageSimilarityIndex:
         index = cls(
             encoder=encoder,
             model_name=str(payload.get("model_name") or "ViT-B/32"),
+            model_revision=payload.get("model_revision"),
             device=device,
             batch_size=batch_size,
         )

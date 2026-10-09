@@ -106,6 +106,41 @@ smart-spider-image-search --query-image ./query.jpg \
 
 在 `dataset_cli` 中传入 `--query-image` 后，关键词或站点仍负责发现互联网候选，下载并完成基础图片校验后，再用查询图片做视觉相似度二次筛选；通过 `--image-similarity-threshold` 调整严格程度。最终 `metadata.jsonl` 的 `image_sim`、`manifest.jsonl` 的 `pipeline.image_query` 会记录筛选证据。
 
+### Jina 多模态候选标注与文本精排（可选）
+
+通用多模态采集命令可启用 Jina 推理。`--jina-omni` 使用
+`jina-embeddings-v5-omni-nano` 的 classification 适配器，对已获取的文本和
+**本地暂存图片**生成候选标签；图片不会因模型推理再次请求源 URL。
+同一样本有已验证图片时，候选标签以图片向量为依据；无图片时才使用文本，
+避免页面正文或 alt 文本盖过图片内容。
+候选标签写入 `manifest.jsonl` 的 `pipeline.annotation.candidates`，包含模型、
+修订、模态、相似度和 `advisory=true`，不会直接变成正式标签。
+
+`--jina-reranker` 可选择 v2 或 v3.5，对同一查询、同一标注批次内的文本样本
+记录 `pipeline.jina_rerank` 的分数和名次。其结果只用于排序与复核，不作为
+图片内容证明或未经校准的全局过滤阈值。
+
+```bash
+pip install -e '.[jina]'
+smart-spider-multimodal --queries '猫,狗' --labels '猫,狗' \
+  --jina-omni --jina-reranker v3.5 --output ./multimodal_dataset
+
+# 使用 retrieval 适配器建图片索引，再用文本跨模态查询
+smart-spider-image-search --build-from ./images --index ./jina-images.npz \
+  --model jinaai/jina-embeddings-v5-omni-nano
+smart-spider-image-search --query-text '夜间道路上的行人' \
+  --index ./jina-images.npz --top-k 20
+```
+
+v2 精排器需要 Transformers 4 的接口，须在独立环境安装
+`pip install -e '.[jina-v2]'`，再使用 `--jina-reranker v2`。
+不要在同一个环境同时安装 `jina` 和 `jina-v2` extras。
+
+模型首次使用时才加载；本地模型代码需要 Hugging Face `trust_remote_code`。
+生产任务宜使用 `--jina-omni-revision` / `--jina-reranker-revision` 固定已审查的
+模型修订。三个模型的公开权重均标注 CC BY-NC 4.0，商业使用须先解决授权。
+推荐先在人工标注集上校准 `--jina-min-similarity` 和标签策略。
+
 ### 远程网页以图搜图
 
 如果需要把本地图片直接上传到网络反向图片搜索页面并返回网页结果，使用独立命令：

@@ -206,6 +206,7 @@ class LabelDecision:
     score: float = 0.0
     source: str = "unknown"
     evidence: dict[str, Any] = field(default_factory=dict)
+    advisory: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -217,6 +218,7 @@ class LabelDecision:
             score=float(data.get("score", 0.0)),
             source=str(data.get("source", "unknown")),
             evidence=dict(data.get("evidence") or {}),
+            advisory=bool(data.get("advisory", False)),
         )
 
 
@@ -280,13 +282,15 @@ class LabelPolicy:
     def resolve(self, decisions: Iterable[LabelDecision]) -> LabelResolution:
         """按模式解析标签，始终保留多标签结果。"""
         normalized: list[LabelDecision] = []
-        best_by_name: dict[str, LabelDecision] = {}
+        best_by_name: dict[tuple[str, bool], LabelDecision] = {}
         for raw in decisions:
             name = self._canonical_name(raw.name)
             if not name:
                 continue
-            item = LabelDecision(name, float(raw.score), raw.source, dict(raw.evidence))
-            key = self._key(name)
+            item = LabelDecision(
+                name, float(raw.score), raw.source, dict(raw.evidence), raw.advisory
+            )
+            key = (self._key(name), item.advisory)
             previous = best_by_name.get(key)
             if previous is None or item.score > previous.score:
                 best_by_name[key] = item
@@ -297,6 +301,9 @@ class LabelPolicy:
         for item in normalized:
             key = self._key(item.name)
             is_fixed = key in fixed_keys
+            if item.advisory:
+                result.candidates.append(item)
+                continue
             if self.mode == LabelMode.FIXED:
                 if is_fixed and item.score >= self.min_score:
                     result.labels.append(item)
@@ -359,6 +366,8 @@ class SampleRecord:
     modalities: list[ModalityAsset] = field(default_factory=list)
     relations: list[ModalityRelation] = field(default_factory=list)
     task_type: str = "multimodal"
+    # 仅在标注期间可用；指向本地暂存媒体，不进入 manifest。
+    _annotation_image_paths: dict[str, str] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         modalities = list(self.modalities)

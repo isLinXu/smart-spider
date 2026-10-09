@@ -621,6 +621,7 @@ class AnnotationRouter:
                     score=decision.score,
                     source=source,
                     evidence=dict(decision.evidence),
+                    advisory=decision.advisory,
                 )
             normalized.append(decision)
         return normalized
