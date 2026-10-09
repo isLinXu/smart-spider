@@ -65,6 +65,7 @@ def _handle_authorized_browse(task, queue: Optional[TaskQueue]) -> dict:
         cookies=cookies or None,
         storage_state=storage_state,
         allow_private_hosts=policy.allow_private_hosts,
+        site_policy=policy,
     )
     try:
         playbook = AuthorizedBrowsePlaybook(

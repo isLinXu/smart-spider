@@ -89,6 +89,7 @@ def run_profile_once(
             cookies=cookies or None,
             storage_state=storage_state,
             allow_private_hosts=profile.policy.allow_private_hosts,
+            site_policy=profile.policy,
         )
     results: list[dict] = []
     try:
@@ -303,6 +304,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         controller = BrowserController(
             headless=False,
             allow_private_hosts=profile.policy.allow_private_hosts,
+            site_policy=profile.policy,
         )
         try:
             seed = accepted[0]

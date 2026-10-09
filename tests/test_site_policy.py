@@ -53,9 +53,9 @@ def test_robots_gate_respects_disallow():
     assert not gate.allowed("https://example.com/private/x")
 
 
-def test_robots_gate_fail_open_when_missing():
+def test_robots_gate_fails_closed_when_unreachable():
     gate = RobotsGate(enabled=True, fetcher=lambda _u: None)
-    assert gate.allowed("https://example.com/anything")
+    assert not gate.allowed("https://example.com/anything")
 
 
 def test_host_rate_limiter_acquire():

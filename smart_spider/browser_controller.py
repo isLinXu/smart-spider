@@ -56,6 +56,7 @@ class BrowserController:
         page_timeout: int = 30_000,
         url_policy: Optional[URLPolicy] = None,
         allow_private_hosts: bool = False,
+        site_policy=None,
     ):
         """初始化控制器。
 
@@ -72,12 +73,15 @@ class BrowserController:
         self.url_policy = url_policy or getattr(dynamic_renderer, "url_policy", None) or URLPolicy(
             allow_private_hosts=allow_private_hosts
         )
+        self.site_policy = site_policy
         self.current_html = ""
         self.current_url = ""
 
         if dynamic_renderer is not None:
             # 使用已有的 DynamicRenderer（每次交互新建 context）
             self._mode = "renderer"
+            if site_policy is not None:
+                self._renderer.site_policy = site_policy
         else:
             # 自动创建持久化会话（Agent 推荐）
             from .browser import PersistentBrowserSession
@@ -89,6 +93,7 @@ class BrowserController:
                 storage_state=storage_state,
                 url_policy=url_policy,
                 allow_private_hosts=allow_private_hosts,
+                site_policy=site_policy,
             )
             self._mode = "session"
 
@@ -104,6 +109,10 @@ class BrowserController:
             页面 HTML 内容
         """
         url = self.url_policy.validate(url)
+        if self.site_policy is not None and not self.site_policy.allows_url(
+            url, url_policy=self.url_policy
+        ):
+            return ""
         if self._mode == "session":
             html = self._session.navigate(url)
         else:
@@ -111,8 +120,18 @@ class BrowserController:
 
         if html:
             self.current_html = html
-            self.current_url = url
+            self.current_url = (
+                self._session.current_url if self._session is not None else url
+            ) or url
         return html or ""
+
+    def set_site_policy(self, policy) -> None:
+        """Apply the authorized host policy to navigation and browser routes."""
+        self.site_policy = policy
+        if self._session is not None:
+            self._session.site_policy = policy
+        if self._renderer is not None:
+            self._renderer.site_policy = policy
 
     # ── 交互操作（返回更新后的 HTML）──────────────────────────────
 

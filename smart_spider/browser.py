@@ -165,6 +165,7 @@ class DynamicRenderer:
         max_restarts: int = 3,
         url_policy: Optional[URLPolicy] = None,
         allow_private_hosts: bool = False,
+        site_policy=None,
     ):
         if not _PLAYWRIGHT_AVAILABLE:
             raise RuntimeError(
@@ -180,6 +181,7 @@ class DynamicRenderer:
         self.url_policy = url_policy or URLPolicy(
             allow_private_hosts=allow_private_hosts
         )
+        self.site_policy = site_policy
         self._restart_count = 0
 
         # 同步包装用的事件循环（在独立线程中运行）
@@ -250,6 +252,12 @@ class DynamicRenderer:
         """拦截并丢弃不必要的资源请求。"""
         req = route.request
         if not _validate_browser_request(req.url, self.url_policy):
+            await route.abort()
+            return
+        request_url = urlsplit(req.url)
+        if (self.site_policy is not None
+                and request_url.scheme in {"http", "https"}
+                and not self.site_policy.allows_host(request_url.hostname or "")):
             await route.abort()
             return
         if req.resource_type in _BLOCK_RESOURCE_TYPES:
@@ -676,6 +684,7 @@ class PersistentBrowserSession:
         storage_state: Optional[object] = None,
         url_policy: Optional[URLPolicy] = None,
         allow_private_hosts: bool = False,
+        site_policy=None,
     ):
         if not _PLAYWRIGHT_AVAILABLE:
             raise RuntimeError(
@@ -690,6 +699,7 @@ class PersistentBrowserSession:
         self.url_policy = url_policy or URLPolicy(
             allow_private_hosts=allow_private_hosts
         )
+        self.site_policy = site_policy
 
         # 异步事件循环（独立线程）
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -769,6 +779,12 @@ class PersistentBrowserSession:
         if not _validate_browser_request(req.url, self.url_policy):
             await route.abort()
             return
+        request_url = urlsplit(req.url)
+        if (self.site_policy is not None
+                and request_url.scheme in {"http", "https"}
+                and not self.site_policy.allows_host(request_url.hostname or "")):
+            await route.abort()
+            return
         if req.resource_type in _BLOCK_RESOURCE_TYPES:
             await route.abort()
             return
@@ -786,9 +802,13 @@ class PersistentBrowserSession:
 
         try:
             url = self.url_policy.validate(url)
+            if self.site_policy is not None and not self.site_policy.allows_host(
+                urlsplit(url).hostname or ""
+            ):
+                return ""
             await self._page.goto(url, wait_until=wait_for, timeout=self._page_timeout)
             await self._simulate_human(self._page)
-            self._current_url = url
+            self._current_url = self._page.url
             html = await self._page.content()
             logger.debug(f"Navigated to {url[:60]} ({len(html)} chars)")
             return html

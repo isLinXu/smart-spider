@@ -136,13 +136,17 @@ class AuthorizedBrowsePlaybook:
         self.rate_limiter = rate_limiter or HostRateLimiter(
             self.policy.requests_per_second
         )
-        self.robots = robots or RobotsGate(
-            user_agent=self.policy.robots_user_agent,
-            enabled=self.policy.respect_robots,
-        )
         self.url_policy = url_policy or URLPolicy(
             allow_private_hosts=self.policy.allow_private_hosts
         )
+        self.robots = robots or RobotsGate(
+            user_agent=self.policy.robots_user_agent,
+            enabled=self.policy.respect_robots,
+            url_policy=self.url_policy,
+        )
+        set_site_policy = getattr(controller, "set_site_policy", None)
+        if callable(set_site_policy):
+            set_site_policy(self.policy)
         self.steps = parse_playbook_steps(steps)
 
     def run(

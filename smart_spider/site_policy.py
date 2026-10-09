@@ -98,7 +98,10 @@ class SiteCrawlPolicy:
             requests_per_second=float(
                 data.get("requests_per_second") or data.get("qps") or 1.0
             ),
-            action_delay_seconds=float(data.get("action_delay_seconds") or 0.5),
+            action_delay_seconds=float(
+                data["action_delay_seconds"]
+                if data.get("action_delay_seconds") is not None else 0.5
+            ),
             prefer_browser=bool(data.get("prefer_browser", True)),
             respect_robots=bool(data.get("respect_robots", True)),
             robots_user_agent=str(data.get("robots_user_agent") or "smart-spider"),
@@ -182,7 +185,7 @@ class HostRateLimiter:
 
 
 class RobotsGate:
-    """可选 robots.txt 门禁；失败时默认放行（fail-open）并记录原因。"""
+    """Robots gate; unreachable robots.txt fails closed."""
 
     def __init__(
         self,
@@ -190,24 +193,40 @@ class RobotsGate:
         user_agent: str = "smart-spider",
         enabled: bool = True,
         fetcher=None,
+        url_policy: Optional[URLPolicy] = None,
     ):
         self.user_agent = user_agent
         self.enabled = enabled
+        self.url_policy = url_policy or URLPolicy()
         self._fetcher = fetcher or self._default_fetch
-        self._cache: dict[str, RobotFileParser] = {}
+        self._cache: dict[str, Optional[RobotFileParser]] = {}
         self._lock = threading.Lock()
 
-    @staticmethod
-    def _default_fetch(robots_url: str) -> Optional[str]:
+    def _default_fetch(self, robots_url: str) -> Optional[str]:
         try:
-            from urllib.request import Request, urlopen
+            from urllib.error import HTTPError
+            from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+            self.url_policy.validate(robots_url)
+            original_host = host_of(robots_url)
+            url_policy = self.url_policy
+
+            class SafeRedirect(HTTPRedirectHandler):
+                def redirect_request(self, request, fp, code, msg, headers, newurl):
+                    url_policy.validate(newurl)
+                    if host_of(newurl) != original_host:
+                        raise UnsafeURLError("robots redirect leaves the authorized host")
+                    return super().redirect_request(request, fp, code, msg, headers, newurl)
 
             request = Request(
                 robots_url,
                 headers={"User-Agent": "smart-spider-robots-check"},
             )
-            with urlopen(request, timeout=5) as response:
-                return response.read().decode("utf-8", errors="replace")
+            with build_opener(SafeRedirect()).open(request, timeout=5) as response:
+                return response.read(512 * 1024).decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            # RFC 9309 treats 4xx (except temporary throttling here) as unavailable.
+            return "" if 400 <= exc.code < 500 and exc.code != 429 else None
         except Exception:
             return None
 
@@ -220,21 +239,22 @@ class RobotsGate:
         base = f"{parsed.scheme}://{parsed.netloc}"
         robots_url = f"{base}/robots.txt"
         with self._lock:
-            parser = self._cache.get(base)
-            if parser is None:
-                parser = RobotFileParser()
-                parser.set_url(robots_url)
+            if base not in self._cache:
                 body = self._fetcher(robots_url)
                 if body is None:
-                    # fail-open: treat as allow-all when robots cannot be fetched
-                    parser.parse([])
+                    self._cache[base] = None
                 else:
+                    parser = RobotFileParser()
+                    parser.set_url(robots_url)
                     parser.parse(body.splitlines())
-                self._cache[base] = parser
+                    self._cache[base] = parser
+            parser = self._cache[base]
+        if parser is None:
+            return False
         try:
             return bool(parser.can_fetch(self.user_agent, url))
         except Exception:
-            return True
+            return False
 
 
 def polite_sleep(seconds: float) -> None:
