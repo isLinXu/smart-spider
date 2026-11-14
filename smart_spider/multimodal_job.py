@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import threading
 import uuid
@@ -50,11 +51,7 @@ from .compliance import (
 )
 from .dataset_lineage import build_lineage, publish_dataset_artifacts
 from .report import UnifiedReport
-from .scene_quality_gate import (
-    JsonlSceneReviewQueue,
-    SceneQualityGate,
-    SceneSignalDetector,
-)
+from .scene_quality_gate import SceneQualityGate, SceneSignalDetector
 from .scene_quality import get_scene_quality_profile
 from .scene_signal_detector import default_scene_signal_detector
 
@@ -225,8 +222,14 @@ class MultimodalJobConfig:
     respect_robots: bool = True
     redact_urls: bool = True
     model_enrichment: dict[str, Any] = field(default_factory=dict)
+    required_annotation_backends: tuple[str, ...] = ()
 
     def __post_init__(self):
+        if isinstance(self.required_annotation_backends, str):
+            raise ValueError("required_annotation_backends must be a sequence of names")
+        self.required_annotation_backends = tuple(dict.fromkeys(self.required_annotation_backends))
+        if any(not isinstance(name, str) or not name.strip() for name in self.required_annotation_backends):
+            raise ValueError("required annotation backend names cannot be empty")
         self.allowed_modalities = tuple(
             item if isinstance(item, Modality) else Modality(str(item))
             for item in self.allowed_modalities
@@ -268,6 +271,7 @@ class MultimodalJobConfig:
             "respect_robots": self.respect_robots,
             "redact_urls": self.redact_urls,
             "model_enrichment": dict(self.model_enrichment),
+            "required_annotation_backends": list(self.required_annotation_backends),
         }
 
     def compliance_policy(self) -> CompliancePolicy:
@@ -285,6 +289,12 @@ class MultimodalJobReport:
     tasks: int = 0
     discovered: int = 0
     accepted: int = 0
+    existing_accepted: int = 0
+    total_accepted: int = 0
+    pending_review: int = 0
+    review_limit_reached: bool = False
+    skipped_review: int = 0
+    degraded_annotations: int = 0
     rejected: int = 0
     materialized_images: int = 0
     quality_report_path: str = ""
@@ -348,6 +358,7 @@ class MultimodalDatasetOrchestrator:
             config.job_id,
             self.manifest,
             self.asset_store,
+            review_queue_path=config.scene_review_queue_path,
         )
         self.repository.recover()
         self.quality_report = QualityReport()
@@ -359,7 +370,6 @@ class MultimodalDatasetOrchestrator:
         self._owns_manifest = manifest_writer is None
         self._lease_recoveries = int(self.state.recover_expired_leases(config.job_id))
         self.scene_quality_gate = None
-        self.scene_review_queue = None
         self.scene_signal_detector = scene_signal_detector
         if config.scene_quality_gate_enabled:
             profile = get_scene_quality_profile(config.scene or "")
@@ -387,10 +397,6 @@ class MultimodalDatasetOrchestrator:
                 profile,
                 detector=self.scene_signal_detector,
             )
-            queue_path = config.scene_review_queue_path or os.path.join(
-                config.output_dir, "scene_review_queue.jsonl"
-            )
-            self.scene_review_queue = JsonlSceneReviewQueue(queue_path)
 
     def _resolve_quality_report_path(self, path: Optional[str]) -> str:
         if not path:
@@ -432,11 +438,18 @@ class MultimodalDatasetOrchestrator:
         report = MultimodalJobReport(
             job_id=self.config.job_id,
             quality_report_path=self.quality_report_path,
+            existing_accepted=self.repository.accepted_count,
+            total_accepted=self.repository.accepted_count,
         )
         try:
             for task in tasks:
-                if report.accepted >= self.config.max_samples:
+                if self.repository.accepted_count >= self.config.max_samples:
                     break
+                if report.pending_review >= self.config.max_samples:
+                    break
+                if self.repository.has_review_for_url(task.start_url):
+                    report.skipped_review += 1
+                    continue
                 report.tasks += 1
                 result = self.source_router.discover(task, static_source, browser_source)
                 route = result.decision.action.value
@@ -470,14 +483,18 @@ class MultimodalDatasetOrchestrator:
                     )
                     if results and results[0]:
                         report.accepted += 1
-                    else:
+                    elif sample.pipeline.get("status") != "needs_review":
                         report.rejected += 1
                     continue
 
                 pending = []
                 for candidate in result.candidates:
-                    if report.accepted + len(pending) >= self.config.max_samples:
+                    if (self.repository.accepted_count + len(pending) >= self.config.max_samples
+                            or report.pending_review + len(pending) >= self.config.max_samples):
                         break
+                    if self.repository.has_review_for_url(candidate.url):
+                        report.skipped_review += 1
+                        continue
                     sample = self._sample_from_candidate(candidate)
                     if sample is None:
                         report.rejected += 1
@@ -487,13 +504,21 @@ class MultimodalDatasetOrchestrator:
                     if len(pending) >= self.config.annotation_batch_size:
                         accepted = self._submit_samples(pending, report)
                         report.accepted += sum(1 for item in accepted if item)
-                        report.rejected += sum(1 for item in accepted if not item)
+                        report.rejected += sum(
+                            1 for entry, outcome in zip(pending, accepted)
+                            if not outcome and entry[0].pipeline.get("status") != "needs_review"
+                        )
                         pending = []
                 if pending:
                     accepted = self._submit_samples(pending, report)
                     report.accepted += sum(1 for item in accepted if item)
-                    report.rejected += sum(1 for item in accepted if not item)
+                    report.rejected += sum(
+                        1 for entry, outcome in zip(pending, accepted)
+                        if not outcome and entry[0].pipeline.get("status") != "needs_review"
+                    )
         finally:
+            report.total_accepted = self.repository.accepted_count
+            report.review_limit_reached = report.pending_review >= self.config.max_samples
             report.scene_decisions = dict(self.quality_report.scene_decisions)
             report.route_counts["lease_recoveries"] = int(self._lease_recoveries)
             report.route_reasons = dict(self.quality_report.route_reasons)
@@ -514,6 +539,11 @@ class MultimodalDatasetOrchestrator:
             route_reasons=report.route_reasons,
             block_kinds=report.block_kinds,
         )
+        reviews = self.state.list_multimodal_reviews(self.config.job_id, ("prepared", "needs_review"))
+        if any(any(str(reason).startswith("required_backend_failed:")
+                   for reason in item["decision"].get("reasons", [])) for item in reviews):
+            checklist.ready = False
+            checklist.warnings.append("required_annotation_backend_failed")
         report.publish_checklist_path = write_publish_checklist(
             self.config.output_dir, checklist
         )
@@ -676,6 +706,10 @@ class MultimodalDatasetOrchestrator:
         statuses = [False] * len(entries)
         prepared: list[tuple[int, SampleRecord, list[str], Optional[str], list[StagedAsset]]] = []
         for index, (sample, candidate_ids, page_id) in enumerate(entries):
+            if self.repository.has_review(sample.sample_id):
+                sample.pipeline["status"] = "needs_review"
+                report.skipped_review += 1
+                continue
             try:
                 claimed, staged_assets = self._prepare_sample(sample, candidate_ids, report)
                 prepared.append((index, sample, claimed, page_id, staged_assets))
@@ -791,8 +825,42 @@ class MultimodalDatasetOrchestrator:
         staged_assets: list[StagedAsset],
     ) -> bool:
         try:
+            sample.labels = annotation.resolution.labels
+            missing_required = [name for name in self.config.required_annotation_backends
+                                if name not in annotation.used_backends or name in annotation.errors]
+            annotation_status = "required_failed" if missing_required else "degraded" if annotation.errors else "complete"
+            sample.pipeline["annotation"] = {
+                "used_backends": annotation.used_backends,
+                "errors": annotation.errors,
+                "candidates": [item.to_dict() for item in annotation.resolution.candidates],
+                "status": annotation_status,
+                "required_backends": list(self.config.required_annotation_backends),
+            }
+            for error in annotation.errors.values():
+                self.quality_report.observe_error(error)
+            if annotation.errors:
+                report.degraded_annotations += 1
+            apply_compliance_to_provenance(sample.provenance, self.config.compliance_policy())
+            if self.config.redact_urls:
+                from .compliance import redact_url
+                for asset in sample.modalities:
+                    source_url = asset.metadata.get("source_url")
+                    if source_url:
+                        asset.metadata["source_url"] = redact_url(str(source_url))
+            if missing_required:
+                return self._retain_review_sample(
+                    sample, claimed, page_id, staged_assets, report,
+                    {"action": "review", "reasons": [f"required_backend_failed:{name}" for name in missing_required],
+                     "provenance": {"required_backends": list(self.config.required_annotation_backends)}},
+                )
             if self.scene_quality_gate is not None:
                 semantic_score = self._sample_semantic_score(sample)
+                if semantic_score is None:
+                    # A non-finite upstream value cannot enter JSON evidence.
+                    # Preserve unavailability explicitly instead of inventing 0.
+                    sample.pipeline["semantic_score"] = None
+                    if "semantic_score" in sample.quality.attributes:
+                        sample.quality.attributes["semantic_score"] = None
                 signals = sample.pipeline.get("scene_signals")
                 if not isinstance(signals, dict):
                     signals = sample.quality.attributes.get("scene_signals", {})
@@ -817,7 +885,10 @@ class MultimodalDatasetOrchestrator:
                     sample.quality.attributes["scene_signals"] = dict(decision.signals)
                     sample.pipeline["scene_signals"] = dict(decision.signals)
                 if decision.action == "review":
-                    self.scene_review_queue.append(sample.sample_id, decision)
+                    self.quality_report.observe_scene_decision(decision.action)
+                    return self._retain_review_sample(
+                        sample, claimed, page_id, staged_assets, report, decision.to_dict(),
+                    )
                 self.quality_report.observe_scene_decision(decision.action)
                 if decision.action != "accept":
                     self._discard_staged_assets(staged_assets)
@@ -829,26 +900,7 @@ class MultimodalDatasetOrchestrator:
                         report,
                     )
                     return False
-            sample.labels = annotation.resolution.labels
-            sample.pipeline["annotation"] = {
-                "used_backends": annotation.used_backends,
-                "errors": annotation.errors,
-                "candidates": [item.to_dict() for item in annotation.resolution.candidates],
-            }
-            for error in annotation.errors.values():
-                self.quality_report.observe_error(error)
             sample.pipeline["status"] = "accepted"
-            apply_compliance_to_provenance(
-                sample.provenance, self.config.compliance_policy()
-            )
-            # Also scrub materialized asset source URLs when redaction enabled.
-            if self.config.redact_urls:
-                from .compliance import redact_url
-
-                for asset in sample.modalities:
-                    source_url = asset.metadata.get("source_url")
-                    if source_url:
-                        asset.metadata["source_url"] = redact_url(str(source_url))
             accepted = self.repository.commit(
                 sample,
                 candidate_ids=[item for item in [page_id, *claimed] if item],
@@ -862,18 +914,37 @@ class MultimodalDatasetOrchestrator:
             self.quality_report.observe_sample(sample)
             return True
         except Exception as exc:
+            if self.repository.has_review(sample.sample_id):
+                # A durable prepare owns these assets and candidate leases.
+                # Startup recovery will finish it; do not re-fetch its media.
+                sample.pipeline["status"] = "needs_review"
+                report.errors.append(f"review_publication_deferred: {exc}")
+                return False
             self._reject_sample(sample, claimed, page_id, str(exc), report)
             return False
 
+    def _retain_review_sample(
+        self, sample: SampleRecord, claimed: list[str], page_id: Optional[str],
+        staged_assets: list[StagedAsset], report: MultimodalJobReport, decision: dict[str, Any],
+    ) -> bool:
+        sample.pipeline["status"] = "needs_review"
+        sample.pipeline["review"] = decision
+        if self.repository.retain_review(
+            sample, candidate_ids=[item for item in [page_id, *claimed] if item],
+            staged_assets=staged_assets, decision=decision,
+        ):
+            report.pending_review += 1
+        return False
+
     @staticmethod
-    def _sample_semantic_score(sample: SampleRecord) -> float:
-        """Read an optional upstream score, defaulting to review-safe zero."""
+    def _sample_semantic_score(sample: SampleRecord) -> Optional[float]:
+        """Missing or invalid evidence stays unavailable, never a fabricated zero."""
         raw = sample.pipeline.get("semantic_score", sample.quality.attributes.get("semantic_score"))
         try:
             score = float(raw)
         except (TypeError, ValueError):
-            return 0.0
-        return max(-1.0, min(1.0, score))
+            return None
+        return score if math.isfinite(score) and -1.0 <= score <= 1.0 else None
 
     def _load_local_scene_image(self, sample: SampleRecord) -> Optional[Any]:
         """Load a materialized image for an injected detector, if available."""

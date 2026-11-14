@@ -34,7 +34,8 @@ def test_multimodal_gate_rejects_missing_evidence_and_writes_review(tmp_path):
     )
     report = job.run([DiscoveryTask(start_url=candidate.url)], source)
     assert report.accepted == 0
-    assert report.rejected == 1
+    assert report.rejected == 0
+    assert report.pending_review == 1
     assert report.scene_decisions == {"review": 1}
     queue = tmp_path / "scene_review_queue.jsonl"
     assert queue.exists()
