@@ -449,8 +449,8 @@ class TestDatasetCrawlerInit:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_init_resume(self):
-        """断点续传初始化。"""
+    def test_init_resume_does_not_count_unregistered_files(self):
+        """只有登记的有效样本计入目标，孤立图片文件不能制造已达标。"""
         tmp = tempfile.mkdtemp()
         try:
             # 先创建一些已有文件
@@ -467,7 +467,9 @@ class TestDatasetCrawlerInit:
                 use_clip=False,
                 resume=True,
             )
-            assert crawler._dir_manager.saved_count == 10
+            assert crawler._dir_manager.saved_count == 0
+            assert crawler._repository.active_count == 0
+            crawler.close()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -632,7 +634,9 @@ class TestDatasetCrawlerInit:
             assert record["source_ext"] == ".png"
             assert record["quality"]["format"] == "jpeg"
             assert record["format_conversion"]["enabled"] is True
-            assert [item["name"] for item in record["labels"]] == ["blue square"]
+            assert record["labels"] == []
+            assert [item["name"] for item in record["label_candidates"]] == ["blue square"]
+            assert record["label_candidates"][0]["advisory"] is True
             assert crawler._state_store.count_candidates(crawler.job_id, "accepted") == 1
             with open(os.path.join(tmp, "manifest.jsonl"), encoding="utf-8") as f:
                 manifest = json.loads(f.readline())

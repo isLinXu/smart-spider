@@ -76,6 +76,7 @@ import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 from urllib.parse import urlsplit
@@ -220,9 +221,12 @@ class DatasetCrawler:
         config: DatasetCrawlConfig,
         *,
         callbacks: Optional[list[Callable]] = None,
+        commit_guard: Optional[Callable] = None,
+        check_active: Optional[Callable] = None,
     ) -> "DatasetCrawler":
         """Construct from a validated ``DatasetCrawlConfig``."""
-        return cls(config=config, callbacks=callbacks)
+        return cls(config=config, callbacks=callbacks,
+                   commit_guard=commit_guard, check_active=check_active)
 
     def __init__(
         self,
@@ -296,6 +300,8 @@ class DatasetCrawler:
         scene_signal_detector: Optional[SceneSignalDetector] = None,
         scene_quality_gate: Optional[SceneQualityGate] = None,
         config: Optional[DatasetCrawlConfig] = None,
+        commit_guard: Optional[Callable] = None,
+        check_active: Optional[Callable] = None,
     ):
         if config is not None:
             if keywords is not None:
@@ -512,6 +518,8 @@ class DatasetCrawler:
             raise RuntimeError(
                 "query_image requires CLIP; remove --no-clip and install openai-clip"
             )
+        if use_clip and not _CLIP_AVAILABLE:
+            raise RuntimeError("CLIP filtering requested but unavailable; install openai-clip or explicitly use --no-clip")
         if max_workers <= 0:
             raise ValueError("max_workers must be positive")
         if per_domain_concurrency <= 0:
@@ -611,24 +619,10 @@ class DatasetCrawler:
         # 进度管理器
         self._progress = ProgressManager(output_dir)
 
-        resumed_scene_counts, resumed_source_counts, resumed_domain_counts = (
-            self._load_resumed_quota_counts() if resume else ({}, {}, {})
-        )
-        self._scene_quotas = SceneQuotaLedger(
-            self.scene_targets, initial_counts=resumed_scene_counts
-        )
-        self._source_quotas = QuotaLedger(
-            self.total_count,
-            max_share=self.max_source_share,
-            initial_counts=resumed_source_counts,
-        )
-        self._domain_quotas = QuotaLedger(
-            self.total_count,
-            max_share=self.max_domain_share,
-            initial_counts=resumed_domain_counts,
-        )
-
         # SQLite 状态库：传入空字符串可显式关闭，默认写入输出目录。
+        self._commit_guard = commit_guard or nullcontext
+        self._check_active = check_active or (lambda: None)
+        self._check_active()
         self._state_store = None
         self._repository = None
         if state_db != "":
@@ -637,6 +631,7 @@ class DatasetCrawler:
             self._state_store.create_job(
                 self.job_id,
                 {
+                    "output_dir": str(Path(output_dir).resolve()),
                     "keywords": keywords,
                     "total_count": total_count,
                     "scene_targets": self.scene_targets,
@@ -647,17 +642,42 @@ class DatasetCrawler:
                     "label_policy": self.label_policy.to_dict(),
                 },
             )
-            self._repository = DatasetRepository(
-                output_dir,
-                self._state_store,
-                self.job_id,
-                batch_size=batch_size,
-            )
+            try:
+                self._repository = DatasetRepository(
+                    output_dir,
+                    self._state_store,
+                    self.job_id,
+                    batch_size=batch_size,
+                    commit_guard=self._commit_guard,
+                )
+            except BaseException:
+                self._state_store.close()
+                signal.signal(signal.SIGINT, self._original_sigint)
+                signal.signal(signal.SIGTERM, self._original_sigterm)
+                raise
             self._lease_recoveries = int(
                 self._state_store.recover_expired_leases(self.job_id)
             )
         else:
             self._lease_recoveries = 0
+
+        # Restore the authority first; truncated/missing JSONL must not prevent
+        # recovery or leave the quota ledgers counting a stale compatibility view.
+        resumed_scene_counts, resumed_source_counts, resumed_domain_counts = (
+            self._load_resumed_quota_counts()
+            if resume or self._repository is not None else ({}, {}, {})
+        )
+        self._scene_quotas = SceneQuotaLedger(
+            self.scene_targets, initial_counts=resumed_scene_counts
+        )
+        self._source_quotas = QuotaLedger(
+            self.total_count, max_share=self.max_source_share,
+            initial_counts=resumed_source_counts,
+        )
+        self._domain_quotas = QuotaLedger(
+            self.total_count, max_share=self.max_domain_share,
+            initial_counts=resumed_domain_counts,
+        )
 
         self._metadata_writer = MetadataWriter(output_dir)
         self._manifest_writer = ManifestWriter(output_dir)
@@ -717,15 +737,10 @@ class DatasetCrawler:
         self._image_query_feature = None
 
         if use_clip:
-            if not _CLIP_AVAILABLE:
-                logger.warning("CLIP not available, disabling CLIP filter. "
-                             "Run: pip install git+https://github.com/openai/CLIP.git")
-                self.use_clip = False
-            else:
-                self.device = "cuda" if torch.cuda.is_available() else "cpu"
-                self.model, self.preprocess = clip.load(self.clip_model_name, device=self.device)
-                self.model.eval()
-                logger.info(f"CLIP model '{self.clip_model_name}' loaded on {self.device}")
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.model, self.preprocess = clip.load(self.clip_model_name, device=self.device)
+            self.model.eval()
+            logger.info(f"CLIP model '{self.clip_model_name}' loaded on {self.device}")
 
         if self.query_image:
             if not self.use_clip or self.model is None or self.preprocess is None:
@@ -737,16 +752,14 @@ class DatasetCrawler:
         # 断点续传：恢复已保存数量
         if resume:
             self._progress.load()
+        if self._repository is not None:
+            existing = self._repository.active_count
+            self._dir_manager.set_existing_state(existing, self._repository.next_index)
+        elif resume:
             existing = self._dir_manager.count_existing_images()
-            if existing > 0:
-                logger.info(f"断点续传：已存在 {existing} 张图片，从第 {existing + 1} 张继续")
-                # 同步目录管理器的计数器
-                next_index = existing
-                if self._repository is not None:
-                    next_index = max(existing, self._repository.next_index)
-                else:
-                    next_index = max(existing, self._dir_manager.infer_next_index())
-                self._dir_manager.set_existing_state(existing, next_index)
+            self._dir_manager.set_existing_state(
+                existing, max(existing, self._dir_manager.infer_next_index())
+            )
 
     def _should_stop(self) -> bool:
         return self._shutdown_requested.is_set() or not self._check_disk_space()
@@ -791,14 +804,16 @@ class DatasetCrawler:
         source_counts: dict[str, int] = {}
         domain_counts: dict[str, int] = {}
         path = Path(self.output_dir) / "metadata.jsonl"
-        if not path.is_file():
-            return scene_counts, source_counts, domain_counts
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-            for line in lines:
-                if not line.strip():
-                    continue
-                record = json.loads(line)
+            if self._repository is not None:
+                records = [item["metadata"] for item in
+                           self._state_store.list_dataset_items(self.job_id)]
+            elif path.is_file():
+                records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+                           if line.strip()]
+            else:
+                records = []
+            for record in records:
                 scene = self._scene_key(str(record.get("keyword") or ""))
                 if scene in self.scene_targets:
                     scene_counts[scene] = scene_counts.get(scene, 0) + 1
@@ -1216,7 +1231,7 @@ class DatasetCrawler:
         ) is not None
 
     def _query_label_decisions(self, keyword: str) -> list[LabelDecision]:
-        """从组合搜索词解析多个正式标签，未命中时保持旧兼容行为。"""
+        """搜索词只提供候选标签证据，不能证明图片中存在该类别。"""
         query = self.label_policy._key(keyword)
         fixed_by_key = {
             self.label_policy._key(label): label
@@ -1230,7 +1245,7 @@ class DatasetCrawler:
             if key and key in fixed_by_key and key not in seen:
                 seen.add(key)
                 decisions.append(LabelDecision(
-                    fixed_by_key[key], 1.0, "query", evidence,
+                    fixed_by_key[key], 1.0, "query", evidence, advisory=True,
                 ))
 
         for key, label in fixed_by_key.items():
@@ -1252,7 +1267,7 @@ class DatasetCrawler:
             })
 
         if not decisions:
-            decisions.append(LabelDecision(keyword, 1.0, "query"))
+            decisions.append(LabelDecision(keyword, 1.0, "query", advisory=True))
         return decisions
 
     def _prepare_output_image(
@@ -1282,6 +1297,7 @@ class DatasetCrawler:
         Returns:
             True 表示成功保存，False 表示跳过或失败
         """
+        self._check_active()
         if self._dir_manager.saved_count >= self.total_count:
             return False
         session = self._begin_image_session(url, keyword, source)
@@ -1614,17 +1630,22 @@ class DatasetCrawler:
             self._http.close()
         except Exception:
             pass
-        if self._repository is not None:
-            self._repository.close()
-            self._repository = None
-        if self._metadata_writer is not None:
-            self._metadata_writer.close()
-        if self._manifest_writer is not None:
-            self._manifest_writer.close()
-        self._dedup.close()
-        if self._state_store is not None:
-            self._state_store.close()
-            self._state_store = None
+        # A revoked worker lease must prevent publication, but must not prevent
+        # closing the remaining local handles or hide the original guard error.
+        first_error = None
+        for attribute in ("_repository", "_metadata_writer", "_manifest_writer",
+                          "_dedup", "_state_store"):
+            resource = getattr(self, attribute, None)
+            if resource is not None:
+                try:
+                    resource.close()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                finally:
+                    setattr(self, attribute, None)
+        if first_error is not None:
+            raise first_error
 
     def crawl(self):
         """执行数据集爬取任务。"""
@@ -1647,9 +1668,11 @@ class DatasetCrawler:
                 self._run_spider_tools_source(pbar)
             return self._finish_job()
         finally:
-            self.close()
-            signal.signal(signal.SIGINT, self._original_sigint)
-            signal.signal(signal.SIGTERM, self._original_sigterm)
+            try:
+                self.close()
+            finally:
+                signal.signal(signal.SIGINT, self._original_sigint)
+                signal.signal(signal.SIGTERM, self._original_sigterm)
 
     def _collect_job_report_stats(self) -> dict[str, Any]:
         db_stats = None
@@ -1706,28 +1729,30 @@ class DatasetCrawler:
         self.stats.end_time = time.monotonic()
         report = self._collect_job_report_stats()
         policy = self.config.compliance_policy()
-        attach_dataset_lineage(
-            report,
-            job_id=self.job_id,
-            output_dir=self.output_dir,
-            config_snapshot=getattr(self, "_config_snapshot", {}),
-            clip_model=self.clip_model_name if self.use_clip else None,
-            extra_provenance={
-                "saved_count": self._dir_manager.saved_count,
-                "scene_quality_gate_enabled": self.scene_quality_gate_enabled,
-                "compliance": policy.to_dict(),
-            },
-        )
-        checklist = attach_dataset_publish_bundle(
-            report,
-            job_id=self.job_id,
-            output_dir=self.output_dir,
-            policy=policy,
-            config_snapshot=getattr(self, "_config_snapshot", {}),
-        )
-        if checklist is not None:
-            self.last_publish_checklist = checklist
-        self._persist_job_report(report)
+        self._check_active()
+        with self._commit_guard():
+            attach_dataset_lineage(
+                report,
+                job_id=self.job_id,
+                output_dir=self.output_dir,
+                config_snapshot=getattr(self, "_config_snapshot", {}),
+                clip_model=self.clip_model_name if self.use_clip else None,
+                extra_provenance={
+                    "saved_count": self._dir_manager.saved_count,
+                    "scene_quality_gate_enabled": self.scene_quality_gate_enabled,
+                    "compliance": policy.to_dict(),
+                },
+            )
+            checklist = attach_dataset_publish_bundle(
+                report,
+                job_id=self.job_id,
+                output_dir=self.output_dir,
+                policy=policy,
+                config_snapshot=getattr(self, "_config_snapshot", {}),
+            )
+            if checklist is not None:
+                self.last_publish_checklist = checklist
+            self._persist_job_report(report)
         self._emit_callback(CrawlEvent(
             event_type="crawl_done", keyword="",
             media_type="image", detail=report,

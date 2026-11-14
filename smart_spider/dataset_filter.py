@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -24,6 +25,7 @@ from tqdm import tqdm
 
 from .image_retrieval import IMAGE_SUFFIXES
 from .dataset_governance import cluster_embeddings, perceptual_fingerprint
+from .dataset_repository import DatasetRepository
 
 
 from .dataset_filter_types import (  # noqa: F401
@@ -133,6 +135,14 @@ class DatasetImageFilter:
     RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     INCREMENTAL_STATE_FILE = "_filter_cache/incremental_state.json"
 
+    @staticmethod
+    def _recover_repository(dataset: Path) -> bool:
+        repository = DatasetRepository.open_existing(dataset)
+        if repository is None:
+            return False
+        repository.close()
+        return True
+
     @classmethod
     def _read_active_runs(cls, dataset: Path) -> list[dict[str, Any]]:
         active_path = dataset / cls.ACTIVE_RUN_FILE
@@ -188,10 +198,11 @@ class DatasetImageFilter:
         self.analyzer = analyzer
         self.policy = policy or DecisionPolicy()
         self.batch_size = batch_size
+        self._repository_backed = self._recover_repository(self.dataset_dir)
 
     def _load_records(self) -> list[dict[str, Any]]:
         records = _read_jsonl(self.dataset_dir / "metadata.jsonl")
-        if records:
+        if records or self._repository_backed:
             return records
         return [
             {"file_path": str(path.relative_to(self.dataset_dir))}
@@ -429,6 +440,15 @@ class DatasetImageFilter:
         paths = [item.path for item in rejected]
         if len(paths) != len(set(paths)):
             raise RuntimeError("cannot apply a run containing duplicate image paths")
+        repository = DatasetRepository.open_existing(self.dataset_dir)
+        if repository is not None:
+            try:
+                repository.quarantine(run_id, [item.to_dict() for item in decisions])
+            finally:
+                # A failed operation remains in the WAL journal for the next
+                # opener. Do not retry filesystem side effects while unwinding.
+                repository.state.close()
+            return
         backups = run_dir / "backups"
         backups.mkdir(parents=True, exist_ok=True)
         for name in ("metadata.jsonl", "manifest.jsonl"):
@@ -548,6 +568,7 @@ class DatasetImageFilter:
         dataset = Path(dataset_dir).expanduser().resolve()
         if not dataset.is_dir():
             raise NotADirectoryError(f"dataset directory not found: {dataset}")
+        cls._recover_repository(dataset)
         run_id = run_id or datetime.now().strftime("exact_dedupe_%Y%m%d_%H%M%S")
         if not cls.RUN_ID_PATTERN.fullmatch(run_id):
             raise ValueError("run_id may only contain letters, digits, dot, underscore, and dash")
@@ -667,6 +688,7 @@ class DatasetImageFilter:
         dataset = Path(dataset_dir).expanduser().resolve()
         if not dataset.is_dir():
             raise NotADirectoryError(f"dataset directory not found: {dataset}")
+        cls._recover_repository(dataset)
         run_id = run_id or datetime.now().strftime("near_dedupe_%Y%m%d_%H%M%S")
         if not cls.RUN_ID_PATTERN.fullmatch(run_id):
             raise ValueError("run_id may only contain letters, digits, dot, underscore, and dash")
@@ -845,6 +867,7 @@ class DatasetImageFilter:
         dataset = Path(dataset_dir).expanduser().resolve()
         if not dataset.is_dir():
             raise NotADirectoryError(f"dataset directory not found: {dataset}")
+        cls._recover_repository(dataset)
         run_id = run_id or datetime.now().strftime("review_reject_%Y%m%d_%H%M%S")
         if not cls.RUN_ID_PATTERN.fullmatch(run_id):
             raise ValueError("run_id may only contain letters, digits, dot, underscore, and dash")
@@ -935,6 +958,11 @@ class DatasetImageFilter:
         errors: list[str] = []
         if not dataset.is_dir():
             return {"ok": False, "dataset": str(dataset), "errors": ["dataset directory not found"]}
+        repository_items = None
+        try:
+            repository_items = DatasetRepository.inspect_inventory(dataset)
+        except (OSError, ValueError, RuntimeError, sqlite3.DatabaseError) as exc:
+            errors.append(f"repository verification failed: {exc}")
 
         def read(path: Path) -> list[dict[str, Any]]:
             try:
@@ -1033,6 +1061,11 @@ class DatasetImageFilter:
         manifest_paths = normalized_paths(manifest, _manifest_path)
         if manifest and metadata_paths != manifest_paths:
             errors.append("manifest and metadata image paths differ")
+        if repository_items is not None:
+            registered_active = {item["relative_path"] for item in repository_items
+                                 if item["state"] == "committed"}
+            if metadata_paths != registered_active:
+                errors.append("active JSONL paths differ from repository state")
 
         quarantined = 0
         quarantine_checked = 0
@@ -1146,7 +1179,11 @@ class DatasetImageFilter:
 
             expected_paths = {repaired_path(path) for path in baseline_paths}
             missing_paths = expected_paths - seen_paths
-            unexpected_paths = (seen_paths - expected_paths) - layout_added_paths
+            # Repository-backed replenishment is explicit authority, whereas
+            # unregistered legacy additions still require a layout repair map.
+            registered_paths = ({item["relative_path"] for item in repository_items}
+                                if repository_items is not None else set())
+            unexpected_paths = (seen_paths - expected_paths) - layout_added_paths - registered_paths
             if missing_paths or unexpected_paths:
                 missing = len(missing_paths)
                 unexpected = len(unexpected_paths)
@@ -1154,6 +1191,11 @@ class DatasetImageFilter:
                     f"active/quarantine chain differs from baseline: "
                     f"missing={missing}, unexpected={unexpected}"
                 )
+
+        if repository_items is not None:
+            registered_paths = {item["relative_path"] for item in repository_items}
+            if seen_paths != registered_paths:
+                errors.append("active/quarantine asset inventory differs from repository state")
 
         result = {
             "ok": not errors,
@@ -1192,6 +1234,12 @@ class DatasetImageFilter:
         dataset = Path(dataset_dir).expanduser().resolve()
         if not cls.RUN_ID_PATTERN.fullmatch(run_id):
             raise ValueError("invalid quarantine run id")
+        repository = DatasetRepository.open_existing(dataset)
+        if repository is not None:
+            try:
+                return repository.restore_quarantine(run_id)
+            finally:
+                repository.state.close()
         active_runs = cls._read_active_runs(dataset)
         if not active_runs:
             raise RuntimeError("no active applied filter run")

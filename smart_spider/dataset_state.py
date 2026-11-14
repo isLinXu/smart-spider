@@ -132,6 +132,23 @@ class DatasetStateStore:
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(job_id) REFERENCES jobs(job_id)
                 );
+                CREATE TABLE IF NOT EXISTS dataset_roots (
+                    job_id TEXT PRIMARY KEY,
+                    root TEXT NOT NULL UNIQUE,
+                    FOREIGN KEY(job_id) REFERENCES jobs(job_id)
+                );
+                CREATE TABLE IF NOT EXISTS dataset_operations (
+                    operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'prepared',
+                    plan_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(job_id, kind, run_id),
+                    FOREIGN KEY(job_id) REFERENCES jobs(job_id)
+                );
                 CREATE TABLE IF NOT EXISTS multimodal_items (
                     item_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     job_id TEXT NOT NULL,
@@ -405,10 +422,142 @@ class DatasetStateStore:
     def abort_dataset_item(self, item_id: int) -> bool:
         with self._lock, self._conn:
             cursor = self._conn.execute(
-                "DELETE FROM dataset_items WHERE item_id=? AND state!='committed'",
+                "DELETE FROM dataset_items WHERE item_id=? AND state IN ('pending', 'prepared')",
                 (item_id,),
             )
             return bool(cursor.rowcount)
+
+    def bind_dataset_root(self, job_id: str, root: str) -> None:
+        """Bind a job to its output directory independently of mutable config."""
+        canonical = os.path.realpath(root)
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO dataset_roots(job_id, root) VALUES (?, ?)",
+                (job_id, canonical),
+            )
+            row = self._conn.execute(
+                "SELECT root FROM dataset_roots WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if row is None or row["root"] != canonical:
+                raise ValueError("dataset job is already bound to another output directory")
+
+    def dataset_root(self, job_id: str) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT root FROM dataset_roots WHERE job_id=?", (job_id,)
+            ).fetchone()
+        return str(row["root"]) if row is not None else None
+
+    def dataset_job_ids(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT job_id FROM dataset_items UNION SELECT job_id FROM dataset_roots"
+            ).fetchall()
+        return [str(row["job_id"]) for row in rows]
+
+    def prepare_dataset_operation(
+        self, job_id: str, run_id: str, kind: str, plan: dict[str, Any]
+    ) -> int:
+        """Durably log a complete filesystem plan before moving any asset."""
+        if kind not in {"quarantine", "restore"}:
+            raise ValueError("unsupported dataset operation")
+        now = utc_now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if self._conn.execute(
+                    "SELECT 1 FROM dataset_operations WHERE job_id=? AND state!='published'",
+                    (job_id,),
+                ).fetchone():
+                    raise RuntimeError("recover the unfinished dataset operation first")
+                expected = "committed" if kind == "quarantine" else "quarantined"
+                for move in plan["moves"]:
+                    row = self._conn.execute(
+                        "SELECT state, relative_path, content_hash FROM dataset_items "
+                        "WHERE item_id=? AND job_id=?", (move["item_id"], job_id),
+                    ).fetchone()
+                    if (row is None or row["state"] != expected
+                            or row["relative_path"] != move["relative_path"]
+                            or row["content_hash"] != move["content_hash"]):
+                        raise RuntimeError("dataset operation has stale or foreign sample state")
+                cursor = self._conn.execute(
+                    "INSERT INTO dataset_operations(job_id, run_id, kind, plan_json, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (job_id, run_id, kind, json.dumps(plan, ensure_ascii=False), now, now),
+                )
+                self._conn.commit()
+                return int(cursor.lastrowid)
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def list_dataset_operations(
+        self, job_id: str, *, unfinished_only: bool = False
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM dataset_operations WHERE job_id=? "
+                + ("AND state!='published' " if unfinished_only else "")
+                + "ORDER BY operation_id", (job_id,)
+            ).fetchall()
+        result = []
+        for row in rows:
+            operation = dict(row)
+            operation["plan"] = json.loads(operation.pop("plan_json"))
+            result.append(operation)
+        return result
+
+    def finalize_dataset_operation(self, operation_id: int) -> None:
+        """Atomically switch all item/sample states after the logged moves finish."""
+        now = utc_now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM dataset_operations WHERE operation_id=?", (operation_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(operation_id)
+                if row["state"] != "prepared":
+                    self._conn.rollback()
+                    return
+                plan = json.loads(row["plan_json"])
+                source, target = (("committed", "quarantined") if row["kind"] == "quarantine"
+                                  else ("quarantined", "committed"))
+                for move in plan["moves"]:
+                    cursor = self._conn.execute(
+                        "UPDATE dataset_items SET state=?, updated_at=? "
+                        "WHERE item_id=? AND job_id=? AND state=? AND content_hash=?",
+                        (target, now, move["item_id"], row["job_id"], source, move["content_hash"]),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("dataset operation item state changed during recovery")
+                    self._conn.execute(
+                        "UPDATE samples SET state=CASE WHEN EXISTS ("
+                        "SELECT 1 FROM dataset_items WHERE job_id=? AND content_hash=? AND state='committed'"
+                        ") THEN 'accepted' ELSE 'quarantined' END, updated_at=? "
+                        "WHERE job_id=? AND content_hash=?",
+                        (row["job_id"], move["content_hash"], now, row["job_id"], move["content_hash"]),
+                    )
+                self._record_event_locked(row["job_id"], None, "dataset_" + row["kind"], {
+                    "operation_id": operation_id, "run_id": row["run_id"],
+                    "items": len(plan["moves"]),
+                })
+                self._conn.execute(
+                    "UPDATE dataset_operations SET state='committed', updated_at=? WHERE operation_id=?",
+                    (now, operation_id),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def publish_dataset_operation(self, operation_id: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE dataset_operations SET state='published', updated_at=? "
+                "WHERE operation_id=? AND state='committed'", (utc_now(), operation_id),
+            )
 
     def list_dataset_items(
         self,
@@ -463,6 +612,20 @@ class DatasetStateStore:
                 (job_id,),
             ).fetchone()["maximum"]
         return int(maximum) + 1 if maximum is not None else 0
+
+    def dataset_inventory_initialized(self, job_id: str) -> bool:
+        """Distinguish an authoritative empty inventory from a first legacy import."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM dataset_counters WHERE job_id=?", (job_id,)
+            ).fetchone() is not None
+
+    def initialize_empty_dataset_inventory(self, job_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO dataset_counters(job_id, next_index, updated_at) "
+                "VALUES (?, 0, ?)", (job_id, utc_now()),
+            )
 
     def import_dataset_items(
         self,
@@ -624,7 +787,7 @@ class DatasetStateStore:
                 raise KeyError(f"unknown candidate: {candidate_id}")
             if row["state"] == "leased" and row["lease_until"] and row["lease_until"] >= now:
                 return False
-            if row["state"] in {"accepted", "rejected", "failed"}:
+            if row["state"] in {"accepted", "rejected", "failed", "needs_review"}:
                 return False
             self._conn.execute(
                 """
@@ -1130,3 +1293,154 @@ class DatasetStateStore:
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
+
+    def _ensure_multimodal_reviews_locked(self) -> None:
+        """Lazy schema keeps old databases readable without migrating samples."""
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS multimodal_reviews (
+                review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                sample_id TEXT NOT NULL,
+                candidate_ids_json TEXT NOT NULL,
+                asset_paths_json TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                decision_json TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'prepared',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(job_id, sample_id)
+            )"""
+        )
+
+    def prepare_multimodal_review(
+        self, job_id: str, sample: SampleRecord, *, candidate_ids: list[str],
+        assets: list[dict[str, Any]], decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Durably retain a review intent before publishing its staged assets."""
+        now = utc_now()
+        sample.validate()
+        if decision.get("action") != "review":
+            raise ValueError("only review decisions may be retained")
+        manifest_json = json.dumps(sample.to_dict(), ensure_ascii=False, allow_nan=False)
+        decision_json = json.dumps(decision, ensure_ascii=False, allow_nan=False)
+        with self._lock:
+            self._ensure_multimodal_reviews_locked()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT review_id, state, created_at FROM multimodal_reviews WHERE job_id=? AND sample_id=?",
+                    (job_id, sample.sample_id),
+                ).fetchone()
+                if row is not None:
+                    self._conn.rollback()
+                    return {"review_id": int(row["review_id"]), "status": row["state"],
+                            "created_at": row["created_at"]}
+                cursor = self._conn.execute(
+                    """INSERT INTO multimodal_reviews(
+                        job_id, sample_id, candidate_ids_json, asset_paths_json,
+                        manifest_json, decision_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (job_id, sample.sample_id, json.dumps(candidate_ids),
+                     json.dumps(assets, ensure_ascii=False), manifest_json,
+                     decision_json, now, now),
+                )
+                self._record_event_locked(
+                    job_id, candidate_ids[0] if candidate_ids else None,
+                    "multimodal_review_prepared", {"sample_id": sample.sample_id},
+                )
+                self._conn.commit()
+                return {"review_id": int(cursor.lastrowid), "status": "prepared", "created_at": now}
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def finalize_multimodal_review(self, review_id: int) -> bool:
+        """Review assets are durable, but never become accepted sample rows."""
+        with self._lock:
+            self._ensure_multimodal_reviews_locked()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM multimodal_reviews WHERE review_id=?", (review_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"unknown multimodal review: {review_id}")
+                if row["state"] == "needs_review":
+                    self._conn.rollback()
+                    return False
+                if row["state"] != "prepared":
+                    raise RuntimeError(f"review {review_id} is not prepared")
+                now = utc_now()
+                candidate_ids = json.loads(row["candidate_ids_json"])
+                for candidate_id in candidate_ids:
+                    self._conn.execute(
+                        """UPDATE candidates SET state='needs_review', lease_token=NULL,
+                            lease_until=NULL, last_error=NULL, updated_at=?
+                            WHERE candidate_id=? AND job_id=? AND state!='accepted'""",
+                        (now, candidate_id, row["job_id"]),
+                    )
+                self._conn.execute(
+                    "UPDATE multimodal_reviews SET state='needs_review', updated_at=? WHERE review_id=?",
+                    (now, review_id),
+                )
+                self._record_event_locked(
+                    row["job_id"], candidate_ids[0] if candidate_ids else None,
+                    "multimodal_needs_review", {"sample_id": row["sample_id"]},
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def list_multimodal_reviews(
+        self, job_id: str, states: tuple[str, ...] = ("needs_review",),
+    ) -> list[dict[str, Any]]:
+        if not states:
+            return []
+        with self._lock:
+            self._ensure_multimodal_reviews_locked()
+            placeholders = ",".join("?" for _ in states)
+            rows = self._conn.execute(
+                f"SELECT * FROM multimodal_reviews WHERE job_id=? AND state IN ({placeholders}) ORDER BY review_id",
+                (job_id, *states),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            for name, column in (("candidate_ids", "candidate_ids_json"),
+                                 ("assets", "asset_paths_json"),
+                                 ("manifest", "manifest_json"), ("decision", "decision_json")):
+                item[name] = json.loads(item.pop(column))
+            result.append(item)
+        return result
+
+    def abort_multimodal_review(self, review_id: int) -> bool:
+        """A missing prepare asset releases only this review's active leases."""
+        with self._lock:
+            self._ensure_multimodal_reviews_locked()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM multimodal_reviews WHERE review_id=?", (review_id,),
+                ).fetchone()
+                if row is None or row["state"] != "prepared":
+                    self._conn.rollback()
+                    return False
+                for candidate_id in json.loads(row["candidate_ids_json"]):
+                    self._conn.execute(
+                        """UPDATE candidates SET state='retry_wait', available_at=?,
+                            lease_token=NULL, lease_until=NULL, updated_at=?
+                            WHERE candidate_id=? AND job_id=? AND state='leased'""",
+                        (time.time(), utc_now(), candidate_id, row["job_id"]),
+                    )
+                self._conn.execute("DELETE FROM multimodal_reviews WHERE review_id=?", (review_id,))
+                self._record_event_locked(
+                    row["job_id"], None, "multimodal_review_aborted",
+                    {"sample_id": row["sample_id"], "reason": "asset_recovery_failed"},
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
