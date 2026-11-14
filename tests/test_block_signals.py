@@ -35,6 +35,6 @@ def test_apply_block_terminal_dead(tmp_path):
     claimed = queue.claim()
     assert claimed is not None
     signal = classify_page_html("安全验证 captcha", status_code=200)
-    done = apply_block_to_queue(queue, record.task_id, signal)
+    done = apply_block_to_queue(queue, record.task_id, signal, claim_token=claimed.claim_token)
     assert done.status == "dead"
     assert done.error.startswith("block:challenge:")

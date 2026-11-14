@@ -2,6 +2,7 @@
 """令牌桶限速（从 http_client 拆出）。"""
 from __future__ import annotations
 
+import math
 import threading
 import time
 
@@ -16,18 +17,24 @@ class RateLimiter:
       睡眠期间其他线程已补充并消耗了 token，醒来后再减会导致 token 变成负数，
       使下一个请求需要等待更长时间（误差累积）。
     - 新版改为「持锁计算等待时间 → 释放锁 → sleep → 再持锁消耗 token」，
-      用 condition variable 替代裸 sleep，确保唤醒后 token 状态一致。
+      唤醒后重新计算 token，确保多个线程竞争时状态一致。
     """
 
-    def __init__(self, rate: float):
+    def __init__(self, rate: float, *, capacity: float | None = None):
         """
         Args:
             rate: 每秒允许的最大请求数（令牌补充速率）
+            capacity: 突发容量，至少 1；默认 max(1, rate)，启动时桶满。
         """
-        if rate <= 0:
-            raise ValueError("rate must be positive")
+        rate = float(rate)
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError("rate must be finite and positive")
+        capacity = max(1.0, rate) if capacity is None else float(capacity)
+        if not math.isfinite(capacity) or capacity < 1:
+            raise ValueError("capacity must be finite and at least 1")
         self._rate = rate
-        self._tokens = rate
+        self._capacity = capacity
+        self._tokens = capacity
         self._last = time.monotonic()
         self._lock = threading.Lock()
 
@@ -36,7 +43,7 @@ class RateLimiter:
         now = time.monotonic()
         elapsed = now - self._last
         self._last = now
-        self._tokens = min(self._rate, self._tokens + elapsed * self._rate)
+        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
 
     def acquire(self):
         """阻塞直到获取一个令牌（精确令牌桶，无 double-lock Bug）。"""
@@ -50,4 +57,3 @@ class RateLimiter:
                 wait = (1.0 - self._tokens) / self._rate
             # 在锁外 sleep，避免持锁阻塞其他线程
             time.sleep(wait)
-

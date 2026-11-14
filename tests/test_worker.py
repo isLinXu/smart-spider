@@ -19,7 +19,7 @@ def test_worker_runs_dataset_crawl_once(tmp_path, monkeypatch):
         total_count=1,
         output_dir=str(tmp_path / "out"),
         use_clip=False,
-        state_db="",
+        state_db=str(tmp_path / "state.sqlite3"),
     )
     enqueued = queue.enqueue("dataset_crawl", {"config": config.to_dict()})
 
@@ -53,7 +53,7 @@ def test_worker_failure_retries_then_dead(tmp_path, monkeypatch):
         total_count=1,
         output_dir=str(tmp_path / "out"),
         use_clip=False,
-        state_db="",
+        state_db=str(tmp_path / "state.sqlite3"),
     )
     enqueued = queue.enqueue(
         "dataset_crawl", {"config": config.to_dict()}, max_attempts=2
@@ -86,7 +86,7 @@ def test_worker_recovers_expired_claims_before_poll(tmp_path, monkeypatch):
         total_count=1,
         output_dir=str(tmp_path / "out"),
         use_clip=False,
-        state_db="",
+        state_db=str(tmp_path / "state.sqlite3"),
     )
     enqueued = queue.enqueue("dataset_crawl", {"config": config.to_dict()})
     claimed = queue.claim(lease_seconds=1, worker_id="stale")

@@ -13,6 +13,10 @@ TASK_STATUSES = frozenset(
 )
 
 
+class StaleClaimError(RuntimeError):
+    """The caller no longer owns an active, unexpired task claim."""
+
+
 @dataclass
 class TaskRecord:
     """本地/远程队列中的一条任务记录。"""
@@ -28,6 +32,8 @@ class TaskRecord:
     max_attempts: int = 3
     lease_until: float = 0.0
     claimed_by: str = ""
+    claim_token: str = ""
+    claim_generation: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -74,12 +80,21 @@ class TaskQueue(Protocol):
         """领取一条 pending 任务并标记为 running（带租约）。"""
 
     def complete(
-        self, task_id: str, *, error: str = "", terminal: bool = False
+        self, task_id: str, *, claim_token: str, worker_id: str = "",
+        error: str = "", terminal: bool = False,
     ) -> TaskRecord:
         """标记成功；失败时按 attempts/max_attempts 重试或进入 dead。
 
+        必须提供 claim 返回的 token 与 worker_id；失效或过期时抛出
+        StaleClaimError，不修改当前任务。
         ``terminal=True`` 表示不可恢复错误（如挑战页/策略拒绝），直接死信。
         """
+
+    def renew(
+        self, task_id: str, *, claim_token: str, worker_id: str = "",
+        lease_seconds: float = 300.0,
+    ) -> TaskRecord:
+        """Extend an owned unexpired lease; stale callers must be rejected."""
 
     def get(self, task_id: str) -> Optional[TaskRecord]:
         """按 id 查询。"""

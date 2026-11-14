@@ -3,12 +3,13 @@
 
 from .local_queue import LocalSqliteTaskQueue
 from .local_store import LocalFilesystemObjectStore
-from .protocols import ObjectStore, TaskQueue, TaskRecord
+from .protocols import ObjectStore, StaleClaimError, TaskQueue, TaskRecord
 
 __all__ = [
     "LocalFilesystemObjectStore",
     "LocalSqliteTaskQueue",
     "ObjectStore",
+    "StaleClaimError",
     "TaskQueue",
     "TaskRecord",
 ]

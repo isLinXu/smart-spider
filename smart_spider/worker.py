@@ -25,29 +25,59 @@ from loguru import logger
 from .dataset_config import DatasetCrawlConfig
 from .dataset_crawler import DatasetCrawler
 from .pipeline import get_task_queue
-from .pipeline.protocols import TaskQueue
+from .pipeline.protocols import StaleClaimError, TaskQueue
+from .task_execution import TaskExecutionContext, dataset_writer_lock
 
 
-def handle_task(task, queue: Optional[TaskQueue] = None) -> None:
+def handle_task(task, queue: Optional[TaskQueue] = None, execution_context=None) -> None:
     """执行单条已 claim 的任务。"""
     if task.kind == "dataset_crawl":
+        if execution_context is not None and not callable(getattr(queue, "lease_guard", None)):
+            raise UnsupportedTaskBackendError(
+                "dataset_crawl requires a SQLite queue with local publication fencing; "
+                "Redis dataset execution is not supported"
+            )
         raw = task.payload.get("config") or task.payload
         config = DatasetCrawlConfig.from_mapping(raw)
+        if execution_context is not None and config.state_db == "":
+            raise UnsupportedTaskBackendError(
+                "dataset_crawl workers require a state database and guarded repository; "
+                "legacy state_db='' mode is only supported by direct CLI execution"
+            )
+        if execution_context is not None:
+            state_path = config.state_db or os.path.join(config.output_dir, ".dataset_state.sqlite3")
+            queue_path = getattr(queue, "db_path", None)
+            if queue_path:
+                same_file = os.path.realpath(state_path) == os.path.realpath(queue_path)
+                if os.path.exists(state_path) and os.path.exists(queue_path):
+                    same_file = same_file or os.path.samefile(state_path, queue_path)
+                if same_file:
+                    raise UnsupportedTaskBackendError(
+                        "dataset state database must differ from the queue database; "
+                        "publication fencing holds a queue write transaction"
+                    )
         logger.info(
             "worker running dataset_crawl task={} keywords={} total={}",
             task.task_id,
             config.keywords,
             config.total_count,
         )
-        DatasetCrawler.from_config(config).crawl()
+        options = {} if execution_context is None else {
+            "commit_guard": execution_context.commit_guard,
+            "check_active": execution_context.check_active,
+        }
+        with dataset_writer_lock(config.output_dir):
+            if execution_context is not None:
+                execution_context.check_active()
+            DatasetCrawler.from_config(config, **options).crawl()
         return
     if task.kind == "authorized_browse":
-        _handle_authorized_browse(task, queue)
+        _handle_authorized_browse(task, queue, execution_context=execution_context)
         return
     raise ValueError(f"unsupported task kind: {task.kind}")
 
 
-def _handle_authorized_browse(task, queue: Optional[TaskQueue]) -> dict:
+def _handle_authorized_browse(task, queue: Optional[TaskQueue], execution_context=None) -> dict:
     """授权浏览剧本：导航/滚动/抽链，可选入队后续链接。"""
     from .block_signals import BlockKind
     from .browser_controller import BrowserController
@@ -57,6 +87,8 @@ def _handle_authorized_browse(task, queue: Optional[TaskQueue]) -> dict:
     url = str(task.payload.get("url") or "").strip()
     if not url:
         raise ValueError("authorized_browse payload requires url")
+    if execution_context is not None:
+        execution_context.check_active()
     policy = SiteCrawlPolicy.from_mapping(task.payload.get("policy") or {})
     depth = int(task.payload.get("depth") or 0)
     storage_state, cookies = policy.resolve_session()
@@ -85,6 +117,8 @@ def _handle_authorized_browse(task, queue: Optional[TaskQueue]) -> dict:
     follow_ids: list[str] = []
     enqueue_links = bool(task.payload.get("enqueue_links", True))
     if enqueue_links and queue is not None and depth < policy.max_depth:
+        if execution_context is not None:
+            execution_context.check_active()
         follow_ids = enqueue_discovered_links(
             queue,
             result.links,
@@ -96,6 +130,7 @@ def _handle_authorized_browse(task, queue: Optional[TaskQueue]) -> dict:
                 "steps": task.payload.get("steps") or [],
                 "profile": task.payload.get("profile") or "",
             },
+            check_active=None if execution_context is None else execution_context.check_active,
         )
     logger.info(
         "authorized_browse task={} url={} links={} enqueued={}",
@@ -116,6 +151,10 @@ class BrowseBlockError(RuntimeError):
     def __init__(self, signal):
         super().__init__(signal.queue_error)
         self.signal = signal
+
+
+class UnsupportedTaskBackendError(RuntimeError):
+    """The selected backend cannot safely execute this task kind."""
 
 
 def run_worker(
@@ -159,52 +198,39 @@ def run_worker(
                 return processed
             time.sleep(max(0.1, poll_interval))
             continue
+        context = TaskExecutionContext(queue, task, lease_seconds=lease_seconds)
+        error = ""
+        terminal = False
+        stale = False
         try:
-            handle_task(task, queue=queue)
-            done = queue.complete(task.task_id)
-            processed += 1
-            from .metrics import observe_task_outcome
-
-            observe_task_outcome(task.kind, done.status)
-            logger.info("worker completed task={}", task.task_id)
+            with context:
+                handle_task(task, queue=queue, execution_context=context)
+                context.check_active()
+        except StaleClaimError:
+            stale = True
+            logger.warning("worker discarded stale task={}", task.task_id)
         except BrowseBlockError as exc:
-            done = queue.complete(
-                task.task_id,
-                error=str(exc),
-                terminal=not exc.signal.retryable,
-            )
-            processed += 1
-            from .metrics import observe_task_outcome
-
-            observe_task_outcome(task.kind, done.status)
-            logger.info(
-                "worker task={} block={} status={} attempts={}/{}",
-                task.task_id,
-                exc.signal.kind.value,
-                done.status,
-                done.attempts,
-                done.max_attempts,
-            )
+            error = str(exc)
+            terminal = not exc.signal.retryable
+        except UnsupportedTaskBackendError as exc:
+            error = str(exc)
+            terminal = True
         except Exception as exc:
-            detail = f"{type(exc).__name__}: {exc}"
-            logger.error(
-                "worker failed task={}: {}\n{}",
-                task.task_id,
-                detail,
-                traceback.format_exc(),
-            )
-            done = queue.complete(task.task_id, error=detail)
-            processed += 1
-            from .metrics import observe_task_outcome
+            error = f"{type(exc).__name__}: {exc}"
+            logger.error("worker failed task={}: {}\n{}", task.task_id, error, traceback.format_exc())
+        if not stale:
+            try:
+                done = queue.complete(
+                    task.task_id, error=error, terminal=terminal, **context.claim_kwargs,
+                )
+            except StaleClaimError:
+                logger.warning("worker completion rejected for stale task={}", task.task_id)
+            else:
+                from .metrics import observe_task_outcome
 
-            observe_task_outcome(task.kind, done.status)
-            logger.info(
-                "worker task={} now status={} attempts={}/{}",
-                task.task_id,
-                done.status,
-                done.attempts,
-                done.max_attempts,
-            )
+                observe_task_outcome(task.kind, done.status)
+                logger.info("worker task={} status={}", task.task_id, done.status)
+        processed += 1
         if once:
             return processed
 

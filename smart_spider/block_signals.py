@@ -114,13 +114,17 @@ def decide_queue_action(signal: BlockSignal) -> str:
     return "dead"
 
 
-def apply_block_to_queue(queue, task_id: str, signal: BlockSignal):
+def apply_block_to_queue(
+    queue, task_id: str, signal: BlockSignal, *, claim_token: str, worker_id: str = "",
+):
     """按分类写回队列；返回 complete 后的 TaskRecord。"""
     action = decide_queue_action(signal)
     if action == "succeed":
-        return queue.complete(task_id)
+        return queue.complete(task_id, claim_token=claim_token, worker_id=worker_id)
     return queue.complete(
         task_id,
+        claim_token=claim_token,
+        worker_id=worker_id,
         error=signal.queue_error,
         terminal=(action == "dead"),
     )

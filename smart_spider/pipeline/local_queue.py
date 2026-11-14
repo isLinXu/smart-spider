@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from typing import Any, Optional, Sequence
 
-from .protocols import TASK_STATUSES, TaskRecord
+from .protocols import TASK_STATUSES, StaleClaimError, TaskRecord
 
 
 class LocalSqliteTaskQueue:
@@ -21,12 +23,13 @@ class LocalSqliteTaskQueue:
             raise ValueError("default_max_attempts must be positive")
         self.db_path = db_path
         self.default_max_attempts = int(default_max_attempts)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         parent = os.path.dirname(db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -71,6 +74,8 @@ class LocalSqliteTaskQueue:
             "max_attempts": "INTEGER NOT NULL DEFAULT 3",
             "lease_until": "REAL NOT NULL DEFAULT 0",
             "claimed_by": "TEXT NOT NULL DEFAULT ''",
+            "claim_token": "TEXT NOT NULL DEFAULT ''",
+            "claim_generation": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, declaration in alterations.items():
             if name not in columns:
@@ -91,6 +96,8 @@ class LocalSqliteTaskQueue:
             max_attempts=int(row["max_attempts"]) if "max_attempts" in keys else 3,
             lease_until=float(row["lease_until"]) if "lease_until" in keys else 0.0,
             claimed_by=str(row["claimed_by"] or "") if "claimed_by" in keys else "",
+            claim_token=str(row["claim_token"] or "") if "claim_token" in keys else "",
+            claim_generation=int(row["claim_generation"]) if "claim_generation" in keys else 0,
         )
 
     def enqueue(
@@ -146,9 +153,10 @@ class LocalSqliteTaskQueue:
         lease_seconds: float = 300.0,
         worker_id: str = "",
     ) -> Optional[TaskRecord]:
-        if lease_seconds <= 0:
-            raise ValueError("lease_seconds must be positive")
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be finite and positive")
         with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             if kind:
                 row = conn.execute(
                     "SELECT * FROM tasks WHERE status='pending' AND kind=? "
@@ -172,59 +180,88 @@ class LocalSqliteTaskQueue:
                     attempts=attempts + 1,
                     lease_until=?,
                     claimed_by=?,
+                    claim_token=?,
+                    claim_generation=claim_generation + 1,
                     error=''
                 WHERE task_id=? AND status='pending'
                 """,
-                (now, lease_until, worker_id or "", row["task_id"]),
+                (now, lease_until, worker_id or "", uuid.uuid4().hex, row["task_id"]),
             )
             if cursor.rowcount != 1:
                 conn.commit()
                 return None
-            conn.commit()
             updated = conn.execute(
                 "SELECT * FROM tasks WHERE task_id=?", (row["task_id"],)
             ).fetchone()
+            conn.commit()
             return self._row_to_record(updated)
 
-    def complete(
-        self, task_id: str, *, error: str = "", terminal: bool = False
-    ) -> TaskRecord:
-        now = time.time()
+    @staticmethod
+    def _require_claim(conn, task_id: str, claim_token: str, worker_id: str) -> TaskRecord:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if row is None:
+            raise KeyError(task_id)
+        record = LocalSqliteTaskQueue._row_to_record(row)
+        if (not claim_token or record.status != "running"
+                or record.claim_token != claim_token
+                or record.claimed_by != worker_id
+                or record.lease_until <= time.time()):
+            raise StaleClaimError(f"stale task claim: {task_id}")
+        return record
+
+    @contextmanager
+    def lease_guard(self, task_id: str, *, claim_token: str, worker_id: str = ""):
+        """Fence a short local publish while blocking claim/recovery writers.
+
+        The caller must not perform network or model work while holding this
+        SQLite write transaction. Repository publication is still recoverable,
+        not an atomic transaction across the queue and repository databases.
+        """
         with self._lock, self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM tasks WHERE task_id=?", (task_id,)
-            ).fetchone()
-            if row is None:
-                raise KeyError(task_id)
-            record = self._row_to_record(row)
-            if error:
-                if terminal or record.attempts >= record.max_attempts:
-                    status = "dead"
-                else:
-                    status = "pending"
-                conn.execute(
-                    """
-                    UPDATE tasks
-                    SET status=?, error=?, updated_at=?, lease_until=0, claimed_by=''
-                    WHERE task_id=?
-                    """,
-                    (status, error, now, task_id),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE tasks
-                    SET status='succeeded', error='', updated_at=?,
-                        lease_until=0, claimed_by=''
-                    WHERE task_id=?
-                    """,
-                    (now, task_id),
-                )
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_claim(conn, task_id, claim_token, worker_id)
+            yield
+
+    def renew(
+        self, task_id: str, *, claim_token: str, worker_id: str = "",
+        lease_seconds: float = 300.0,
+    ) -> TaskRecord:
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be finite and positive")
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_claim(conn, task_id, claim_token, worker_id)
+            now = time.time()
+            conn.execute(
+                "UPDATE tasks SET lease_until=?, updated_at=? "
+                "WHERE task_id=? AND status='running' AND claim_token=? AND claimed_by=?",
+                (now + lease_seconds, now, task_id, claim_token, worker_id),
+            )
+            row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
             conn.commit()
-            updated = conn.execute(
-                "SELECT * FROM tasks WHERE task_id=?", (task_id,)
-            ).fetchone()
-            return self._row_to_record(updated)
+            return self._row_to_record(row)
+
+    def complete(
+        self, task_id: str, *, claim_token: str, worker_id: str = "",
+        error: str = "", terminal: bool = False,
+    ) -> TaskRecord:
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            record = self._require_claim(conn, task_id, claim_token, worker_id)
+            status = "succeeded"
+            if error:
+                status = "dead" if terminal or record.attempts >= record.max_attempts else "pending"
+            cursor = conn.execute(
+                "UPDATE tasks SET status=?, error=?, updated_at=?, lease_until=0, "
+                "claimed_by='', claim_token='' "
+                "WHERE task_id=? AND status='running' AND claim_token=? AND claimed_by=?",
+                (status, error, time.time(), task_id, claim_token, worker_id),
+            )
+            if cursor.rowcount != 1:
+                raise StaleClaimError(f"stale task claim: {task_id}")
+            row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            conn.commit()
+            return self._row_to_record(row)
 
     def get(self, task_id: str) -> Optional[TaskRecord]:
         with self._lock, self._connect() as conn:
@@ -274,6 +311,7 @@ class LocalSqliteTaskQueue:
         moment = time.time() if now is None else float(now)
         recovered = 0
         with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
                 SELECT * FROM tasks
@@ -292,7 +330,7 @@ class LocalSqliteTaskQueue:
                 conn.execute(
                     """
                     UPDATE tasks
-                    SET status=?, error=?, updated_at=?, lease_until=0, claimed_by=''
+                    SET status=?, error=?, updated_at=?, lease_until=0, claimed_by='', claim_token=''
                     WHERE task_id=? AND status='running'
                     """,
                     (status, error, moment, record.task_id),
@@ -304,6 +342,7 @@ class LocalSqliteTaskQueue:
     def retry(self, task_id: str, *, reset_attempts: bool = False) -> TaskRecord:
         now = time.time()
         with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM tasks WHERE task_id=?", (task_id,)
             ).fetchone()
@@ -320,7 +359,7 @@ class LocalSqliteTaskQueue:
                 """
                 UPDATE tasks
                 SET status='pending', error='', updated_at=?, attempts=?,
-                    lease_until=0, claimed_by=''
+                    lease_until=0, claimed_by='', claim_token=''
                 WHERE task_id=?
                 """,
                 (now, attempts, task_id),

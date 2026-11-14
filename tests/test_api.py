@@ -60,12 +60,16 @@ def test_api_health_and_dataset_job(tmp_path):
     assert claimed.json()["claimed_by"] == "api-worker"
     assert claimed.json()["attempts"] == 1
 
-    failed = client.post(f"/v1/jobs/{task_id}/complete", params={"error": "boom"})
+    failed = client.post(f"/v1/jobs/{task_id}/complete", params={
+        "error": "boom", "claim_token": claimed.json()["claim_token"], "worker_id": "api-worker",
+    })
     assert failed.json()["status"] == "pending"
 
     claimed2 = client.post("/v1/worker/claim", params={"kind": "dataset_crawl"})
     assert claimed2.json()["attempts"] == 2
-    dead = client.post(f"/v1/jobs/{task_id}/complete", params={"error": "boom2"})
+    dead = client.post(f"/v1/jobs/{task_id}/complete", params={
+        "error": "boom2", "claim_token": claimed2.json()["claim_token"],
+    })
     assert dead.json()["status"] == "dead"
 
     retried = client.post(f"/v1/jobs/{task_id}/retry", params={"reset_attempts": True})
@@ -78,7 +82,9 @@ def test_api_health_and_dataset_job(tmp_path):
     assert recovered.json()["recovered"] == 0
 
     claimed3 = client.post("/v1/worker/claim", params={"kind": "dataset_crawl"})
-    done = client.post(f"/v1/jobs/{task_id}/complete")
+    done = client.post(f"/v1/jobs/{task_id}/complete", params={
+        "claim_token": claimed3.json()["claim_token"],
+    })
     assert done.json()["status"] == "succeeded"
     assert claimed3.json()["task_id"] == task_id
 
@@ -118,7 +124,12 @@ def test_api_submit_browse_job(tmp_path):
         "authorized_browse",
         {"url": "https://example.com/login"},
     )
-    queue.complete(dead.task_id, error="block:challenge:challenge_page", terminal=True)
+    # Claim each queued browse task before reporting its outcome.
+    claimed = queue.claim(kind="authorized_browse")
+    queue.complete(claimed.task_id, claim_token=claimed.claim_token)
+    claimed = queue.claim(kind="authorized_browse")
+    queue.complete(dead.task_id, claim_token=claimed.claim_token,
+                   error="block:challenge:challenge_page", terminal=True)
     filtered = client.get(
         "/v1/jobs",
         params={"kind": "authorized_browse", "status": "dead", "block_kind": "challenge"},
@@ -138,3 +149,34 @@ def test_api_metrics_endpoint(tmp_path):
     assert response.status_code == 200
     assert "smart_spider_queue_tasks" in response.text
     assert 'status="pending"' in response.text
+
+
+def test_api_requires_current_owner_for_completion_and_renewal(tmp_path):
+    queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"))
+    store = LocalFilesystemObjectStore(str(tmp_path / "objects"))
+    client = TestClient(create_app(queue=queue, store=store))
+    task = queue.enqueue("demo", {})
+    claim = client.post("/v1/worker/claim", params={"worker_id": "api-owner"}).json()
+    credentials = {"claim_token": claim["claim_token"], "worker_id": "api-owner"}
+    path = f"/v1/jobs/{task.task_id}"
+    assert claim["claim_generation"] == 1
+    assert client.post(path + "/complete").status_code == 422
+    assert client.post(path + "/complete", params={
+        **credentials, "worker_id": "other",
+    }).status_code == 409
+    assert client.post(path + "/renew", params={
+        **credentials, "claim_token": "stale",
+    }).status_code == 409
+    assert client.post(path + "/renew", params={
+        **credentials, "lease_seconds": "nan",
+    }).status_code == 400
+    renewed = client.post(path + "/renew", params={**credentials, "lease_seconds": 600})
+    assert renewed.status_code == 200
+    assert renewed.json()["lease_until"] > claim["lease_until"]
+    queue.recover_expired_claims(now=renewed.json()["lease_until"] + 1)
+    current = queue.claim(worker_id="new-owner")
+    assert client.post(path + "/complete", params=credentials).status_code == 409
+    assert queue.get(task.task_id).claim_token == current.claim_token
+    assert client.post(path + "/complete", params={
+        "claim_token": current.claim_token, "worker_id": current.claimed_by,
+    }).status_code == 200

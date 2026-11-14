@@ -332,6 +332,7 @@ def enqueue_discovered_links(
     kind: str = "authorized_browse",
     max_attempts: int = 3,
     extra_payload: Optional[dict[str, Any]] = None,
+    check_active=None,
 ) -> list[str]:
     """将未超深的链接作为后续 authorized_browse 任务入队。"""
     task_ids: list[str] = []
@@ -339,6 +340,8 @@ def enqueue_discovered_links(
     for link in links:
         if link.depth > policy.max_depth:
             continue
+        if check_active is not None:
+            check_active()
         payload = {
             "url": link.url,
             "depth": link.depth,

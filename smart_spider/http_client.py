@@ -32,6 +32,26 @@ from .url_policy import URLPolicy, UnsafeURLError
 class ResponseTooLargeError(requests.RequestException):
     """Raised before an HTTP response can exceed its configured byte budget."""
 
+
+_REDIRECT_SENSITIVE_HEADERS = frozenset(
+    {"authorization", "cookie", "proxy-authorization"}
+)
+
+
+class _StripRedirectCredentials(requests.auth.AuthBase):
+    """Suppress session/netrc auth and cookies after leaving the first origin.
+
+    requests applies auth after merging session headers and cookies. Removing
+    them here prevents the session from restoring credentials stripped by the
+    manual redirect loop, without mutating a session shared by other requests.
+    """
+
+    def __call__(self, request):
+        for name in tuple(request.headers):
+            if name.lower() in _REDIRECT_SENSITIVE_HEADERS:
+                del request.headers[name]
+        return request
+
 # ──────────────────────────────────────────────────────────────────────────────
 # curl_cffi 可选：TLS 指纹伪造
 # ──────────────────────────────────────────────────────────────────────────────
@@ -330,11 +350,15 @@ class SmartHttpClient:
         headers: dict,
         proxy_entry: Optional[ProxyEntry],
         stream: bool,
+        _strip_redirect_credentials: bool = False,
         **kwargs,
     ) -> requests.Response:
         """Send exactly one HTTP hop with automatic redirects disabled."""
         request_kwargs = dict(kwargs)
         request_kwargs.pop("allow_redirects", None)
+        if _strip_redirect_credentials:
+            request_kwargs.pop("auth", None)
+            request_kwargs.pop("cookies", None)
         if self._use_curl:
             proxy_url = proxy_entry.url if proxy_entry else None
             proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
@@ -352,6 +376,8 @@ class SmartHttpClient:
                 **request_kwargs,
             )
         session = self._get_session(proxy_entry)
+        if _strip_redirect_credentials:
+            request_kwargs["auth"] = _StripRedirectCredentials()
         request = session.get if method == "GET" else session.head
         return request(
             url,
@@ -362,6 +388,15 @@ class SmartHttpClient:
             stream=True,
             allow_redirects=False,
             **request_kwargs,
+        )
+
+    @staticmethod
+    def _origin(url: str) -> tuple[str, str, int]:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        port = parsed.port
+        return scheme, (parsed.hostname or "").lower(), (
+            port if port is not None else (443 if scheme == "https" else 80)
         )
 
     def _send_with_validated_redirects(
@@ -375,6 +410,9 @@ class SmartHttpClient:
     ) -> requests.Response:
         """Validate every redirect target before it receives a request."""
         current_url = url
+        headers = dict(headers)
+        request_kwargs = dict(kwargs)
+        strip_credentials = False
         redirects = 0
         while True:
             # Re-resolve immediately before every socket connection.  The peer
@@ -382,7 +420,8 @@ class SmartHttpClient:
             self.url_policy.validate(current_url)
             resolved = self.url_policy.resolve_public_addresses(current_url)
             response = self._send_single_request(
-                method, current_url, headers, proxy_entry, stream, **kwargs
+                method, current_url, headers, proxy_entry, stream,
+                _strip_redirect_credentials=strip_credentials, **request_kwargs
             )
             try:
                 actual_url = getattr(response, "url", None)
@@ -402,6 +441,16 @@ class SmartHttpClient:
                 # This happens *before* closing the old hop and before issuing
                 # a connection to the target, preventing redirect SSRF.
                 self.url_policy.validate(next_url)
+                if self._origin(current_url) != self._origin(next_url):
+                    headers = {
+                        name: value for name, value in headers.items()
+                        if name.lower() not in _REDIRECT_SENSITIVE_HEADERS
+                    }
+                    request_kwargs.pop("auth", None)
+                    request_kwargs.pop("cookies", None)
+                    # Sticky across later hops, even when returning to the
+                    # original origin. Session defaults must not restore auth.
+                    strip_credentials = True
             except Exception:
                 response.close()
                 raise

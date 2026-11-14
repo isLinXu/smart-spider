@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 
 from .dataset_config import DatasetCrawlConfig
 from .pipeline import LocalFilesystemObjectStore, TaskRecord, get_object_store, get_task_queue
+from .pipeline.protocols import StaleClaimError
 
 
 def create_app(
@@ -63,6 +64,8 @@ def create_app(
             "max_attempts": record.max_attempts,
             "lease_until": record.lease_until,
             "claimed_by": record.claimed_by,
+            "claim_token": record.claim_token,
+            "claim_generation": record.claim_generation,
             "created_at": record.created_at,
             "updated_at": record.updated_at,
         }
@@ -199,12 +202,36 @@ def create_app(
 
     @app.post("/v1/jobs/{task_id}/complete")
     def complete_job(
-        task_id: str, error: str = "", terminal: bool = False
+        task_id: str, claim_token: str, worker_id: str = "",
+        error: str = "", terminal: bool = False,
     ) -> Dict[str, Any]:
         try:
-            record = queue.complete(task_id, error=error, terminal=terminal)
+            record = queue.complete(
+                task_id, claim_token=claim_token, worker_id=worker_id,
+                error=error, terminal=terminal,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="task not found") from exc
+        except StaleClaimError as exc:
+            raise HTTPException(status_code=409, detail="stale task claim") from exc
+        return _to_response(record)
+
+    @app.post("/v1/jobs/{task_id}/renew")
+    def renew_job(
+        task_id: str, claim_token: str, worker_id: str = "",
+        lease_seconds: float = 300.0,
+    ) -> Dict[str, Any]:
+        try:
+            record = queue.renew(
+                task_id, claim_token=claim_token, worker_id=worker_id,
+                lease_seconds=lease_seconds,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="task not found") from exc
+        except StaleClaimError as exc:
+            raise HTTPException(status_code=409, detail="stale task claim") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _to_response(record)
 
     return app

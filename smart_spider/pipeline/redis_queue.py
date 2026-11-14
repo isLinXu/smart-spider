@@ -12,12 +12,13 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import uuid
 from typing import Any, Optional, Sequence
 
-from .protocols import TASK_STATUSES, TaskRecord
+from .protocols import TASK_STATUSES, StaleClaimError, TaskRecord
 
 
 def _redis():
@@ -68,6 +69,10 @@ class RedisTaskQueue:
 
     def _save(self, record: TaskRecord) -> None:
         pipe = self._client.pipeline()
+        self._write(pipe, record)
+        pipe.execute()
+
+    def _write(self, pipe, record: TaskRecord) -> None:
         pipe.hset(
             self._key("task", record.task_id),
             mapping={
@@ -82,14 +87,16 @@ class RedisTaskQueue:
                 "max_attempts": str(record.max_attempts),
                 "lease_until": str(record.lease_until),
                 "claimed_by": record.claimed_by,
+                "claim_token": record.claim_token,
+                "claim_generation": str(record.claim_generation),
             },
         )
         pipe.sadd(self._key("kinds"), record.kind)
         pipe.zadd(self._key("index"), {record.task_id: record.updated_at})
-        pipe.execute()
 
-    def _load(self, task_id: str) -> Optional[TaskRecord]:
-        data = self._client.hgetall(self._key("task", task_id))
+    def _load(self, task_id: str, client=None) -> Optional[TaskRecord]:
+        reader = self._client if client is None else client
+        data = reader.hgetall(self._key("task", task_id))
         if not data:
             return None
         return TaskRecord(
@@ -104,7 +111,34 @@ class RedisTaskQueue:
             max_attempts=int(float(data.get("max_attempts") or self.default_max_attempts)),
             lease_until=float(data.get("lease_until") or 0.0),
             claimed_by=str(data.get("claimed_by") or ""),
+            claim_token=str(data.get("claim_token") or ""),
+            claim_generation=int(data.get("claim_generation") or 0),
         )
+
+    def _transaction(self, operation, *keys):
+        """All reads precede MULTI; watched changes retry the entire decision."""
+        for _ in range(32):
+            try:
+                with self._client.pipeline() as pipe:
+                    pipe.watch(*keys)
+                    return operation(pipe)
+            except Exception as exc:
+                # Keep the injected-client path independent of redis imports.
+                # redis-py raises WatchError for EXEC conflicts and for a
+                # connection lost while watching; both need a fresh decision.
+                if type(exc).__name__ != "WatchError":
+                    raise
+        raise RuntimeError("Redis task transaction exceeded conflict retry budget")
+
+    @staticmethod
+    def _require_claim(record, task_id, claim_token, worker_id):
+        if record is None:
+            raise KeyError(task_id)
+        if (not claim_token or record.status != "running"
+                or record.claim_token != claim_token
+                or record.claimed_by != worker_id
+                or record.lease_until <= time.time()):
+            raise StaleClaimError(f"stale task claim: {task_id}")
 
     def enqueue(
         self,
@@ -127,9 +161,16 @@ class RedisTaskQueue:
             updated_at=now,
             max_attempts=attempts_limit,
         )
-        self._save(record)
-        self._client.lpush(self._key("pending", kind), record.task_id)
-        return record
+        def enqueue_atomic(pipe):
+            if self._load(record.task_id, pipe) is not None:
+                raise ValueError(f"task already exists: {record.task_id}")
+            pipe.multi()
+            self._write(pipe, record)
+            pipe.lpush(self._key("pending", kind), record.task_id)
+            pipe.execute()
+            return record
+
+        return self._transaction(enqueue_atomic, self._key("task", record.task_id))
 
     def claim(
         self,
@@ -138,55 +179,97 @@ class RedisTaskQueue:
         lease_seconds: float = 300.0,
         worker_id: str = "",
     ) -> Optional[TaskRecord]:
-        if lease_seconds <= 0:
-            raise ValueError("lease_seconds must be positive")
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be finite and positive")
         kinds: list[str]
         if kind:
             kinds = [kind]
         else:
             kinds = sorted(self._client.smembers(self._key("kinds")) or [])
         for item_kind in kinds:
-            task_id = self._client.rpop(self._key("pending", item_kind))
-            if not task_id:
-                continue
-            record = self._load(task_id)
-            if record is None or record.status != "pending":
-                continue
-            now = time.time()
-            record.status = "running"
-            record.attempts += 1
-            record.updated_at = now
-            record.lease_until = now + float(lease_seconds)
-            record.claimed_by = worker_id or ""
-            record.error = ""
-            self._save(record)
-            self._client.zadd(self._key("running"), {task_id: record.lease_until})
-            return record
+            pending_key = self._key("pending", item_kind)
+
+            def claim_atomic(pipe):
+                task_id = pipe.lindex(pending_key, -1)
+                if not task_id:
+                    return None
+                pipe.watch(self._key("task", task_id))
+                record = self._load(task_id, pipe)
+                if record is None or record.status != "pending":
+                    pipe.multi()
+                    pipe.rpop(pending_key)
+                    pipe.execute()
+                    return False  # Discard a stale index entry and keep looking.
+                now = time.time()
+                record.status = "running"
+                record.attempts += 1
+                record.updated_at = now
+                record.lease_until = now + float(lease_seconds)
+                record.claimed_by = worker_id or ""
+                record.claim_token = uuid.uuid4().hex
+                record.claim_generation += 1
+                record.error = ""
+                pipe.multi()
+                pipe.rpop(pending_key)
+                self._write(pipe, record)
+                pipe.zadd(self._key("running"), {task_id: record.lease_until})
+                pipe.execute()
+                return record
+
+            while True:
+                record = self._transaction(claim_atomic, pending_key)
+                if record is False:
+                    continue
+                if record is not None:
+                    return record
+                break
         return None
 
     def complete(
-        self, task_id: str, *, error: str = "", terminal: bool = False
+        self, task_id: str, *, claim_token: str, worker_id: str = "",
+        error: str = "", terminal: bool = False,
     ) -> TaskRecord:
-        record = self._load(task_id)
-        if record is None:
-            raise KeyError(task_id)
-        now = time.time()
-        record.updated_at = now
-        record.lease_until = 0.0
-        record.claimed_by = ""
-        self._client.zrem(self._key("running"), task_id)
-        if error:
+        def complete_atomic(pipe):
+            record = self._load(task_id, pipe)
+            self._require_claim(record, task_id, claim_token, worker_id)
+            record.updated_at = time.time()
+            record.lease_until = 0.0
+            record.claimed_by = ""
+            record.claim_token = ""
             record.error = error
-            if terminal or record.attempts >= record.max_attempts:
-                record.status = "dead"
+            if error:
+                record.status = "dead" if terminal or record.attempts >= record.max_attempts else "pending"
             else:
-                record.status = "pending"
-                self._client.lpush(self._key("pending", record.kind), task_id)
-        else:
-            record.status = "succeeded"
-            record.error = ""
-        self._save(record)
-        return record
+                record.status = "succeeded"
+            pipe.multi()
+            pipe.zrem(self._key("running"), task_id)
+            if record.status == "pending":
+                pipe.lpush(self._key("pending", record.kind), task_id)
+            self._write(pipe, record)
+            pipe.execute()
+            return record
+
+        return self._transaction(complete_atomic, self._key("task", task_id))
+
+    def renew(
+        self, task_id: str, *, claim_token: str, worker_id: str = "",
+        lease_seconds: float = 300.0,
+    ) -> TaskRecord:
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be finite and positive")
+
+        def renew_atomic(pipe):
+            record = self._load(task_id, pipe)
+            self._require_claim(record, task_id, claim_token, worker_id)
+            record.updated_at = time.time()
+            record.lease_until = record.updated_at + lease_seconds
+            pipe.multi()
+            self._write(pipe, record)
+            pipe.zadd(self._key("running"), {task_id: record.lease_until})
+            pipe.execute()
+            return record
+
+        return self._transaction(renew_atomic, self._key("task", task_id))
 
     def get(self, task_id: str) -> Optional[TaskRecord]:
         return self._load(task_id)
@@ -228,43 +311,59 @@ class RedisTaskQueue:
         expired = self._client.zrangebyscore(self._key("running"), "-inf", moment)
         recovered = 0
         for task_id in expired:
-            record = self._load(task_id)
-            if record is None or record.status != "running":
-                self._client.zrem(self._key("running"), task_id)
-                continue
-            record.updated_at = moment
-            record.lease_until = 0.0
-            record.claimed_by = ""
-            if record.attempts >= record.max_attempts:
-                record.status = "dead"
-                record.error = record.error or "lease_expired_max_attempts"
-            else:
-                record.status = "pending"
-                record.error = record.error or "lease_expired"
-                self._client.lpush(self._key("pending", record.kind), task_id)
-            self._client.zrem(self._key("running"), task_id)
-            self._save(record)
-            recovered += 1
+            def recover_atomic(pipe):
+                record = self._load(task_id, pipe)
+                if record is None or record.status != "running":
+                    pipe.multi()
+                    pipe.zrem(self._key("running"), task_id)
+                    pipe.execute()
+                    return 0
+                if record.lease_until > moment:
+                    return 0  # Renewed since the initial index scan.
+                record.updated_at = moment
+                record.lease_until = 0.0
+                record.claimed_by = ""
+                record.claim_token = ""
+                if record.attempts >= record.max_attempts:
+                    record.status = "dead"
+                    record.error = record.error or "lease_expired_max_attempts"
+                else:
+                    record.status = "pending"
+                    record.error = record.error or "lease_expired"
+                pipe.multi()
+                if record.status == "pending":
+                    pipe.lpush(self._key("pending", record.kind), task_id)
+                pipe.zrem(self._key("running"), task_id)
+                self._write(pipe, record)
+                pipe.execute()
+                return 1
+
+            recovered += self._transaction(recover_atomic, self._key("task", task_id))
         return recovered
 
     def retry(self, task_id: str, *, reset_attempts: bool = False) -> TaskRecord:
-        record = self._load(task_id)
-        if record is None:
-            raise KeyError(task_id)
-        if record.status not in {"failed", "dead", "succeeded"}:
-            raise ValueError(
-                f"cannot retry task in status={record.status!r}; "
-                "expected failed, dead, or succeeded"
-            )
-        now = time.time()
-        record.status = "pending"
-        record.error = ""
-        record.updated_at = now
-        record.lease_until = 0.0
-        record.claimed_by = ""
-        if reset_attempts:
-            record.attempts = 0
-        self._client.zrem(self._key("running"), task_id)
-        self._client.lpush(self._key("pending", record.kind), task_id)
-        self._save(record)
-        return record
+        def retry_atomic(pipe):
+            record = self._load(task_id, pipe)
+            if record is None:
+                raise KeyError(task_id)
+            if record.status not in {"failed", "dead", "succeeded"}:
+                raise ValueError(
+                    f"cannot retry task in status={record.status!r}; "
+                    "expected failed, dead, or succeeded"
+                )
+            record.status = "pending"
+            record.error = ""
+            record.updated_at = time.time()
+            record.lease_until = 0.0
+            record.claimed_by = ""
+            record.claim_token = ""
+            if reset_attempts:
+                record.attempts = 0
+            pipe.multi()
+            pipe.zrem(self._key("running"), task_id)
+            pipe.lpush(self._key("pending", record.kind), task_id)
+            self._write(pipe, record)
+            pipe.execute()
+            return record
+
+        return self._transaction(retry_atomic, self._key("task", task_id))

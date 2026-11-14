@@ -170,8 +170,12 @@ def test_browse_retry_dead_by_block_kind(tmp_path):
     queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"))
     challenge = queue.enqueue("authorized_browse", {"url": "https://example.com/a"})
     other = queue.enqueue("authorized_browse", {"url": "https://example.com/b"})
-    queue.complete(challenge.task_id, error="block:challenge:challenge_page", terminal=True)
-    queue.complete(other.task_id, error="block:forbidden:policy_denied_seed", terminal=True)
+    claimed = queue.claim()
+    queue.complete(challenge.task_id, claim_token=claimed.claim_token,
+                   error="block:challenge:challenge_page", terminal=True)
+    claimed = queue.claim()
+    queue.complete(other.task_id, claim_token=claimed.claim_token,
+                   error="block:forbidden:policy_denied_seed", terminal=True)
     ids = retry_dead_tasks(queue=queue, block_kind="challenge")
     assert ids == [challenge.task_id]
     assert queue.get(challenge.task_id).status == "pending"

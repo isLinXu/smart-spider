@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from collections import defaultdict
 from typing import Any
 
@@ -10,34 +11,59 @@ from smart_spider.pipeline import LocalFilesystemObjectStore, LocalSqliteTaskQue
 from smart_spider.pipeline.redis_queue import RedisTaskQueue
 
 
+class WatchError(Exception):
+    pass
+
+
 class _FakePipeline:
     def __init__(self, client: "FakeRedis"):
         self._client = client
         self._ops: list[tuple] = []
+        self._watched = {}
+        self._queueing = True
 
-    def hset(self, key, mapping=None, **kwargs):
-        self._ops.append(("hset", key, mapping or kwargs))
+    def __enter__(self):
         return self
 
-    def sadd(self, key, *values):
-        self._ops.append(("sadd", key, values))
-        return self
+    def __len__(self):
+        # Match redis-py: a watched pipeline with no queued writes is falsy.
+        return len(self._ops)
 
-    def zadd(self, key, mapping):
-        self._ops.append(("zadd", key, mapping))
-        return self
+    def __exit__(self, *_):
+        self._ops.clear()
+        self._watched.clear()
+
+    def watch(self, *keys):
+        with self._client.lock:
+            for key in keys:
+                self._watched[key] = self._client.versions[key]
+        self._queueing = False
+
+    def multi(self):
+        self._queueing = True
+
+    def __getattr__(self, name):
+        def call(*args, **kwargs):
+            if self._queueing:
+                if name in {"hgetall", "lindex", "smembers", "zrangebyscore"}:
+                    raise AssertionError("transaction reads must happen before MULTI")
+                self._ops.append((name, args, kwargs))
+                return self
+            with self._client.lock:
+                return getattr(self._client, name)(*args, **kwargs)
+        return call
 
     def execute(self):
-        for op in self._ops:
-            name = op[0]
-            if name == "hset":
-                self._client.hset(op[1], mapping=op[2])
-            elif name == "sadd":
-                self._client.sadd(op[1], *op[2])
-            elif name == "zadd":
-                self._client.zadd(op[1], op[2])
-        self._ops.clear()
-        return []
+        with self._client.lock:
+            hook = self._client.before_execute
+            self._client.before_execute = None
+            if hook is not None:
+                hook(self)
+            if any(self._client.versions[key] != value for key, value in self._watched.items()):
+                raise WatchError("watched key changed")
+            results = [getattr(self._client, name)(*args, **kwargs) for name, args, kwargs in self._ops]
+            self._ops.clear()
+            return results
 
 
 class FakeRedis:
@@ -48,6 +74,9 @@ class FakeRedis:
         self.lists: dict[str, list[str]] = defaultdict(list)
         self.sets: dict[str, set[str]] = defaultdict(set)
         self.zsets: dict[str, dict[str, float]] = defaultdict(dict)
+        self.versions = defaultdict(int)
+        self.lock = threading.RLock()
+        self.before_execute = None
 
     def pipeline(self):
         return _FakePipeline(self)
@@ -55,12 +84,14 @@ class FakeRedis:
     def hset(self, key, mapping=None, **kwargs):
         payload = mapping or kwargs
         self.hashes[key].update({str(k): str(v) for k, v in payload.items()})
+        self.versions[key] += 1
 
     def hgetall(self, key):
         return dict(self.hashes.get(key) or {})
 
     def sadd(self, key, *values):
         self.sets[key].update(str(v) for v in values)
+        self.versions[key] += 1
 
     def smembers(self, key):
         return set(self.sets.get(key) or set())
@@ -68,15 +99,24 @@ class FakeRedis:
     def lpush(self, key, *values):
         for value in values:
             self.lists[key].insert(0, str(value))
+        self.versions[key] += 1
+
+    def lindex(self, key, index):
+        try:
+            return self.lists[key][index]
+        except IndexError:
+            return None
 
     def rpop(self, key):
         if not self.lists.get(key):
             return None
+        self.versions[key] += 1
         return self.lists[key].pop()
 
     def zadd(self, key, mapping):
         for member, score in mapping.items():
             self.zsets[key][str(member)] = float(score)
+        self.versions[key] += 1
 
     def zrem(self, key, *members):
         removed = 0
@@ -84,6 +124,8 @@ class FakeRedis:
             if str(member) in self.zsets.get(key, {}):
                 del self.zsets[key][str(member)]
                 removed += 1
+        if removed:
+            self.versions[key] += 1
         return removed
 
     def zrevrange(self, key, start, end):
@@ -123,7 +165,7 @@ def test_local_task_queue_lifecycle(tmp_path):
     assert claimed.attempts == 1
     assert claimed.claimed_by == "w1"
     assert claimed.lease_until > time.time()
-    done = queue.complete(record.task_id)
+    done = queue.complete(record.task_id, claim_token=claimed.claim_token, worker_id="w1")
     assert done.status == "succeeded"
     assert queue.claim() is None
 
@@ -133,7 +175,7 @@ def test_local_task_queue_retry_then_dead(tmp_path):
     record = queue.enqueue("dataset_crawl", {"n": 1}, max_attempts=2)
     first = queue.claim(kind="dataset_crawl")
     assert first is not None
-    retried = queue.complete(first.task_id, error="boom")
+    retried = queue.complete(first.task_id, claim_token=first.claim_token, error="boom")
     assert retried.status == "pending"
     assert retried.attempts == 1
     assert retried.error == "boom"
@@ -141,7 +183,7 @@ def test_local_task_queue_retry_then_dead(tmp_path):
     second = queue.claim(kind="dataset_crawl")
     assert second is not None
     assert second.attempts == 2
-    dead = queue.complete(second.task_id, error="boom-again")
+    dead = queue.complete(second.task_id, claim_token=second.claim_token, error="boom-again")
     assert dead.status == "dead"
     assert queue.claim() is None
 
@@ -174,7 +216,8 @@ def test_local_task_queue_list_tasks(tmp_path):
     queue = LocalSqliteTaskQueue(str(tmp_path / "q.sqlite3"))
     a = queue.enqueue("dataset_crawl", {"n": 1})
     b = queue.enqueue("other", {"n": 2})
-    queue.complete(queue.claim(kind="dataset_crawl").task_id)
+    claimed = queue.claim(kind="dataset_crawl")
+    queue.complete(claimed.task_id, claim_token=claimed.claim_token)
     items = queue.list_tasks(kind="dataset_crawl")
     assert [item.task_id for item in items] == [a.task_id]
     pending = queue.list_tasks(status="pending")
@@ -186,11 +229,11 @@ def _assert_queue_semantics(queue: Any):
     claimed = queue.claim(kind="dataset_crawl", worker_id="rw", lease_seconds=30)
     assert claimed is not None
     assert claimed.attempts == 1
-    soft = queue.complete(claimed.task_id, error="temp")
+    soft = queue.complete(claimed.task_id, claim_token=claimed.claim_token, worker_id="rw", error="temp")
     assert soft.status == "pending"
     again = queue.claim(kind="dataset_crawl")
     assert again.attempts == 2
-    dead = queue.complete(again.task_id, error="final")
+    dead = queue.complete(again.task_id, claim_token=again.claim_token, error="final")
     assert dead.status == "dead"
     assert queue.list_tasks(status="dead")[0].task_id == record.task_id
     revived = queue.retry(record.task_id, reset_attempts=True)
