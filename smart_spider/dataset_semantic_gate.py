@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Callable, Optional
 
 from loguru import logger
@@ -33,19 +34,19 @@ def evaluate_clip_similarity(
 ) -> SemanticGateResult:
     """Compare one image to the keyword CLIP vector.
 
-    Inference errors are swallowed (same as the legacy crawler): the candidate
-    continues with ``sim=0.0`` instead of being rejected. A missing text
-    feature also skips the gate.
+    Requested inference must succeed; missing or invalid scores cannot admit a sample.
     """
     result = SemanticGateResult()
     if not enabled:
         return result
-    text_feat = get_text_feature(keyword)
-    if text_feat is None:
-        return result
     try:
+        text_feat = get_text_feature(keyword)
+        if text_feat is None:
+            return SemanticGateResult(accepted=False, reason="clip_text_unavailable")
         img_feat = encode_image(image)
         sim = float(cosine_similarity(img_feat, text_feat))
+        if not math.isfinite(sim) or not -1.0 <= sim <= 1.0:
+            return SemanticGateResult(accepted=False, reason="clip_invalid_score")
         result.sim = sim
         if sim < threshold:
             result.accepted = False
@@ -60,7 +61,7 @@ def evaluate_clip_similarity(
         return result
     except Exception as exc:
         logger.debug(f"CLIP inference error: {exc}")
-        return result
+        return SemanticGateResult(accepted=False, reason="clip_inference_error")
 
 
 def evaluate_image_query_similarity(
@@ -81,6 +82,8 @@ def evaluate_image_query_similarity(
                 reason="image_query_inference_error",
             )
         result = SemanticGateResult(image_sim=float(image_sim))
+        if not math.isfinite(result.image_sim) or not -1.0 <= result.image_sim <= 1.0:
+            return SemanticGateResult(accepted=False, reason="image_query_invalid_score")
         if result.image_sim < threshold:
             result.accepted = False
             result.reason = "image_query_low_sim"

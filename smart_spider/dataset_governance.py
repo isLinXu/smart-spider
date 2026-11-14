@@ -8,7 +8,9 @@ whole related groups to one split and enforces quotas at ingestion time.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -149,6 +151,7 @@ class SplitItem:
     page_url: str = ""
     captured_at: str = ""
     cluster_id: str = ""
+    source_group: str = ""
 
 
 @dataclass(frozen=True)
@@ -167,6 +170,7 @@ class LeakageSafeSplitter:
         validation: float = 0.1,
         test: float = 0.1,
         seed: str = "smart-spider-v1",
+        registry_path: Optional[str | Path] = None,
     ) -> None:
         ratios = {"train": train, "validation": validation, "test": test}
         if not all(0.0 < value < 1.0 for value in ratios.values()):
@@ -175,6 +179,7 @@ class LeakageSafeSplitter:
             raise ValueError("split ratios must sum to 1")
         self.ratios = ratios
         self.seed = str(seed)
+        self.registry_path = Path(registry_path).expanduser().resolve() if registry_path else None
 
     @staticmethod
     def _origin_domain(item: SplitItem) -> str:
@@ -195,9 +200,72 @@ class LeakageSafeSplitter:
         try:
             return datetime.fromisoformat(raw.replace("Z", "+00:00")).date().isoformat()
         except ValueError:
-            return raw[:10]
+            return ""
+
+    def _keys(self, item: SplitItem) -> list[tuple[str, str]]:
+        domain = self._origin_domain(item)
+        page = self._canonical_page(item)
+        source = item.source_group.strip() or domain or page
+        day = self._time_bucket(item)
+        values = (
+            ("id", str(item.item_id)),
+            ("origin_domain", domain),
+            ("page", page),
+            ("source", item.source_group.strip()),
+            ("time_bucket", json.dumps([source, day], ensure_ascii=False) if source and day else ""),
+            ("cluster", item.cluster_id.strip()),
+        )
+        return [(kind, value) for kind, value in values if value]
 
     def plan(self, items: Sequence[SplitItem]) -> SplitPlan:
+        """Assign connected provenance groups, optionally preserving old releases.
+
+        A registry is required for stable incremental assignments across runs.
+        If new provenance joins groups assigned to different splits, planning
+        fails so the conflict can be resolved explicitly.
+        """
+        if self.registry_path is None:
+            return self._plan(items, {})[0]
+        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(self.registry_path), timeout=30)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS split_config "
+                "(id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS split_keys "
+                "(key TEXT PRIMARY KEY, split TEXT NOT NULL)"
+            )
+            config = json.dumps(
+                {"version": 1, "seed": self.seed, "ratios": self.ratios},
+                sort_keys=True,
+            )
+            stored = connection.execute(
+                "SELECT config FROM split_config WHERE id=1"
+            ).fetchone()
+            if stored and stored[0] != config:
+                raise ValueError("split registry configuration mismatch; use a new registry")
+            previous = dict(connection.execute("SELECT key, split FROM split_keys"))
+            if any(value not in self.ratios for value in previous.values()):
+                raise ValueError("invalid split registry assignment")
+            plan, assignments = self._plan(items, previous)
+            connection.execute("INSERT OR IGNORE INTO split_config VALUES (1, ?)", (config,))
+            connection.executemany(
+                "INSERT OR IGNORE INTO split_keys VALUES (?, ?)", assignments.items()
+            )
+            connection.commit()
+            return plan
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _plan(
+        self, items: Sequence[SplitItem], previous: Mapping[str, str]
+    ) -> tuple[SplitPlan, dict[str, str]]:
         identifiers = [str(item.item_id) for item in items]
         if any(not identifier for identifier in identifiers) or len(set(identifiers)) != len(identifiers):
             raise ValueError("split item IDs must be non-empty and unique")
@@ -216,26 +284,28 @@ class LeakageSafeSplitter:
 
         first_by_key: dict[tuple[str, str], int] = {}
         for index, item in enumerate(items):
-            keys = (
-                ("origin_domain", self._origin_domain(item)),
-                ("page", self._canonical_page(item)),
-                ("time_bucket", self._time_bucket(item)),
-                ("cluster", item.cluster_id.strip()),
-            )
+            keys = self._keys(item)
             for kind, value in keys:
                 if not value:
                     continue
                 key = (kind, value)
-                previous = first_by_key.setdefault(key, index)
-                union(previous, index)
+                previous_index = first_by_key.setdefault(key, index)
+                union(previous_index, index)
         groups: dict[int, list[str]] = {}
         for index, identifier in enumerate(identifiers):
             groups.setdefault(find(index), []).append(identifier)
+        group_keys: dict[int, set[str]] = {}
+        for index, item in enumerate(items):
+            group_keys.setdefault(find(index), set()).update(
+                json.dumps(key, ensure_ascii=False) for key in self._keys(item)
+            )
         assignments: dict[str, str] = {}
+        key_assignments: dict[str, str] = {}
         train_cutoff = self.ratios["train"]
         validation_cutoff = train_cutoff + self.ratios["validation"]
-        for group in groups.values():
-            group_key = "\0".join(sorted(group))
+        for root, group in groups.items():
+            provenance_keys = group_keys[root]
+            group_key = "\0".join(sorted(provenance_keys))
             fraction = int.from_bytes(
                 hashlib.sha256(f"{self.seed}\0{group_key}".encode("utf-8")).digest()[:8],
                 "big",
@@ -243,8 +313,16 @@ class LeakageSafeSplitter:
             split = "train" if fraction < train_cutoff else (
                 "validation" if fraction < validation_cutoff else "test"
             )
+            known = {previous[key] for key in provenance_keys if key in previous}
+            if len(known) > 1:
+                raise ValueError(
+                    "new provenance bridges existing splits; explicit migration required"
+                )
+            if known:
+                split = known.pop()
             assignments.update({identifier: split for identifier in group})
-        return SplitPlan(assignments=assignments, group_count=len(groups))
+            key_assignments.update({key: split for key in provenance_keys})
+        return SplitPlan(assignments=assignments, group_count=len(groups)), key_assignments
 
 
 class QuotaLedger:

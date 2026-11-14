@@ -27,6 +27,7 @@ def test_heuristic_detector_returns_named_scores():
     assert signals["road_vehicle_detector"] == 0.0
     assert signals["scene_context"] == 1.0
     assert "synthetic_image" not in signals
+    assert set(detector.signal_sources.values()) == {"heuristic"}
 
 
 def test_default_detector_is_runnable_without_yolo():
@@ -74,3 +75,5 @@ def test_yolo_detector_maps_people_and_road_vehicles_to_strong_signals():
     assert signals["road_vehicle_detector"] == 0.83
     assert signals["person"] == 0.91
     assert signals["forklift"] < 0.83
+    assert detector.signal_sources["person_detector"] == "detector"
+    assert detector.signal_sources["road_vehicle_detector"] == "detector"

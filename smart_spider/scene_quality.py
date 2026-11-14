@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -42,12 +42,23 @@ class SceneCalibration:
     version: str
     positive_count: int = 0
     negative_count: int = 0
+    approved: bool = False
+    dataset_digest: str = ""
+    policy_fingerprint: str = ""
+    model_versions: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.dataset_id or not self.version:
             raise ValueError("calibration dataset_id and version are required")
         if self.positive_count < 0 or self.negative_count < 0:
             raise ValueError("calibration counts cannot be negative")
+        if type(self.approved) is not bool:
+            raise ValueError("calibration approved must be a boolean")
+        if not isinstance(self.model_versions, dict) or any(
+            not isinstance(key, str) or not key or not isinstance(value, str) or not value
+            for key, value in self.model_versions.items()
+        ):
+            raise ValueError("calibration model_versions must map names to revisions")
 
 
 @dataclass(frozen=True)
@@ -75,6 +86,13 @@ class SceneQualityProfile:
     def fingerprint(self) -> str:
         payload = json.dumps(self._fingerprint_payload(), ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    @property
+    def policy_fingerprint(self) -> str:
+        """Bind calibration to the exact prompts, thresholds and admission rules."""
+        payload = self._fingerprint_payload()
+        payload.pop("calibration")
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
     def _fingerprint_payload(self) -> dict[str, Any]:
         return {
@@ -463,7 +481,10 @@ def _calibration(value: Any, name: str) -> SceneCalibration:
         )
     if not isinstance(value, dict):
         raise ValueError("scene profile calibration must be an object")
-    unknown = set(value) - {"dataset_id", "version", "positive_count", "negative_count"}
+    unknown = set(value) - {
+        "dataset_id", "version", "positive_count", "negative_count", "approved",
+        "dataset_digest", "policy_fingerprint", "model_versions",
+    }
     if unknown:
         raise ValueError("unknown calibration fields: " + ", ".join(sorted(unknown)))
     try:
@@ -472,6 +493,10 @@ def _calibration(value: Any, name: str) -> SceneCalibration:
             version=str(value.get("version") or "").strip(),
             positive_count=int(value.get("positive_count", 0)),
             negative_count=int(value.get("negative_count", 0)),
+            approved=value.get("approved", False),
+            dataset_digest=str(value.get("dataset_digest") or ""),
+            policy_fingerprint=str(value.get("policy_fingerprint") or ""),
+            model_versions=value.get("model_versions", {}),
         )
     except (TypeError, ValueError) as exc:
         raise ValueError("invalid scene profile calibration") from exc

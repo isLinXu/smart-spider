@@ -14,6 +14,7 @@ signals route the sample to review instead of inventing a zero-risk score.
 """
 from __future__ import annotations
 
+import threading
 from typing import Any, Mapping, Optional
 
 import numpy as np
@@ -53,6 +54,10 @@ class HeuristicSceneSignalDetector:
     @property
     def model_versions(self) -> Mapping[str, str]:
         return dict(self._versions)
+
+    @property
+    def signal_sources(self) -> Mapping[str, str]:
+        return {name: "heuristic" for name in _DEFAULT_SIGNAL_NAMES if name != "synthetic_image"}
 
     def detect(self, image: Any) -> Mapping[str, float]:
         rgb = self._as_rgb_array(image)
@@ -210,6 +215,7 @@ class YoloSceneSignalDetector:
                 "pip install ultralytics"
             ) from exc
         self._model = YOLO(model_name)
+        self._evidence = threading.local()
         self._confidence = float(confidence)
         self._device = device
         self._versions = {
@@ -222,9 +228,12 @@ class YoloSceneSignalDetector:
         return dict(self._versions)
 
     def detect(self, image: Any) -> Mapping[str, float]:
+        if not hasattr(self, "_evidence"):
+            self._evidence = threading.local()
         rgb = HeuristicSceneSignalDetector._as_rgb_array(image)
         # Start from heuristic priors so required keys always exist.
         signals = dict(HeuristicSceneSignalDetector().detect(rgb))
+        self._evidence.sources = dict(HeuristicSceneSignalDetector().signal_sources)
         results = self._model.predict(
             source=rgb,
             conf=self._confidence,
@@ -235,6 +244,12 @@ class YoloSceneSignalDetector:
             return signals
         result = results[0]
         names = getattr(result, "names", {}) or {}
+        labels = {str(value).casefold() for value in names.values()}
+        supported = {self._CLASS_TO_SIGNAL[label] for label in labels if label in self._CLASS_TO_SIGNAL}
+        if "person" in labels:
+            supported.add("person_detector")
+        if labels & self._ROAD_VEHICLE_CLASSES:
+            supported.add("road_vehicle_detector")
         boxes = getattr(result, "boxes", None)
         if boxes is None:
             return signals
@@ -242,6 +257,9 @@ class YoloSceneSignalDetector:
         clss = getattr(boxes, "cls", None)
         if confs is None or clss is None:
             return signals
+        for name in supported:
+            signals[name] = 0.0
+            self._evidence.sources[name] = "detector"
         for conf, cls_id in zip(confs.tolist(), clss.tolist()):
             label = str(names.get(int(cls_id), "")).casefold()
             score = _clamp(float(conf))
@@ -265,6 +283,11 @@ class YoloSceneSignalDetector:
                     min(signals.get("forklift", 0.0), score),
                 )
         return signals
+
+
+    @property
+    def signal_sources(self) -> Mapping[str, str]:
+        return dict(getattr(self._evidence, "sources", {}))
 
 
 def default_scene_signal_detector(

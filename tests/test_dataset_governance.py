@@ -46,6 +46,43 @@ def test_splitter_never_separates_connected_provenance_groups():
     assert plan.group_count == 2
 
 
+def test_split_time_buckets_are_scoped_to_the_source():
+    plan = LeakageSafeSplitter(seed="test").plan([
+        SplitItem("camera-a", captured_at="2026-09-03T12:00:00Z", source_group="camera-a"),
+        SplitItem("camera-b", captured_at="2026-09-03T12:00:00Z", source_group="camera-b"),
+    ])
+    assert plan.group_count == 2
+
+
+def test_split_registry_keeps_incremental_samples_with_the_original_group(tmp_path):
+    registry = tmp_path / "splits.sqlite3"
+    old = SplitItem("old", origin_url="https://old-origin.test/a", cluster_id="shared")
+    first = LeakageSafeSplitter(seed="test", registry_path=registry).plan([old])
+    new = SplitItem("new", origin_url="https://new-origin.test/b", cluster_id="shared")
+    resumed = LeakageSafeSplitter(seed="test", registry_path=registry).plan([old, new])
+    assert resumed.assignments["old"] == resumed.assignments["new"]
+    assert resumed.assignments["old"] == first.assignments["old"]
+
+
+def test_split_registry_rejects_new_provenance_that_bridges_releases(tmp_path):
+    registry = tmp_path / "splits.sqlite3"
+    splitter = LeakageSafeSplitter(seed="bridge-test", registry_path=registry)
+    items = [
+        SplitItem(f"item-{index}", origin_url=f"https://source-{index}.test/a",
+                  cluster_id="cluster-x" if index == 1 else "")
+        for index in range(20)
+    ]
+    initial = splitter.plan(items)
+    anchor = items[1]
+    left = next(item for item in items if initial.assignments[item.item_id] != initial.assignments[anchor.item_id])
+    bridge = SplitItem("bridge", origin_url=left.origin_url, cluster_id=anchor.cluster_id)
+    import pytest
+    with pytest.raises(ValueError, match="bridges existing splits"):
+        LeakageSafeSplitter(seed="bridge-test", registry_path=registry).plan(
+            [left, anchor, bridge]
+        )
+
+
 def test_quota_ledgers_reserve_and_release_without_overflow():
     sources = QuotaLedger(10, max_share=0.2)
     assert sources.try_reserve("example.com")

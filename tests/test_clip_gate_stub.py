@@ -1,6 +1,7 @@
 # coding=utf-8
 """CLIP-free scene gate path for CI (semantic score is injected; no torch)."""
 from PIL import Image
+from tests.scene_calibration_fixture import calibrated_profile
 
 from smart_spider.dataset_crawler import DatasetCrawler
 from smart_spider.scene_quality import get_scene_quality_profile
@@ -12,6 +13,7 @@ class StubDetector:
 
     def __init__(self, signals):
         self.signals = dict(signals)
+        self.signal_sources = {key: "detector" for key in signals}
         self.model_versions = {"stub": "ci"}
 
     def detect(self, image):
@@ -19,7 +21,7 @@ class StubDetector:
 
 
 def test_stub_gate_accepts_complete_signals_without_clip(tmp_path):
-    profile = get_scene_quality_profile("smoking")
+    profile = calibrated_profile(get_scene_quality_profile("smoking"))
     detector = StubDetector(
         {
             "person": 0.9,
@@ -72,7 +74,7 @@ def test_semantic_filters_skip_without_clip(tmp_path):
 
 
 def test_stub_gate_reviews_when_semantic_score_is_borderline(tmp_path):
-    profile = get_scene_quality_profile("smoking")
+    profile = calibrated_profile(get_scene_quality_profile("smoking"))
     detector = StubDetector(
         {
             "person": 0.9,

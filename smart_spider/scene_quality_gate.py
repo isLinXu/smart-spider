@@ -10,6 +10,7 @@ automatic acceptance.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from dataclasses import asdict, dataclass
@@ -34,7 +35,7 @@ class SceneSignalDetector(Protocol):
 @dataclass(frozen=True)
 class GateDecision:
     action: str
-    semantic_score: float
+    semantic_score: Optional[float]
     reasons: tuple[str, ...]
     signals: dict[str, float]
     provenance: dict[str, Any]
@@ -62,19 +63,25 @@ class SceneQualityGate:
 
     def evaluate(
         self,
-        semantic_score: float,
+        semantic_score: Optional[float],
         *,
         signals: Optional[Mapping[str, float]] = None,
         model_versions: Optional[Mapping[str, str]] = None,
+        signal_sources: Optional[Mapping[str, str]] = None,
     ) -> GateDecision:
-        if not -1.0 <= semantic_score <= 1.0:
+        if semantic_score is not None and not math.isfinite(semantic_score):
+            semantic_score = None
+        if semantic_score is not None and not -1.0 <= semantic_score <= 1.0:
             raise ValueError("semantic_score must be between -1 and 1")
         normalized = self._normalize_signals(signals or {})
         versions = dict(model_versions or {})
         if self.detector is not None:
             versions = {**dict(self.detector.model_versions), **versions}
+        sources = {name: str((signal_sources or {}).get(name, "unknown")) for name in normalized}
         reasons: list[str] = []
-        if semantic_score < self.profile.review_score:
+        if semantic_score is None:
+            reasons.append("semantic_score_unavailable")
+        elif semantic_score < self.profile.review_score:
             reasons.append("semantic_score_below_review_threshold")
 
         requirements_satisfied = True
@@ -90,25 +97,49 @@ class SceneQualityGate:
                 requirements_satisfied = False
                 reasons.append(f"signal_above_maximum:{requirement.name}")
 
-        if semantic_score < self.profile.review_score:
+        calibration = self.profile.calibration
+        calibration_ready = (
+            calibration.approved
+            and calibration.positive_count > 0 and calibration.negative_count > 0
+            and len(calibration.dataset_digest) == 64
+            and all(char in "0123456789abcdef" for char in calibration.dataset_digest)
+            and calibration.policy_fingerprint == self.profile.policy_fingerprint
+            and bool(calibration.model_versions)
+            and calibration.model_versions == versions
+        )
+        untrusted = [requirement.name for requirement in self.profile.signal_requirements
+                     if requirement.name in normalized and sources[requirement.name] not in {"detector", "manual"}]
+        if semantic_score is not None and semantic_score < self.profile.review_score:
             action = "reject"
-        elif semantic_score >= self.profile.acceptance_score and requirements_satisfied:
+        elif semantic_score is None:
+            action = "review"
+        elif (semantic_score >= self.profile.acceptance_score and requirements_satisfied
+              and calibration_ready and not untrusted):
             action = "accept"
         elif self.profile.review_required:
             if semantic_score < self.profile.acceptance_score:
                 reasons.append("semantic_score_below_acceptance_threshold")
             action = "review"
         else:
+            if semantic_score < self.profile.acceptance_score:
+                reasons.append("semantic_score_below_acceptance_threshold")
             action = "reject"
+        if action != "reject" or semantic_score is None or semantic_score >= self.profile.review_score:
+            if not calibration_ready:
+                reasons.append("calibration_unverified")
+            reasons.extend(f"untrusted_signal:{name}" for name in untrusted)
         provenance = {
             "profile": self.profile.name,
             "profile_version": self.profile.version,
             "profile_fingerprint": self.profile.fingerprint,
+            "policy_fingerprint": self.profile.policy_fingerprint,
             "calibration": asdict(self.profile.calibration),
+            "calibration_verified": calibration_ready,
             "acceptance_score": self.profile.acceptance_score,
             "review_score": self.profile.review_score,
             "signal_requirements": [asdict(item) for item in self.profile.signal_requirements],
             "model_versions": dict(sorted(versions.items())),
+            "signal_sources": dict(sorted(sources.items())),
         }
         return GateDecision(
             action=action,
@@ -118,14 +149,24 @@ class SceneQualityGate:
             provenance=provenance,
         )
 
-    def evaluate_image(self, image: Any, semantic_score: float) -> GateDecision:
+    def evaluate_image(self, image: Any, semantic_score: Optional[float]) -> GateDecision:
         if self.detector is None:
             return self.evaluate(semantic_score)
-        return self.evaluate(
-            semantic_score,
-            signals=self.detector.detect(image),
-            model_versions=self.detector.model_versions,
-        )
+        try:
+            signals = self.detector.detect(image)
+            return self.evaluate(
+                semantic_score,
+                signals=signals,
+                model_versions=self.detector.model_versions,
+                signal_sources=getattr(self.detector, "signal_sources", {}),
+            )
+        except Exception as exc:
+            decision = self.evaluate(semantic_score)
+            return GateDecision(
+                action="review", semantic_score=decision.semantic_score,
+                reasons=decision.reasons + ("detector_error",), signals={},
+                provenance={**decision.provenance, "detector_error_type": type(exc).__name__},
+            )
 
     @staticmethod
     def _normalize_signals(signals: Mapping[str, float]) -> dict[str, float]:

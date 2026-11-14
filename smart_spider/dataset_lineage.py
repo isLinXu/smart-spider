@@ -158,6 +158,16 @@ def write_manifest_checksum(
     """Write ``manifest.sha256`` covering active manifest JSONL shards."""
     root = Path(output_dir).expanduser().resolve()
     manifest_paths = list(paths) if paths is not None else iter_manifest_files(root)
+    manifest_paths = [
+        path if path.is_absolute() else root / path for path in manifest_paths
+    ]
+    expected = {path.name for path in iter_manifest_files(root)}
+    supplied = {path.name for path in manifest_paths}
+    if supplied != expected or len(supplied) != len(manifest_paths):
+        raise ValueError("checksum paths must cover every active manifest exactly once")
+    for path in manifest_paths:
+        if path.resolve().parent != root:
+            raise ValueError("manifest path escapes dataset root")
     checksum = hash_files(manifest_paths) if manifest_paths else hashlib.sha256().hexdigest()
     record = {
         "algorithm": "sha256",
@@ -181,13 +191,48 @@ def verify_manifest_checksum(output_dir: str | os.PathLike[str]) -> dict[str, An
     checksum_path = root / MANIFEST_CHECKSUM_FILENAME
     if not checksum_path.is_file():
         return {"ok": False, "error": "manifest.sha256 missing"}
-    record = json.loads(checksum_path.read_text(encoding="utf-8"))
-    expected = str(record.get("sha256") or "")
-    names = list(record.get("files") or [])
+    try:
+        record = json.loads(checksum_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"ok": False, "error": "invalid manifest checksum record"}
+    if (
+        not isinstance(record, dict)
+        or record.get("algorithm") != "sha256"
+        or record.get("format_version") != LINEAGE_FORMAT_VERSION
+    ):
+        return {"ok": False, "error": "unsupported manifest checksum record"}
+    expected = record.get("sha256")
+    names = record.get("files")
+    if (
+        not isinstance(expected, str)
+        or len(expected) != 64
+        or any(char not in "0123456789abcdef" for char in expected)
+        or not isinstance(names, list)
+        or any(
+            not isinstance(name, str)
+            or Path(name).name != name
+            or not (
+                name == "manifest.jsonl"
+                or (name.startswith("manifest-") and name.endswith(".jsonl"))
+            )
+            for name in names
+        )
+        or len(names) != len(set(names))
+    ):
+        return {"ok": False, "error": "invalid manifest checksum fields"}
     paths = [root / name for name in names]
+    if any(path.resolve().parent != root for path in paths):
+        return {"ok": False, "error": "manifest path escapes dataset root"}
     missing = [str(path.name) for path in paths if not path.is_file()]
     if missing:
         return {"ok": False, "error": "missing manifest files", "missing": missing}
+    unexpected = sorted({path.name for path in iter_manifest_files(root)} - set(names))
+    if unexpected:
+        return {
+            "ok": False,
+            "error": "unexpected manifest files",
+            "unexpected": unexpected,
+        }
     actual = hash_files(paths) if paths else hashlib.sha256().hexdigest()
     return {
         "ok": actual == expected,

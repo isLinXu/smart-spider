@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.scene_calibration_fixture import calibrated_profile, detector_sources
 
 from smart_spider.scene_quality import get_scene_quality_profile, list_scene_quality_profiles
 from smart_spider.scene_quality_gate import SceneQualityGate
@@ -29,10 +30,12 @@ def test_fixture_covers_all_builtin_profiles():
 
 @pytest.mark.parametrize("case", _load_cases(), ids=lambda c: c["id"])
 def test_scene_gate_truth_case(case: dict):
-    profile = get_scene_quality_profile(case["profile"])
+    profile = calibrated_profile(get_scene_quality_profile(case["profile"]))
     decision = SceneQualityGate(profile).evaluate(
         float(case["semantic_score"]),
         signals=case.get("signals") or {},
+        signal_sources=detector_sources(profile),
+        model_versions={"stub": "ci"},
     )
     assert decision.action == case["expected_action"], (
         f"{case['id']}: expected {case['expected_action']}, "

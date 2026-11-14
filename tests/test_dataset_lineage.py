@@ -1,6 +1,7 @@
 # coding=utf-8
 """Dataset lineage and manifest checksum tests (S10)."""
 from pathlib import Path
+import json
 
 from smart_spider.dataset_config import DatasetCrawlConfig
 from smart_spider.dataset_lineage import (
@@ -49,6 +50,27 @@ def test_checksum_detects_manifest_tamper(tmp_path):
     assert verify_manifest_checksum(tmp_path)["ok"] is True
     (tmp_path / "manifest.jsonl").write_text('{"id":"2"}\n', encoding="utf-8")
     assert verify_manifest_checksum(tmp_path)["ok"] is False
+
+
+def test_checksum_detects_manifest_shards_added_after_publication(tmp_path):
+    (tmp_path / "manifest.jsonl").write_text('{"id":"1"}\n', encoding="utf-8")
+    write_manifest_checksum(tmp_path)
+    (tmp_path / "manifest-0001.jsonl").write_text('{"id":"2"}\n', encoding="utf-8")
+    result = verify_manifest_checksum(tmp_path)
+    assert result["ok"] is False
+    assert result["error"] == "unexpected manifest files"
+    assert result["unexpected"] == ["manifest-0001.jsonl"]
+
+
+def test_checksum_rejects_paths_outside_manifest_root(tmp_path):
+    checksum = tmp_path / "manifest.sha256"
+    checksum.write_text(json.dumps({
+        "algorithm": "sha256", "format_version": 1,
+        "files": ["../secret.jsonl"], "sha256": "a" * 64,
+    }), encoding="utf-8")
+    result = verify_manifest_checksum(tmp_path)
+    assert result["ok"] is False
+    assert result["error"] == "invalid manifest checksum fields"
 
 
 def test_lease_recovery_counted_in_stats(tmp_path):

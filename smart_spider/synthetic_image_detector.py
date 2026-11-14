@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import threading
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -119,6 +120,10 @@ class OnnxSyntheticImageDetector:
     def model_versions(self) -> Mapping[str, str]:
         return dict(self._versions)
 
+    @property
+    def signal_sources(self) -> Mapping[str, str]:
+        return {"synthetic_image": "detector"}
+
     def detect(self, image: Any) -> Mapping[str, float]:
         array = self._preprocess(image)[None, ...]
         output = self._session.run(None, {self._input_name: array})[0]
@@ -163,6 +168,7 @@ class CompositeSceneSignalDetector:
     """Merge independent detector outputs without hiding missing evidence."""
 
     def __init__(self, *detectors: Any) -> None:
+        self._evidence = threading.local()
         self._detectors = tuple(detector for detector in detectors if detector is not None)
         if not self._detectors:
             raise ValueError("at least one scene signal detector is required")
@@ -180,14 +186,26 @@ class CompositeSceneSignalDetector:
 
     def detect(self, image: Any) -> Mapping[str, float]:
         signals: dict[str, float] = {}
+        sources: dict[str, str] = {}
         for detector in self._detectors:
-            for raw_name, raw_score in detector.detect(image).items():
+            detected = detector.detect(image)
+            origins = getattr(detector, "signal_sources", {})
+            for raw_name, raw_score in detected.items():
                 name = str(raw_name).strip()
                 score = float(raw_score)
                 if not name or not 0.0 <= score <= 1.0:
                     raise ValueError(f"invalid detector signal {raw_name!r}: {raw_score!r}")
-                signals[name] = max(signals.get(name, 0.0), score)
+                source = str(origins.get(name, "unknown"))
+                if name not in signals or score > signals[name]:
+                    signals[name], sources[name] = score, source
+                elif score == signals[name] and source not in {"detector", "manual"}:
+                    sources[name] = source
+        self._evidence.sources = sources
         return signals
+
+    @property
+    def signal_sources(self) -> Mapping[str, str]:
+        return dict(getattr(self._evidence, "sources", {}))
 
 
 class CLIPPhotographicStyleDetector:
@@ -221,6 +239,10 @@ class CLIPPhotographicStyleDetector:
     @property
     def model_versions(self) -> Mapping[str, str]:
         return dict(self._versions)
+
+    @property
+    def signal_sources(self) -> Mapping[str, str]:
+        return {"non_photographic": "detector"}
 
     def detect(self, image: Any) -> Mapping[str, float]:
         if not isinstance(image, Image.Image):

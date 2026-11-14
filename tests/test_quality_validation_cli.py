@@ -10,6 +10,10 @@ class _Detector:
     def model_versions(self):
         return {"scene_signal_detector": "fixture"}
 
+    @property
+    def signal_sources(self):
+        return {key: "detector" for key in self.detect(Image.new("RGB", (1, 1)))}
+
     def detect(self, image):
         red = image.getpixel((0, 0))[0]
         return {
@@ -51,15 +55,15 @@ def test_validation_combines_content_and_scene_gates_without_moving_images(tmp_p
         output_dir=dataset / "validation",
     )
 
-    assert report["final_actions"] == {"accept": 1, "reject": 1}
-    assert report["scene_gate_actions"] == {"accept": 2}
+    assert report["final_actions"] == {"review": 1, "reject": 1}
+    assert report["scene_gate_actions"] == {"review": 2}
     assert (batch / "person.jpg").exists()
     assert (batch / "vehicle.jpg").exists()
     rows = [
         json.loads(line)
         for line in (dataset / "validation" / "decisions.jsonl").read_text().splitlines()
     ]
-    assert rows[0]["final_action"] == "accept"
+    assert rows[0]["final_action"] == "review"
     assert rows[1]["final_action"] == "reject"
     assert rows[1]["content_gate"]["final_effect"] == "reject"
 
@@ -85,4 +89,4 @@ def test_validation_routes_missing_detector_evidence_to_review(tmp_path):
     )
 
     assert report["final_actions"] == {"review": 1}
-    assert report["scene_reasons"] == {"signal_below_minimum:person_detector": 1}
+    assert report["scene_reasons"] == {"signal_below_minimum:person_detector": 1, "calibration_unverified": 1}

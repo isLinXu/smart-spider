@@ -556,7 +556,7 @@ def test_clip_gate_rejects_below_threshold():
     assert result.event_detail["scene_profile"] == "phone_call"
 
 
-def test_clip_gate_skips_disabled_missing_text_and_errors():
+def test_clip_gate_skips_only_when_disabled():
     disabled = evaluate_clip_similarity(
         enabled=False,
         encode_image=lambda _img: [1.0],
@@ -578,7 +578,8 @@ def test_clip_gate_skips_disabled_missing_text_and_errors():
         keyword="cat",
         threshold=0.5,
     )
-    assert no_text.accepted is True
+    assert no_text.accepted is False
+    assert no_text.reason == "clip_text_unavailable"
     assert no_text.sim == 0.0
 
     def boom(_left, _right):
@@ -593,7 +594,20 @@ def test_clip_gate_skips_disabled_missing_text_and_errors():
         keyword="cat",
         threshold=0.5,
     )
-    assert errored.accepted is True
+    assert errored.accepted is False
+    assert errored.reason == "clip_inference_error"
+
+    invalid = evaluate_clip_similarity(
+        enabled=True,
+        encode_image=lambda _img: [1.0],
+        get_text_feature=lambda _kw: [1.0],
+        cosine_similarity=lambda _left, _right: float("nan"),
+        image=object(),
+        keyword="cat",
+        threshold=0.5,
+    )
+    assert invalid.accepted is False
+    assert invalid.reason == "clip_invalid_score"
     assert errored.sim == 0.0
 
 

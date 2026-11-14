@@ -1,17 +1,21 @@
 # coding=utf-8
 """Regression tests for calibrated, detector-backed scene quality gates."""
 import json
+from dataclasses import replace
 
 import pytest
+
+from tests.scene_calibration_fixture import calibrated_profile, detector_sources
 
 from smart_spider.scene_quality import get_scene_quality_profile
 from smart_spider.scene_quality_gate import JsonlSceneReviewQueue, SceneQualityGate
 
 
 def test_gate_accepts_only_complete_detector_evidence():
-    profile = get_scene_quality_profile("叉车司机未戴安全帽")
+    profile = calibrated_profile(get_scene_quality_profile("叉车司机未戴安全帽"), {"ppe-detector": "2026.09.01"})
     decision = SceneQualityGate(profile).evaluate(
         0.72,
+        signal_sources=detector_sources(profile),
         signals={
             "forklift": 0.82,
             "forklift_operator": 0.77,
@@ -42,6 +46,52 @@ def test_absence_based_violation_with_missing_signal_requires_review():
     assert "missing_signal:reflective_vest" in decision.reasons
 
 
+def test_complete_but_uncalibrated_or_heuristic_evidence_stays_in_review():
+    profile = get_scene_quality_profile("smoking")
+    signals = {"person": 0.9, "cigarette_or_smoke": 0.8, "operational_area": 0.8}
+    uncalibrated = SceneQualityGate(profile).evaluate(
+        0.72, signals=signals,
+        signal_sources={name: "detector" for name in signals},
+        model_versions={"stub": "ci"},
+    )
+    heuristic = SceneQualityGate(profile).evaluate(
+        0.72, signals=signals,
+        signal_sources={name: "heuristic" for name in signals},
+        model_versions={"stub": "ci"},
+    )
+    assert uncalibrated.action == heuristic.action == "review"
+    assert "calibration_unverified" in uncalibrated.reasons
+    assert "untrusted_signal:person" in heuristic.reasons
+
+
+def test_missing_semantic_score_and_detector_errors_go_to_review():
+    profile = get_scene_quality_profile("smoking")
+    missing = SceneQualityGate(profile).evaluate(None)
+    assert missing.action == "review"
+    assert "semantic_score_unavailable" in missing.reasons
+
+    class BrokenDetector:
+        model_versions = {"broken": "fixture"}
+
+        def detect(self, _image):
+            raise RuntimeError("fixture failure")
+
+    failed = SceneQualityGate(profile, BrokenDetector()).evaluate_image(object(), 0.8)
+    assert failed.action == "review"
+    assert "detector_error" in failed.reasons
+    assert failed.provenance["detector_error_type"] == "RuntimeError"
+
+
+def test_reject_without_review_policy_still_explains_unverified_calibration():
+    profile = replace(get_scene_quality_profile("smoking"), review_required=False)
+    decision = SceneQualityGate(profile).evaluate(
+        0.8,
+        signals={"person": 0.9, "cigarette_or_smoke": 0.8, "operational_area": 0.8},
+    )
+    assert decision.action == "reject"
+    assert "calibration_unverified" in decision.reasons
+
+
 def test_gate_rejects_low_semantic_score_even_with_detector_evidence():
     profile = get_scene_quality_profile("smoking")
     decision = SceneQualityGate(profile).evaluate(
@@ -70,7 +120,7 @@ def test_review_queue_is_durable_and_contains_provenance(tmp_path):
     assert rows[0]["decision"]["provenance"]["profile"] == profile.name
     with pytest.raises(ValueError, match="only review decisions"):
         queue.append("assets/example.jpg", SceneQualityGate(profile).evaluate(
-            0.7,
+            0.01,
             signals={
                 "forklift": 0.9,
                 "forklift_operator": 0.9,
@@ -81,9 +131,10 @@ def test_review_queue_is_durable_and_contains_provenance(tmp_path):
 
 
 def test_generic_scene_profiles_require_detector_evidence():
-    pedestrian = get_scene_quality_profile("行人")
+    pedestrian = calibrated_profile(get_scene_quality_profile("行人"), {"yolo_model": "fixture.pt"})
     accepted = SceneQualityGate(pedestrian).evaluate(
         0.3,
+        signal_sources=detector_sources(pedestrian),
         signals={
             "person_detector": 0.88,
             "scene_context": 0.9,
