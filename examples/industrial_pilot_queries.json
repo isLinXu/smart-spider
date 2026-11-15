@@ -1,0 +1,8 @@
+{
+  "person": ["warehouse worker", "factory workers", "loading dock workers", "warehouse pedestrians", "workers carrying boxes", "worker crouching factory", "工厂工人作业", "仓库工人搬运", "装卸工人现场", "车间工人监控", "工厂行人监控", "物流园区人员"],
+  "forklift": ["forklift warehouse", "forklift unloading truck", "forklift operator warehouse", "forklift industrial yard", "reach truck warehouse", "forklift night shift", "仓库叉车作业", "叉车装卸货车", "叉车司机作业", "工厂叉车搬运", "叉车监控", "前移式叉车作业"],
+  "truck_rear": ["truck rear loading dock", "box truck rear doors", "truck rear unloading", "trailer rear warehouse", "truck tail lift unloading", "truck rear night", "货车尾部装卸", "厢式货车后门", "货车后方装货", "货车尾板卸货", "装卸月台货车尾部", "半挂车尾部"],
+  "head": ["factory worker head", "warehouse worker face", "construction worker head", "worker hard hat head", "forklift operator face", "worker head rear view", "工人头部特写", "车间工人面部", "工人戴安全帽作业", "仓库工人背影", "叉车司机头部", "工人侧脸现场"],
+  "phone": ["worker using smartphone", "warehouse worker phone", "construction worker mobile phone", "factory worker phone call", "forklift driver phone", "worker texting at work", "工人使用手机", "车间工人玩手机", "仓库员工打电话", "叉车司机玩手机", "工地工人看手机", "工人手持手机"],
+  "helmet": ["worker hard hat", "warehouse worker safety helmet", "forklift operator hard hat", "construction worker hard hat", "factory workers hard hats", "worker carrying hard hat", "工人戴安全帽", "仓库工人安全帽", "叉车司机安全帽", "车间工人安全帽", "装卸工人安全帽", "工人手拿安全帽"]
+}

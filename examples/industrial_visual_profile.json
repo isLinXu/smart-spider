@@ -1,0 +1,22 @@
+{
+  "version": "industrial-visual-review-v1",
+  "threshold_status": "provisional_uncalibrated",
+  "thresholds": {"priority_similarity": 0.24, "class_margin": 0.01, "scene_similarity": 0.20, "style_margin": 0.0, "low_similarity": 0.18, "negative_margin": 0.03},
+  "groups": {
+    "person.positive": ["a photograph of workers walking or working inside a warehouse", "a real person working in an industrial factory", "a security camera photograph of people at a loading dock"],
+    "person.negative": ["an empty factory building with no people", "cartoon people or mannequin figures", "a close-up celebrity portrait or political news collage"],
+    "forklift.positive": ["a photograph of a forklift truck operating in a warehouse", "a forklift carrying pallets in an industrial yard", "a reach truck with forks and a lifting mast"],
+    "forklift.negative": ["a manual pallet jack", "an excavator or wheel loader", "a toy forklift or cartoon forklift"],
+    "truck_rear.positive": ["a photograph of the rear doors and rear bumper of a cargo truck", "the back of a box truck parked at a warehouse loading dock", "a truck with its rear cargo doors open for unloading"],
+    "truck_rear.negative": ["a front view of a truck showing the cab and windshield", "a side view of a cargo truck with its rear not visible", "a cardboard box or packaging product", "the rear of a passenger car or bus"],
+    "head.positive": ["a photograph of a worker's head and face at work", "workers with visible heads in a factory", "a worker's head seen from behind wearing a hard hat"],
+    "head.negative": ["a mannequin head or sculpture of a head", "a cartoon anime face", "an empty industrial building with no workers", "a celebrity portrait on a magazine cover"],
+    "phone.positive": ["a photograph of a worker holding a smartphone at work", "a person holding a mobile phone to their ear in a warehouse", "a worker looking at a cellphone held in their hand"],
+    "phone.negative": ["a worker holding a walkie talkie radio", "a warehouse worker using a barcode scanner", "a worker holding a tablet computer", "empty hands with no mobile phone"],
+    "helmet.positive": ["a photograph of an industrial worker wearing a safety hard hat", "construction workers wearing protective hard hats at work", "a worker carrying an industrial safety helmet"],
+    "helmet.negative": ["a motorcycle helmet", "a bicycle helmet", "a baseball cap or ordinary fabric hat", "an isolated safety helmet product on a white background"],
+    "scene": ["a photograph inside a working factory with workers and machinery", "a photograph of workers in a warehouse or logistics loading area", "a real construction site with workers", "a security camera view of an industrial yard or loading dock"],
+    "photo": ["a real photograph of people working in an industrial environment", "a documentary photograph of a workplace", "a real surveillance camera image of an industrial scene", "a photograph of a vehicle in a warehouse or loading area"],
+    "style_negative": ["an anime illustration or cartoon character", "a cartoon comic book cover", "a technical diagram or infographic with text and arrows", "a product isolated on a plain white background", "a product advertisement or promotional poster", "a collage of images or screenshots", "a computer generated 3D rendering or video game scene", "a landscape photograph with no workers or vehicles"]
+  }
+}

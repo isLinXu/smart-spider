@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "task_type": "object_detection",
+  "business_scene": "工厂、仓储、物流园区和装卸区固定监控；待业务确认",
+  "classes": [
+    {
+      "id": 0,
+      "name": "person",
+      "definition": "真实人员的可见身体范围，包含遮挡、截断、蹲坐和背身；不包含海报人物和人形模型。",
+      "queries": ["仓库 工人 作业 现场", "warehouse workers loading pallets", "工厂 车间 人员 监控", "factory workers surveillance camera", "装卸区 人员 货车", "loading dock workers", "物流园区 行人 夜间", "industrial yard pedestrians at night", "仓库 工人 蹲下 搬运", "warehouse worker crouching", "车间 工人 遮挡", "factory worker partially occluded", "工厂 人员 俯视", "warehouse workers overhead view", "装卸 工人 雨天", "loading dock workers in rain", "叉车 行人 混行", "forklift pedestrian warehouse aisle", "车间 多人 作业", "factory workers group working", "仓库 工人 背影", "warehouse worker back view", "厂区 行人 远距离", "industrial workers distant view"]
+    },
+    {
+      "id": 1,
+      "name": "forklift",
+      "definition": "叉车可见整车范围，含门架与货叉，不含所搬货物；手动托盘车、挖掘机和玩具不属于此类。",
+      "queries": ["仓库 叉车 搬运 作业", "forklift working in warehouse", "装卸区 叉车 装车", "forklift loading truck at dock", "工厂 叉车 监控", "forklift warehouse surveillance", "前移式 叉车 货架 作业", "reach truck warehouse operation", "平衡重 叉车 室外 作业", "counterbalance forklift industrial yard", "叉车 正面 作业", "forklift front view warehouse", "叉车 侧面 搬货", "forklift side view carrying load", "叉车 后方 行驶", "forklift rear view operating", "夜间 叉车 装卸", "forklift night shift loading", "仓库 叉车 遮挡", "forklift partially hidden behind pallets", "叉车 俯视 监控", "forklift overhead view warehouse", "雨天 叉车 作业", "forklift operating in rain"]
+    },
+    {
+      "id": 2,
+      "name": "truck_rear",
+      "definition": "货车尾部可见区域：后门或后厢板、后灯及后保险杠；侧后方只框尾部，不框整车，不包含车头、纯侧面和客车。最终框口径待业务确认。",
+      "queries": ["货车 尾部 装卸区 实拍", "truck rear view loading dock", "厢式货车 后门 仓库", "box truck rear doors warehouse", "半挂车 尾部 物流园", "semi trailer rear logistics yard", "货车 尾门 打开 装卸", "truck rear open doors unloading", "货车 尾板 升降 装卸", "truck rear tail lift loading", "货车 侧后方 停靠", "truck rear three quarter view dock", "平板货车 尾部 实拍", "flatbed truck rear industrial yard", "夜间 货车 尾部", "truck rear at night loading bay", "货车 尾部 雨天", "truck rear in rain depot", "装卸月台 货车 后方 监控", "loading dock camera truck rear", "货车 后门 遮挡", "truck rear partially occluded unloading", "货车 尾部 远距离 园区", "truck rear distant view logistics park"]
+    },
+    {
+      "id": 3,
+      "name": "head",
+      "definition": "可辨认的真实人头可见范围，含头发、脸部、戴帽情况，不含颈肩；不得将此类直接解释为未戴安全帽。戴帽头部与安全帽分别标注并关联同一人员。",
+      "queries": ["车间 工人 头部 现场", "factory workers heads at work", "仓库 工人 侧脸", "warehouse worker head profile", "工地 工人 戴安全帽 作业", "worker head wearing hard hat", "工厂 工人 未戴帽 作业", "factory worker bare head", "仓库 工人 背面 头部", "warehouse worker back of head", "车间 工人 俯视 监控", "worker head overhead surveillance", "工厂 多人 头部 遮挡", "workers heads partially occluded factory", "装卸工 弯腰 作业", "loading dock worker bending down", "夜间 作业 工人 头部", "worker head night shift", "工人 戴口罩 车间", "factory worker head face mask", "叉车 司机 驾驶 头部", "forklift operator head in cabin", "仓库 远距离 工人", "warehouse workers distant heads"]
+    },
+    {
+      "id": 4,
+      "name": "phone",
+      "definition": "真实可见的手机本体，含手持和贴耳，不含手、整个人、平板、对讲机及扫码枪；手势不能证明手机存在，打电话属于额外行为标签。",
+      "queries": ["仓库 工人 手持 手机", "warehouse worker holding mobile phone", "车间 工人 使用手机", "factory worker using smartphone", "装卸区 工人 打电话", "loading dock worker phone call", "叉车 司机 使用手机", "forklift driver using cellphone", "工人 手机 贴耳", "worker holding phone to ear", "工厂 工人 低头 看手机", "factory worker looking down at phone", "仓库 员工 手机 侧面", "warehouse employee smartphone side view", "工作台 手机 工人", "smartphone on industrial workbench", "工人 手机 被手 遮挡", "worker smartphone partially covered by hand", "夜班 工人 使用手机", "night shift worker using phone", "工厂 员工 手机 远景", "factory employee mobile phone wide view", "装卸 工人 手机 背面", "worker holding smartphone back visible"]
+    },
+    {
+      "id": 5,
+      "name": "helmet",
+      "definition": "工业安全帽本体，不含整个头部；排除摩托车头盔、自行车头盔和普通帽子。记录 worn 或 carried 属性，仅帽子存在不能证明人员佩戴。",
+      "queries": ["工厂 工人 戴安全帽 作业", "factory worker wearing hard hat", "仓库 工人 安全帽", "warehouse worker safety helmet", "叉车 司机 安全帽", "forklift operator wearing hard hat", "装卸 工人 安全帽", "loading dock worker hard hat", "安全帽 工人 侧面", "worker hard hat side view", "安全帽 工人 背面", "worker hard hat rear view", "俯视 工人 安全帽", "worker hard hat overhead view", "夜间 作业 安全帽 工人", "night shift worker hard hat", "安全帽 遮挡 作业 工人", "worker hard hat partially occluded", "工人 手拿 安全帽 现场", "worker carrying hard hat factory", "工厂 多人 不同颜色 安全帽", "industrial workers different color hard hats", "仓库 远处 工人 安全帽", "warehouse worker hard hat distant view"]
+    }
+  ],
+  "review_requirements": [
+    "每张图标注全部可见的六类目标，目录和搜索词仅表示采集意图。",
+    "人工排除商品白底图、海报、拼图、示意图、合成图、已有标注框覆盖的图像；保留真实夜间、遮挡和轻度模糊难例。",
+    "逐图记录来源页面、作者和适用授权；搜索结果的可下载性不证明训练授权。",
+    "整图分辨率不代表小目标清晰；单独检查 head、phone、helmet 的像素尺寸和可辨识性。",
+    "跨类别做内容哈希和近重复聚类；按站点、摄像头、视频片段和相似图簇分组切分，业务留出集优先使用授权现场数据。",
+    "审核全部目标框之后再导出 COCO 或 YOLO；未标注图片不可作为背景负样本。"
+  ]
+}
