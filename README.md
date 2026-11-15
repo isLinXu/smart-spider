@@ -211,6 +211,120 @@ python -m smart_spider.dataset_cli \
 路径默认拒绝 localhost、私网和保留地址；只有在明确受控的内网任务中才使用
 `--allow-private-hosts`。
 
+### 六类工业目标：person / forklift / truck_rear / head / phone / helmet
+
+`crawl_industrial_objects.py` 复用图片采集链路，默认每类 **5,000 张候选图**，
+以工厂、仓储、物流园区和装卸区为场景。类别顺序固定为
+`0=person, 1=forklift, 2=truck_rear, 3=head, 4=phone, 5=helmet`。
+类别定义、中英文查询词及复核要求在
+[`examples/industrial_objects.json`](examples/industrial_objects.json) 中维护。
+
+```bash
+# 离线检查计划；不会创建目录或请求网络
+python crawl_industrial_objects.py --dry-run
+
+# 首批验证：独立目录，每类 100 张
+python crawl_industrial_objects.py --total-per-class 100 \
+  --output-root ./dataset_industrial_pilot \
+  --query-overrides examples/industrial_pilot_queries.json
+
+# 批量采集；重复同一命令续跑，各类独立状态库和日志
+python crawl_industrial_objects.py --total-per-class 5000 \
+  --output-root ./dataset_industrial_objects --parallel 2 --rate 2
+
+# 只读统计已登记且文件存在的候选，不用孤立文件充数
+python crawl_industrial_objects.py --output-root ./dataset_industrial_objects --status
+```
+
+使用已有出口代理时可显式传 `--proxy http://proxy.example:8080`，地址中不能含凭据。
+该参数复用框架的代理连接路径，采集目标和重定向仍须通过公网地址校验。
+部分环境只设置 `HTTPS_PROXY` 时，现有 HTTP 客户端会将代理 socket 误作目标地址，
+产生 `private or reserved connected peer` 错误；应显式配置代理。
+
+每类使用 24 个中英文场景查询，覆盖视角、遮挡、夜间和远景。采集限速按单个
+爬虫设置，两个任务的总速率上限约为两倍；每域并发 1，单域配额上限 15%，
+基础尺寸至少 640×360。当前保留图片解码、文件大小和内容去重校验；默认不启用
+未经校准的语义模型，不把搜索词写成正式标签，也不声称已完成语义过滤。
+
+输出包含各类 `manifest.jsonl`、`metadata.jsonl`、`crawl.log` 和状态库，根目录有
+`class_spec.json`、`crawl_plan.json`、`run_summary.json`。结束或正常中断后生成
+`review_queue.jsonl`，按已有内容 ID 合并跨类重复并保留所有采集来源。
+统计的是候选图数量，未经视觉审核；同一图可含多个类别，因此六类数量之和
+不等于合并后的唯一图片数，更不等于标注实例数。近重复仍需后续聚类。
+基础清单中的 `accepted` 只代表下载准入；根报告始终标记 `training_ready=false`。
+
+试采查询文件采用较短的场景词；`--query-overrides` 只调整查询词，不修改类别定义。
+查询列表会随计划保存，已有目录拒绝混入不同的类别或查询配置；新一轮查询使用新目录。
+搜索页内容仍可能与查询无关，应先查看图片再扩大采集。
+
+可使用离线 CLIP 复核排序处理一个或多个采集目录。需要已有的 OpenAI CLIP
+ViT-B/32 权重及 `clip`、PyTorch 依赖；基础采集不依赖该模型。
+
+```bash
+python -m smart_spider.industrial_review \
+  --input-roots ./dataset_industrial_pilot \
+  --output ./.artifacts/industrial_pilot_review \
+  --weights /path/to/ViT-B-32.pt --device cpu --threads 4 --batch-size 8
+```
+
+模块只读取清单中通过 SHA-256 和解码验证的本地图片，跨目录去重后每图编码一次，
+同时比较六类目标、易混物体、工业场景及插画/商品图提示词。不会重新下载媒体，
+不会修改原清单、删除低分图或产生检测框。模型权重固定为
+`sha256:40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af`；
+启动时校验实际文件。OpenAI CLIP 的 [MIT 许可](https://github.com/openai/CLIP/blob/main/LICENSE)
+适用于模型项目，图片来源许可仍须独立核验。
+
+输出 `visual_review.jsonl`、`invalid_assets.jsonl`、`summary.json`、`profile.json`
+及可在本地浏览器打开的 `review.html`（每类展示前 30 张）。逐图保留模型 ID、权重摘要、
+代码版本及摘要、余弦相似度、匹配提示词、原始来源和配置指纹。
+`priority_review` / `needs_review` / `lower_priority` 仅表示复核顺序；
+阈值来自 [`examples/industrial_visual_profile.json`](examples/industrial_visual_profile.json)，
+目前未经业务校准，分数不代表正确率。报告分别列出各检索类别内的分布和全部图片的
+六类评分分布，不能把后者当作六类独立图片数量或正式标签。
+
+训练前先确认类别口径：`truck_rear` 暂定义为尾门、后灯及后保险杠所在的尾部区域；
+`head` 包含戴帽人头，不能直接用作“未戴帽”类别；`helmet` 只含工业安全帽本体；
+`phone` 只框可见手机，不能从手势猜测手机存在。每张图需要标全六类可见实例，
+额外记录小目标尺寸、遮挡、截断，以及安全帽是否佩戴、与哪名人员关联。
+
+建议每类先人工审核 100–200 张，测量相关率、可标注率和来源授权通过率，
+再按实际通过率补采。例如通过率为 60% 时，5,000 张有效图约需 8,334 张候选；
+这是预算估算，真实目标仍要按去重后的审核结果验收。商品白底图、海报、
+示意图、合成图和已画框的展示图需筛除；真实夜间和遮挡难例应单独保留。
+另建已完整标注的难负样本切片，重点覆盖扫码枪、对讲机、托盘车和普通帽子。
+
+搜索结果不附带统一训练许可，脚本不会填写虚构的许可声明。逐图核验来源与授权、
+完成检测框审核、全局近重复聚类后再导出训练数据。按摄像头、视频片段、站点
+及相似图簇分组切分，避免同一现场相邻帧进入训练与测试两侧；独立业务评测集
+优先使用授权现场监控。CVAT 支持审核后导出
+[Ultralytics YOLO 检测格式](https://docs.cvat.ai/docs/dataset_management/formats/format-yolo-ultralytics/)。
+尚未标注的候选不能通过空标签文件伪装成负样本。
+
+可用 Commons 的分类页和文件页补采带逐图许可声明的原图：
+
+```bash
+python -m smart_spider.industrial_commons \
+  --output ./dataset_industrial_commons_v1 \
+  --target-per-class 30 --results-per-query 50
+```
+
+查询在 `examples/industrial_commons_queries.json` 中维护。默认使用允许访问的
+`/wiki/Category:` 和 `/wiki/File:` 页面，遵守 robots；不绕过被拒绝的接口。
+单连接、每秒最多约 1 次请求，媒体额外按 2 MB/s 节流；显式出口代理仍使用
+`--proxy`，来源和跳转限于 Commons 及其上传域的 HTTPS 公网地址。
+这是一轮有界补采：每个分类页最多取 `--results-per-query` 个文件，不递归子分类、
+不翻页，目标未满退出码为 2，不会用重复图补足配额。以相同参数重复命令可续跑。
+
+模块只接收有作者和明确 CC BY / CC BY-SA / CC0 声明的 JPEG、PNG、WebP，
+下载后检查真实格式、尺寸、字节上限和 SHA-256，跨类别复用已有原图。
+原始字节不转换，`source_evidence/` 保留来源页面快照，清单记录原图链接、
+作者、署名资料、许可链接和页面摘要。HTML 页面没有提供的外部 SHA-1
+不声称已校验，另记录本地文件摘要；接口方式仅在 robots 允许时可用。
+`rejected_candidates.json` 和 `summary.json` 记录本轮拒绝原因及候选数量。
+许可状态始终是 `source_license_declared_review_pending`；文件级声明、其他使用限制、
+业务场景适配和检测框仍需审核，不能据此宣布已取得完整业务训练授权。
+新目录可以直接交给 `smart_spider.industrial_review` 进行离线视觉排序。
+
 ## 参数说明
 
 ### 基础参数
